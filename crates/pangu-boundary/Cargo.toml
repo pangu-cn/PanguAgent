@@ -1,0 +1,19 @@
+[package]
+name = "pangu-boundary"
+description = "Pangu Agent 的边界层：风险分级、策略裁决、资源沙箱、审批闸门、预算"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+pangu-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+url.workspace = true

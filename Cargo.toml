@@ -1,0 +1,62 @@
+[package]
+name = "pangu-tests"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Pangu Agent 的跨 crate 不变量与集成测试包"
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["pangu-cn"]
+repository = "https://github.com/pangu-cn/PanguAgent"
+homepage = "https://github.com/pangu-cn/PanguAgent"
+keywords = ["ai-agent", "llm", "tool-calling", "sandbox", "policy"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+pangu-core = { path = "crates/pangu-core", version = "0.1.0" }
+pangu-boundary = { path = "crates/pangu-boundary", version = "0.1.0" }
+pangu-provider = { path = "crates/pangu-provider", version = "0.1.0" }
+pangu-toolkit = { path = "crates/pangu-toolkit", version = "0.1.0" }
+pangu-agent = { path = "crates/pangu-agent", version = "0.1.0" }
+
+async-trait = "0.1"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+hex = "0.4"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process", "fs", "signal", "net"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+pangu-agent.workspace = true
+pangu-boundary.workspace = true
+pangu-core.workspace = true
+pangu-provider.workspace = true
+pangu-toolkit.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

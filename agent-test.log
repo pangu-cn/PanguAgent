@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src\lib.rs (target\debug\deps\pangu_agent-dab2d2ca25c72e13.exe)
+
+running 10 tests
+test test_support::tests::complete_without_successful_evidence_is_failed ... ok
+test test_support::tests::approval_abort_produces_aborted_status ... ok
+test test_support::tests::provider_failure_emits_terminal_event_and_returns_error ... ok
+test test_support::tests::denied_action_never_reaches_executor ... ok
+test test_support::tests::tool_error_is_returned_to_the_model ... ok
+test test_support::tests::budget_exhaustion_prevents_execution ... ok
+test test_support::tests::approval_denial_blocks_execution ... ok
+test test_support::tests::missing_price_stops_before_provider_request ... ok
+test test_support::tests::successful_tool_can_support_complete ... ok
+test test_support::tests::explicit_approval_allows_execution ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+

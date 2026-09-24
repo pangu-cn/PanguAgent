@@ -1,0 +1,27 @@
+[package]
+name = "pangu"
+description = "Pangu Agent 的命令行界面：CLI + doctor + demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pangu"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+pangu-agent.workspace = true
+pangu-boundary.workspace = true
+pangu-core.workspace = true
+pangu-provider.workspace = true
+pangu-toolkit.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

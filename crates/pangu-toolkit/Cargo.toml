@@ -1,0 +1,23 @@
+[package]
+name = "pangu-toolkit"
+description = "Pangu Agent 的工具集合：读/写/搜索/网络工具，带风险分级与沙箱集成"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+anyhow.workspace = true
+pangu-agent.workspace = true
+pangu-boundary.workspace = true
+pangu-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true

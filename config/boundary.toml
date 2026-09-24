@@ -1,0 +1,88 @@
+# Pangu Agent effective boundary. This file is embedded as the default config.
+[budget]
+max_turns = 12
+max_input_tokens = 200_000
+max_output_tokens = 16_000
+max_cost_usd = 1.00
+max_wall_clock_secs = 600
+
+[model]
+protocol = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+request_timeout_secs = 60
+max_output_tokens = 4_096
+
+[boundary]
+workspace = "."
+readable_roots = ["."]
+writable_roots = ["."]
+forbidden_globs = ["**/.git/**", "**/.env", "**/.env.*", "**/secrets/**", "**/*.pem", "**/id_rsa*"]
+max_tool_output_bytes = 16_384
+max_arg_bytes = 8_192
+subprocess_timeout_secs = 45
+subprocess_output_limit = 200_000
+max_write_bytes = 4_194_304
+max_paths_per_action = 64
+
+[boundary.approval]
+mode = "destructive_and_above"
+ask_timeout_secs = 120
+
+[boundary.network]
+allow_localhost = false
+hosts = []
+
+[boundary.env]
+allow = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "USERPROFILE"]
+
+[goal]
+require_evidence = true
+min_successful_tool_calls = 1
+system_prompt = """
+你是 Pangu，一个在显式边界内工作的自主 agent。
+只能通过提供的工具改变外部世界；一次只执行一个可审计动作。
+先读后写，优先可逆操作。被拒绝后不要重复同一动作。
+只有目标真实完成且已有成功工具证据时，才调用 finish(status=\"complete\")。
+不得虚构工具结果，不得修改预算、工作区、审批模式或禁止项。
+"""
+
+# First-match is retained within the allow/ask tier; deny rules always win.
+[[rules]]
+id = "allow-read-file"
+effect = "allow"
+tool = "read_file"
+max_risk = "read_only"
+reason = "工作区内只读文件"
+
+[[rules]]
+id = "allow-list-dir"
+effect = "allow"
+tool = "list_dir"
+max_risk = "read_only"
+reason = "工作区内只读目录"
+
+[[rules]]
+id = "allow-search"
+effect = "allow"
+tool = "search"
+max_risk = "read_only"
+reason = "工作区内只读搜索"
+
+[[rules]]
+id = "ask-write-file"
+effect = "ask"
+tool = "write_file"
+reason = "写入前需要确认"
+
+[[rules]]
+id = "ask-network"
+effect = "ask"
+tool = "http_fetch"
+reason = "出站请求前需要确认"
+
+[[rules]]
+id = "ask-command"
+effect = "ask"
+tool = "run_command"
+reason = "子进程前需要确认"

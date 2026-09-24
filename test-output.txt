@@ -1,0 +1,33 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src\lib.rs (target\debug\deps\pangu_boundary-c785a2ab18928d20.exe)
+
+running 8 tests
+test policy::tests::no_rule_is_default_deny ... ok
+test goal::tests::status_round_trips ... ok
+test risk::tests::ordering_is_fail_closed ... ok
+test policy::tests::deny_precedes_an_earlier_broad_allow ... ok
+test approval::tests::exhausted_script_is_denied_by_default ... ok
+
+thread 'config::tests::embedded_config_parses' (29480) panicked at crates\pangu-boundary\src\config.rs:420:41:
+called `Result::unwrap()` on an `Err` value: Config("invalid config: TOML parse error at line 29, column 8\n   |\n29 | mode = \"DestructiveAndAbove\"\n   |        ^^^^^^^^^^^^^^^^^^^^^\nunknown variant `DestructiveAndAbove`, expected one of `never`, `destructive`, `destructive_and_above`, `always`\n")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'config::tests::overrides_are_revalidated' (20496) panicked at crates\pangu-boundary\src\config.rs:428:40:
+called `Result::unwrap()` on an `Err` value: Config("invalid config: TOML parse error at line 29, column 8\n   |\n29 | mode = \"DestructiveAndAbove\"\n   |        ^^^^^^^^^^^^^^^^^^^^^\nunknown variant `DestructiveAndAbove`, expected one of `never`, `destructive`, `destructive_and_above`, `always`\n")
+test config::tests::overrides_are_revalidated ... FAILED
+test config::tests::embedded_config_parses ... FAILED
+
+thread 'sandbox::tests::write_target_must_be_below_workspace' (36272) panicked at crates\pangu-boundary\src\sandbox.rs:445:53:
+called `Result::unwrap()` on an `Err` value: Config("writable root \\\\?\\D:\\private\\github\\PanguAgent\\crates\\pangu-boundary is outside workspace \\\\?\\C:\\Users\\ASUS\\AppData\\Local\\Temp\\pangu-sandbox-12824")
+test sandbox::tests::write_target_must_be_below_workspace ... FAILED
+
+failures:
+
+failures:
+    config::tests::embedded_config_parses
+    config::tests::overrides_are_revalidated
+    sandbox::tests::write_target_must_be_below_workspace
+
+test result: FAILED. 5 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p pangu-boundary --lib`
