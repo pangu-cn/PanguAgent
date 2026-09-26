@@ -33,6 +33,8 @@ jobs:
 
       - name: Run all tests
         shell: bash
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           # tee keeps the full test output as a downloadable artifact, and the
           # failure summary is re-emitted as ::error:: annotations: the job log
@@ -44,12 +46,13 @@ jobs:
           set -e
           if [ "$status" -ne 0 ]; then
             esc() { printf '%s' "$1" | tr -d '\r' | sed -e 's/%/%25/g' -e 's/:/%3A/g'; }
+            sed 's/\x1b\[[0-9;]*m//g' all-tests.log > all-tests-plain.log
             {
-              grep -E '^test .* FAILED$' all-tests.log | head -20 || true
-              grep -E '^ +--> ' all-tests.log | head -10 || true
+              grep -aE '^test .* FAILED$' all-tests-plain.log | head -20 || true
+              grep -aE '^ +--> ' all-tests-plain.log | head -10 || true
               # The panic message sits on the line after the location and is the
               # part that names the actual refusal, so it must not be dropped.
-              grep -A 3 'panicked at' all-tests.log | grep -vE '^--$' | head -30 || true
+              grep -aA 3 'panicked at' all-tests-plain.log | grep -avE '^--$' | head -30 || true
             } | while IFS= read -r line; do
               [ -n "$line" ] && echo "::error title=cargo test failure::$(esc "$line")"
             done
@@ -59,18 +62,28 @@ jobs:
 
       - name: Run strict Clippy
         shell: bash
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           # Same reasoning as the test step: the job log needs admin rights, so
-          # the diagnostic is re-emitted as an annotation.
+          # the diagnostic is re-emitted as an annotation. `grep -a` matters:
+          # rustc colourises its output, and without it grep treats the log as
+          # binary and silently prints nothing at all.
           set +e
           cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           set -e
           if [ "$status" -ne 0 ]; then
             esc() { printf '%s' "$1" | tr -d '\r' | sed -e 's/%/%25/g' -e 's/:/%3A/g'; }
+            # Strip ANSI colour before matching: rustc colourises diagnostics and
+            # a colourised line does not start with "error", so an anchored
+            # match would silently find nothing. `grep -a` then keeps it from
+            # treating the log as binary.
+            sed 's/\x1b\[[0-9;]*m//g' clippy.log > clippy-plain.log
             {
-              grep -E '^(error|warning)' clippy.log | head -20 || true
-              grep -E '^ +--> ' clippy.log | head -20 || true
+              grep -aE '^(error|warning)' clippy-plain.log | head -20 || true
+              grep -aE '^ +--> ' clippy-plain.log | head -20 || true
+              grep -aA 4 '^(error|warning)' clippy-plain.log | grep -avE '^--$' | head -30 || true
             } | while IFS= read -r line; do
               [ -n "$line" ] && echo "::error title=clippy::$(esc "$line")"
             done
