@@ -328,7 +328,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [ ] **A1 会话树与恢复**：借鉴 Pi/Hermes/DeepSeek Harness/OpenHands/Cline，支持 resume、branch、fork、compaction；每个节点可回放。
   - **勘察修正**：ROADMAP 原文把“会话树”和“对话恢复”写在一起，但 `SessionNode` 树只记**工作区快照**，不记对话——`Agent::run()` 的 `history` 每次在内存里从零构造，从不持久化。因此“恢复工作区”= F7 的 rollback（已做），“恢复对话继续聊”当时**无法实现**。Journal 也不够：`ModelRequest` 只记 `messages=2 tools=7` 计数、`ModelResponse` 只记 `provider response received`，都不带消息内容。
   - **附带发现**：`SessionNode.history_digest` 声明并校验了，但全仓库**无任何非 None 赋值**，是死字段。
-  - 已完成（ADR-0004，用户选定 A1b 路线）：`ConversationSnapshot` + Artifact store 存取（`save_conversation` / `load_conversation` / `list_conversations`）、显式压缩并记录 `compacted_from_digest`、9 个单测 + 1 个不变式。`history_digest` 由此开始被真正赋值。
+  - 已完成（ADR-0004，用户选定 A1b 路线）：`ConversationSnapshot` + Artifact store 存取（`save_conversation` / `load_conversation` / `list_conversations`）、显式压缩并记录 `compacted_from_digest`、12 个单测 + 1 个不变式。
+  - **纠正一处早期夸大**：`SessionNode.history_digest` 那个死字段**至今仍无任何非 None 赋值**。被真正赋值的是 `ConversationSnapshot.history_digest`——一个新结构上的新字段，不是同一个字段。两者要打通，前提是先接入 agent 运行循环（见下方未完成项）。
   - **核心保证**：恢复的历史**只是模型输入**。它不携带任何 `Decision`/`Effect`/已批准记忆；resume 后第一次发起工具调用仍走完整 `Policy → Sandbox → Approval`。不提供任何到判定的转换。
   - **安全边界**：存储前脱敏（`redact_text`/`redact_value`）、内容 digest 读时校验（篡改即拒）、空历史**拒绝恢复**（否则等于静默重开会话）、快照不可变（保护压缩出处链可解）、压缩必须非空摘要且必须真的丢弃内容、压缩必须用新 `snapshot_id`。
   - **未包含（有意排除）**：tree 导航（祖先/子节点/公共祖先）、branch/fork、CLI 子命令、agent 运行循环的 save/restore 钩子；**fork 的工作区隔离完全未解决**（两条分支共享同一工作区必然互相覆盖）；跨机器同步、协作编辑。
