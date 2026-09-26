@@ -291,6 +291,78 @@ pub fn validate_encoded_size(encoded: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Mirror of every [`ConversationSnapshot`] field except `messages`.
+///
+/// It exists so [`encode_linewise`] does not have to hand-write each field. It
+/// is a **maintenance hazard by construction**: a field added to the snapshot
+/// and not added here would silently vanish from disk. `header_ref_covers_every_
+/// field` is the guard that turns that into a test failure.
+#[derive(Serialize)]
+struct HeaderRef<'a> {
+    schema_version: u32,
+    snapshot_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_node_id: Option<&'a str>,
+    run_id: &'a str,
+    history_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compaction: Option<&'a CompactionRecord>,
+    created_at: &'a str,
+}
+
+impl<'a> HeaderRef<'a> {
+    fn of(snapshot: &'a ConversationSnapshot) -> Self {
+        Self {
+            schema_version: snapshot.schema_version,
+            snapshot_id: &snapshot.snapshot_id,
+            session_node_id: snapshot.session_node_id.as_deref(),
+            run_id: &snapshot.run_id,
+            history_digest: &snapshot.history_digest,
+            compaction: snapshot.compaction.as_ref(),
+            created_at: &snapshot.created_at,
+        }
+    }
+}
+
+/// Encode a snapshot with **one message per line**.
+///
+/// The previous form was `serde_json::to_vec`, which writes the whole snapshot
+/// on a single line, so "which lines does this slice cover" had no answer. This
+/// layout is what ADR-0005 §3.5's `start_line` / `end_line` address.
+///
+/// Wire-compatible, not byte-compatible: JSON is whitespace-insensitive, so
+/// `from_slice` reads the old single-line files and the new ones alike. No
+/// migration is needed and both layouts can sit in one store.
+///
+/// No existing digest is invalidated: [`ConversationSnapshot::digest_of`]
+/// hashes `serde_json::to_vec(messages)` — the *logical* messages — not the
+/// file bytes, so it is unaffected by how the file is laid out.
+///
+/// A message can never span two lines: `serde_json` escapes newlines inside
+/// strings, so content with embedded line breaks stays on one line. The
+/// `encoding_puts_exactly_one_message_per_line` test pins that down, because
+/// every `start_line` / `end_line` in the store depends on it.
+pub fn encode_linewise(snapshot: &ConversationSnapshot) -> Result<Vec<u8>> {
+    let header = serde_json::to_string(&HeaderRef::of(snapshot))?;
+    let Some(head) = header.strip_suffix('}') else {
+        return Err(Error::Other(
+            "snapshot header did not serialize as a JSON object".into(),
+        ));
+    };
+    let mut out = String::with_capacity(header.len() + 16);
+    out.push_str(head);
+    out.push_str(",\"messages\":[");
+    for (index, message) in snapshot.messages.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('\n');
+        out.push_str(&serde_json::to_string(message)?);
+    }
+    out.push_str("\n]}\n");
+    Ok(out.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +599,111 @@ mod store_tests {
             "expected a digest mismatch, got: {error}"
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    fn sample_snapshot() -> ConversationSnapshot {
+        ConversationSnapshot::new("snap-linewise", "run-linewise", sample())
+            .expect("a fresh snapshot validates")
+    }
+
+    /// The maintenance guard for `HeaderRef`. If a field is added to
+    /// `ConversationSnapshot` and not to the mirror, `encode_linewise` would
+    /// drop it from disk while still passing every round-trip test on a
+    /// snapshot that does not set the new field. Comparing key sets is what
+    /// catches that.
+    #[test]
+    fn header_ref_covers_every_field() {
+        let mut snapshot = sample_snapshot();
+        snapshot.session_node_id = Some("node_1".into());
+        snapshot.compaction = Some(CompactionRecord {
+            compacted_from_digest: "a".repeat(64),
+            dropped_messages: 3,
+            kept_messages: 2,
+            summary: "earlier turns collapsed".into(),
+        });
+        let full = serde_json::to_value(&snapshot).expect("value");
+        let full_keys: std::collections::BTreeSet<String> = full
+            .as_object()
+            .expect("object")
+            .keys()
+            .filter(|key| key.as_str() != "messages")
+            .cloned()
+            .collect();
+        let header = serde_json::to_value(HeaderRef::of(&snapshot)).expect("value");
+        let header_keys: std::collections::BTreeSet<String> = header
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            header_keys, full_keys,
+            "`HeaderRef` and `ConversationSnapshot` have drifted; a field is not              being written to disk. Set every field to Some/Some first — the              comparison above runs with both set, so `skip_serializing_if`              cannot hide a missing key."
+        );
+    }
+
+    /// The property ADR-0005 §3.5 depends on: a message occupies exactly one
+    /// line, so a stored `start_line` / `end_line` still names the same bytes
+    /// after any future edit to the encoder.
+    #[test]
+    fn encoding_puts_exactly_one_message_per_line() {
+        let mut snapshot = sample_snapshot();
+        // Content with embedded newlines is the case that could break the
+        // invariant: `serde_json` must escape them rather than emit them raw.
+        snapshot.messages.push(Message::Tool {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            content: "line one
+line two
+line three"
+                .into(),
+            is_error: false,
+        });
+        let encoded = encode_linewise(&snapshot).expect("encode");
+        let text = String::from_utf8(encoded).expect("utf8");
+        assert!(
+            !text.contains("line one
+line two"),
+            "a raw newline leaked out of a message body, so messages no longer              occupy one line each: {text}"
+        );
+        // header line, one line per message, closing line
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            snapshot.messages.len() + 2,
+            "expected a header line, one line per message, and a closing line;              got {} lines for {} messages: {text}",
+            lines.len(),
+            snapshot.messages.len()
+        );
+        for line in &lines {
+            assert!(!line.trim().is_empty(), "blank line in {text}");
+        }
+    }
+
+    #[test]
+    fn linewise_encoding_round_trips() {
+        let mut snapshot = sample_snapshot();
+        snapshot.session_node_id = Some("node_1".into());
+        let encoded = encode_linewise(&snapshot).expect("encode");
+        let decoded: ConversationSnapshot =
+            serde_json::from_slice(&encoded).expect("decode must accept the new layout");
+        assert_eq!(decoded, snapshot);
+    }
+
+    /// Backward compatibility is the whole reason this change is safe to ship
+    /// without a migration: a file written by the old single-line encoder must
+    /// still load, with an intact digest.
+    #[test]
+    fn a_single_line_snapshot_written_by_the_old_encoder_still_loads() {
+        let snapshot = sample_snapshot();
+        let legacy = serde_json::to_vec(&snapshot).expect("legacy encode");
+        assert_eq!(
+            legacy.iter().filter(|byte| **byte == b'\n').count(),
+            0,
+            "the test premise is that the old encoder produced no newlines"
+        );
+        let decoded: ConversationSnapshot = serde_json::from_slice(&legacy).expect("legacy decode");
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.history_digest, snapshot.history_digest);
     }
 }

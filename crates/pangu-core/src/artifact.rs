@@ -869,7 +869,7 @@ impl ArtifactStore {
         let _process_lock = StoreProcessLock::acquire(&self.root)?;
         conversation.validate()?;
         validate_id("snapshot_id", &conversation.snapshot_id)?;
-        let bytes = serde_json::to_vec(conversation)?;
+        let bytes = crate::conversation::encode_linewise(conversation)?;
         crate::conversation::validate_encoded_size(&bytes)?;
         let path = self.conversation_path(&conversation.snapshot_id)?;
         if path_exists_without_symlink(&path)? {
