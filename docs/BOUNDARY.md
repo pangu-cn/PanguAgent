@@ -68,6 +68,25 @@ Contract 与 Sandbox 的有效字段及 readable/writable roots 的有效顺序�
 
 当前实现不把一次批准永久写入全局状态；`AllowOnce` 只允许当前调用，`AllowRule` 也只对当前已验证调用生效（rule id 仍会进入审计事件）。审批 target、reason、preview 和参数键值在展示前脱敏、限长并清理控制字符。这比永久记忆更保守；未来若增加记忆，必须绑定完整动作指纹并保留 deny 优先。
 
+### Checkpoint / rollback（实验性 opt-in）
+
+checkpoint/rollback 只有在 `GoalContract.checkpoint.enabled = true`、Artifact backend 和有效 policy/sandbox 绑定均成立时才可进入运行时；默认配置仍为关闭，模型不能通过参数打开它。成功动作后的 checkpoint 链是：
+
+```text
+成功 ToolFinished(v2 receipt)
+  → internal checkpoint capability
+  → Policy::evaluate_internal
+  → SnapshotRequest / Sandbox
+  → Approval（仅当 Policy 返回匹配的 ask）
+  → Artifact + session node + COMMITTED marker
+```
+
+这里的 `evaluate_internal` 只用于不可由模型命名的固定 checkpoint capability：正常 deny 仍优先，匹配的 allow/ask 仍生效；没有匹配规则时，checkpoint 由 L1 显式开关授权。外部 mutation 仍始终要求 L4，rollback 也始终要求 L4。`Never`、NoAnswer、超时和未批准均失败关闭。
+
+rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型不能提交裸路径或自然语言来恢复。它只处理已验证 workspace roots 和 session ledger，不执行外部补偿、Git、网络、子进程或连接器。checkpoint 之后有外部 mutation、workspace CAS 漂移、损坏 Artifact、stale transaction lock 或不完整 transition binding 时拒绝继续。
+
+阶段二实现和测试已经存在，但在正式激活/支持声明前，本节和第 4.1 节是条件性实验规范；部署者仍须遵守第 4.1 节的 operator recovery 限制。
+
 ### 边界之外
 
 Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代码隔离。不提供通用 shell、任意删除、支付、发邮件、凭据读取或默认放行便利模式。唯一明确的人工降级开关是 CLI 的 `--dangerously-unattended`：它要求 approval mode 为 `Never`，使用 fail-closed handler，并在 `RunStarted` 写入 `unattended=true`。
@@ -85,6 +104,21 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 9. **I-Honest-Terminal**：没有成功工具 evidence 的 `complete` 自动降级为 `failed`。
 10. **I-Child-Env-Cleaned**：传给子进程的环境变量集合必须是有效 `env_allow` 的子集，且敏感键不能出现。
 11. **I-Effect-Bounded**：所有 provider 响应、工具输出、错误、事件 payload 和 Journal 单行都有大小上限。
+
+### 4.1 阶段二 checkpoint/rollback 条件性不变量（实验性）
+
+以下规则适用于显式启用的 checkpoint/rollback 运行；它们不改变默认关闭行为，也不应在阶段二正式验收前被解释为默认产品支持：
+
+12. **I-Checkpoint-After-Verified-Action**：只有成功 `VerifiedAction` 对应的成功 `ToolFinished` 才能产生 checkpoint。
+13. **I-Checkpoint-Atomic**：快照、manifest、稳定事件指针、session node 和完成 marker 缺失/损坏时，Artifact 不得成为回退源。
+14. **I-Rollback-Trigger**：rollback 只能由绑定目标 checkpoint、来源 session node、理由和可选 failed-path 引用的 typed request 触发。
+15. **I-Irreversible-Requires-Human**：外部 mutation 必须执行前声明、记账并取得明确人工允许。
+16. **I-Rollback-Scope**：rollback 只修改工作区和 session 状态，不执行外部补偿、Git、网络、子进程或连接器。
+17. **I-Rollback-Idempotent**：同一 `(checkpoint_id, rollback_id)` 不得产生第二次工作区变更；重试只能修复已记录的 transition node/审计缺失。
+18. **I-Failed-Path-Not-Repeated**：同一 run 中等价失败动作在执行前阻断，引用必须绑定当前边界和资源摘要。
+19. **I-No-Implicit-Git-Commit**：默认 backend 是 Pangu Artifact，不得隐式创建或修改 Git commit、branch、tag、stash 或 index。
+
+阶段二实现还保留以下恢复限制：`.rollback-operation.lock` 崩溃遗留时必须人工检查，不自动猜测；Windows 原子替换的 hand-off 临时文件需 operator 核验；不持有 Artifact lock 的并发 workspace writer 依赖最终 digest/CAS 检测，不能宣称 OS 级隔离。事故处理顺序和证据清单见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
 
 ## 5. 非目标
 
@@ -117,4 +151,4 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 
 只改文档而不改代码，或只改代码而不更新本文件，都视为边界漂移。
 
-当前 `ADR-0001` 仍待批准；第 4 节继续保持现有 11 条不变量不变。实现不得引用或依赖 ADR-0001 中尚未激活的拟新增不变量。
+当前 `ADR-0001` 已获批准；阶段一契约和阶段二实验性实现均已存在，但 checkpoint/rollback 仍默认关闭、尚未作为正式支持能力激活。第 1–11 条是现有运行边界；第 4.1 条的 12–19 条只在显式启用且通过阶段二验收门后适用。实现和文档必须继续区分“实验性 opt-in”与“正式支持”；operator 处理 stale lock、failed operation 和 Windows replacement backup 时必须遵循 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。

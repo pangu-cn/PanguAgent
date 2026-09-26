@@ -29,9 +29,194 @@ pub struct Config {
     pub model: ModelSection,
     pub budget: Budget,
     pub boundary: BoundarySection,
+    pub checkpoint: CheckpointSection,
     pub goal: GoalSection,
     pub rules: Vec<Rule>,
     pub unattended: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointBackend {
+    #[default]
+    Artifact,
+    Git,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointFailurePolicy {
+    #[default]
+    FailRun,
+    NeedsInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct CheckpointSection {
+    pub enabled: bool,
+    pub backend: CheckpointBackend,
+    pub artifact_root: PathBuf,
+    pub max_snapshot_bytes: u64,
+    pub max_snapshot_files: usize,
+    pub max_snapshot_file_bytes: u64,
+    pub failure_policy: CheckpointFailurePolicy,
+    pub rollback_requires_approval: bool,
+}
+
+impl Default for CheckpointSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: CheckpointBackend::Artifact,
+            artifact_root: PathBuf::from(".pangu/checkpoints"),
+            max_snapshot_bytes: 64 * 1024 * 1024,
+            max_snapshot_files: 10_000,
+            max_snapshot_file_bytes: 4 * 1024 * 1024,
+            failure_policy: CheckpointFailurePolicy::FailRun,
+            rollback_requires_approval: true,
+        }
+    }
+}
+
+impl CheckpointSection {
+    pub fn validate(&self, workspace: &Path, writable_roots: &[PathBuf]) -> Result<()> {
+        if self.max_snapshot_bytes == 0
+            || self.max_snapshot_files == 0
+            || self.max_snapshot_file_bytes == 0
+        {
+            return Err(Error::Config(
+                "checkpoint snapshot limits must be > 0".into(),
+            ));
+        }
+        pangu_core::SnapshotLimits {
+            max_snapshot_bytes: self.max_snapshot_bytes,
+            max_snapshot_files: self.max_snapshot_files,
+            max_snapshot_file_bytes: self.max_snapshot_file_bytes,
+        }
+        .validate()?;
+        if !self.rollback_requires_approval {
+            return Err(Error::Config(
+                "checkpoint.rollback_requires_approval cannot be disabled".into(),
+            ));
+        }
+        // A disabled section is deliberately inert with respect to paths. In
+        // particular, do not make older configurations fail merely because
+        // their existing writable roots do not happen to contain the future
+        // default path. Universal safety fields above are still validated.
+        if !self.enabled {
+            // Still reject malformed/traversing spellings so a dormant
+            // section cannot become an unsafe path after a later edit.
+            absolute_path_from(workspace, &self.artifact_root)?;
+            return Ok(());
+        }
+        let artifact_path = absolute_path_from(workspace, &self.artifact_root)?;
+        if path_has_symlink_component_under(workspace, &artifact_path) {
+            return Err(Error::Config(
+                "checkpoint.artifact_root must not contain symlink components".into(),
+            ));
+        }
+        let artifact_root = canonicalize_with_missing(&artifact_path)?;
+        let workspace = canonicalize_with_missing(workspace)?;
+        if !path_starts_with(&artifact_root, &workspace) || same_path(&artifact_root, &workspace) {
+            return Err(Error::Config(
+                "checkpoint.artifact_root must be a dedicated directory inside the workspace"
+                    .into(),
+            ));
+        }
+        if artifact_root.exists() && !artifact_root.is_dir() {
+            return Err(Error::Config(
+                "checkpoint.artifact_root must be a directory".into(),
+            ));
+        }
+        let inside_writable_root = writable_roots.iter().any(|root| {
+            absolute_path_from(&workspace, root)
+                .and_then(|root| std::fs::canonicalize(root).map_err(Into::into))
+                .map(|root| path_starts_with(&artifact_root, &root))
+                .unwrap_or(false)
+        });
+        if !inside_writable_root {
+            return Err(Error::Config(
+                "checkpoint.artifact_root must be inside a writable root".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn canonicalize_with_missing(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => {
+                let mut canonical = std::fs::canonicalize(&current)?;
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = current.file_name().ok_or_else(|| {
+                    Error::Config(format!("cannot resolve path: {}", path.display()))
+                })?;
+                missing.push(name.to_os_string());
+                if !current.pop() {
+                    return Err(Error::Config(format!(
+                        "cannot resolve path: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    comparable_path(left) == comparable_path(right)
+}
+
+fn path_starts_with(path: &Path, base: &Path) -> bool {
+    comparable_path(path).starts_with(comparable_path(base))
+}
+
+fn comparable_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.as_os_str().to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn path_has_symlink_component_under(base: &Path, path: &Path) -> bool {
+    let base = comparable_path(base);
+    let path = comparable_path(path);
+    let Ok(relative) = path.strip_prefix(&base) else {
+        return true;
+    };
+    let mut current = base;
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return true,
+            std::path::Component::Normal(value) => current.push(value),
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => return true,
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
@@ -340,6 +525,8 @@ impl Config {
                 )));
             }
         }
+        self.checkpoint
+            .validate(&workspace, &self.boundary.writable_roots)?;
         for pattern in &self.boundary.forbidden_globs {
             if pattern.chars().any(char::is_control) {
                 return Err(Error::Config(
@@ -513,7 +700,17 @@ impl Config {
         let mut env = self.boundary.env.allow.clone();
         env.sort();
         env.dedup();
-        let value = serde_json::json!({
+        let checkpoint_value = if self.checkpoint.enabled {
+            let mut checkpoint = self.checkpoint.clone();
+            checkpoint.artifact_root = absolute_path_from(&workspace, &checkpoint.artifact_root)
+                .ok()
+                .and_then(|path| canonicalize_with_missing(&path).ok())
+                .unwrap_or_else(|| checkpoint.artifact_root.clone());
+            serde_json::to_value(checkpoint).ok()
+        } else {
+            None
+        };
+        let mut value = serde_json::json!({
             "workspace": workspace.to_string_lossy().replace('\\', "/"),
             "readable_roots": roots(&self.boundary.readable_roots),
             "writable_roots": roots(&self.boundary.writable_roots),
@@ -540,6 +737,14 @@ impl Config {
             "rules": &self.rules,
             "unattended": self.unattended,
         });
+        // A disabled checkpoint remains configuration-compatible and must not
+        // change the digest of an existing v1 run. Once enabled, every
+        // checkpoint limit and policy field is part of the contract boundary.
+        if let Some(checkpoint) = checkpoint_value {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("checkpoint".into(), checkpoint);
+            }
+        }
         pangu_core::hex_sha256(&serde_json::to_string(&value).unwrap_or_default())
     }
 
@@ -644,6 +849,7 @@ pub struct CliOverrides {
     pub max_cost_usd: Option<f64>,
     pub add_egress: Vec<String>,
     pub unattended: bool,
+    pub checkpoint_enabled: Option<bool>,
     pub model: Option<String>,
     pub base_url: Option<String>,
 }
@@ -682,6 +888,9 @@ impl Config {
             self.unattended = true;
             self.boundary.approval.mode = ApprovalMode::Never;
         }
+        if let Some(enabled) = overrides.checkpoint_enabled {
+            self.checkpoint.enabled = enabled;
+        }
         self.validate()?;
         Ok(self)
     }
@@ -719,6 +928,67 @@ mod tests {
         relative.boundary.writable_roots = vec![std::path::PathBuf::from(".")];
         assert_eq!(absolute.boundary_digest(), relative.boundary_digest());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn disabled_checkpoint_is_inert_and_keeps_legacy_digest() {
+        let base = Config::embedded().unwrap();
+        let mut changed = base.clone();
+        changed.checkpoint.enabled = false;
+        changed.checkpoint.artifact_root = std::path::PathBuf::from("not-present");
+        changed.checkpoint.max_snapshot_bytes = 1;
+        changed.checkpoint.max_snapshot_file_bytes = 1;
+        assert_eq!(base.boundary_digest(), changed.boundary_digest());
+        changed.validate().unwrap();
+        changed.checkpoint.rollback_requires_approval = false;
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_checkpoint_is_bound_to_an_effective_absolute_root() {
+        let root = std::env::temp_dir().join(format!(
+            "pangu-checkpoint-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.checkpoint.enabled = true;
+        // Absolute user paths are accepted even when Windows canonicalization
+        // returns an extended-length spelling for the workspace.
+        config.checkpoint.artifact_root = root.join("artifacts");
+        let contract =
+            crate::goal::GoalContract::from_config("checkpoint contract", &config).unwrap();
+        assert!(contract.checkpoint.artifact_root.is_absolute());
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        assert!(contract
+            .checkpoint
+            .artifact_root
+            .starts_with(&canonical_root));
+        assert_ne!(
+            contract.digest(),
+            crate::goal::GoalContract::from_config("legacy", &Config::embedded().unwrap())
+                .unwrap()
+                .digest()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn old_config_without_checkpoint_section_loads_with_defaults() {
+        let base = Config::embedded().unwrap();
+        let mut value = toml::Value::try_from(&base).unwrap();
+        value.as_table_mut().unwrap().remove("checkpoint");
+        let loaded = Config::from_toml(&toml::to_string(&value).unwrap()).unwrap();
+        assert!(!loaded.checkpoint.enabled);
+        assert_eq!(loaded.checkpoint.backend, CheckpointBackend::Artifact);
+        assert!(loaded.checkpoint.rollback_requires_approval);
     }
 
     #[test]

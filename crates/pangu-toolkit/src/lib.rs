@@ -12,7 +12,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use pangu_agent::{ToolAssessment, ToolExecutor, ToolOutput, VerifiedAction};
+use pangu_agent::{
+    EffectDescriptor, EffectScope, Reversibility, ToolAssessment, ToolExecutor, ToolOutput,
+    VerifiedAction,
+};
 use pangu_boundary::{Risk, Sandbox};
 use pangu_core::{short_hash, ToolCall, ToolSpec};
 
@@ -114,7 +117,12 @@ impl ToolExecutor for Toolkit {
             "read_file" => {
                 ensure_allowed_keys(&call.args, &["path"])?;
                 let path = required_path(&call.args, "path")?;
-                let mut assessment = ToolAssessment::new(Risk::ReadOnly).read(path.clone());
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
                 assessment.preview = format!("read {}", path.display());
                 let _ = sandbox;
                 Ok(assessment)
@@ -122,7 +130,12 @@ impl ToolExecutor for Toolkit {
             "list_dir" => {
                 ensure_allowed_keys(&call.args, &["path"])?;
                 let path = required_path(&call.args, "path")?;
-                let mut assessment = ToolAssessment::new(Risk::ReadOnly).read(path.clone());
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
                 assessment.preview = format!("list {}", path.display());
                 Ok(assessment)
             }
@@ -133,7 +146,12 @@ impl ToolExecutor for Toolkit {
                 if query.len() > 512 {
                     bail!("search query is too long");
                 }
-                let mut assessment = ToolAssessment::new(Risk::ReadOnly).read(path.clone());
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
                 assessment.preview = format!(
                     "search {} query_sha256={}",
                     path.display(),
@@ -148,7 +166,12 @@ impl ToolExecutor for Toolkit {
                 if content.len() > sandbox.max_write_bytes {
                     bail!("write content exceeds configured limit");
                 }
-                let mut assessment = ToolAssessment::new(Risk::Reversible).write(path.clone());
+                let mut assessment = ToolAssessment::new(Risk::Reversible)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::Reversible,
+                    ))
+                    .write(path.clone());
                 assessment.preview = format!(
                     "write {} bytes={} sha256={}",
                     path.display(),
@@ -188,7 +211,12 @@ impl ToolExecutor for Toolkit {
                 } else {
                     format!("{host_name}:{port}")
                 };
-                let mut assessment = ToolAssessment::new(Risk::NeedsHuman).host(host);
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::ExternalRead,
+                        Reversibility::NoEffect,
+                    ))
+                    .host(host);
                 assessment.preview = format!("GET {}", url_preview(&url));
                 Ok(assessment)
             }
@@ -199,7 +227,9 @@ impl ToolExecutor for Toolkit {
                 let mut argv = vec![command.clone()];
                 argv.extend(args.iter().cloned());
                 sandbox.validate_argv(&argv)?;
-                let mut assessment = ToolAssessment::new(Risk::NeedsHuman);
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman).with_effect(
+                    EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                );
                 for path in command_read_paths(&command, &args)? {
                     assessment = assessment.read(path);
                 }

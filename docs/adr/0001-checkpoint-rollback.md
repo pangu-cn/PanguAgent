@@ -1,9 +1,11 @@
 # ADR-0001：Pangu Artifact 检查点与受限回退（提案）
 
-> **状态：提案 / 待批准 / 待实现**
+> **状态：已批准 / 阶段二实现已存在 / 实验性 opt-in，未正式激活**
 > **日期：2026-03-31**
+> **批准记录：** 2026-09-24；批准者/评审记录：项目维护者（用户在当前会话明确回复“批准”）；批准版本：本文 2026-03-31 版本。
+> **阶段二实现记录：** 2026-09-25；已加入 Artifact 内容寻址快照与恢复、session/operation/failed-path/effect ledger、Agent 成功动作后的 checkpoint、内部 rollback 状态机、Journal v2 receipt、CLI 子命令和独立/集成测试。checkpoint 仍默认关闭，Git backend 仍未实现；Windows 覆盖写入、崩溃遗留锁和并发 workspace writer 仍按本文的 operator recovery 限制处理。
 > **范围：** `pangu-core`、`pangu-boundary`、`pangu-agent`、Artifact/session store、Journal、配置和文档
-> **规范优先级：** 本文是设计提案，不是当前行为承诺。`docs/BOUNDARY.md` 仍是唯一生效的边界规范；在代码、不变量测试和兼容性说明完成前，本文中的新规则不能被实现为默认行为。
+> **规范优先级：** 本文记录已批准的设计和阶段二实现状态，但不是默认启用承诺。`docs/BOUNDARY.md` 仍是唯一生效的边界规范；阶段二能力只能在显式启用、通过有效 contract 和 L1–L4 闸门后使用，不能被模型或默认配置隐式打开。
 
 ## 1. 背景
 
@@ -22,16 +24,15 @@ assess → Policy (L2) → Sandbox (L3) → Approval (L4)
 - 工具成功 evidence、失败回灌和终态诚实性；
 - 工作区内可逆写入与有界只读工具。
 
-但当前还没有：
+阶段二实现现在提供（但默认不激活）：
 
-- 持久化的会话树或会话节点；
-- 工作区快照 Artifact；
-- checkpoint 与事件的稳定引用；
-- 受限的文件系统/会话回退；
-- failed-path ledger；
-- 外部副作用的独立 effect/reversibility 声明。
+- 持久化的 session node、Artifact manifest/blob 和 operation ledger；
+- 受限的工作区快照、compare-and-swap 恢复与幂等 rollback；
+- checkpoint 与稳定 Journal v2 receipt 的绑定；
+- failed-path ledger 和 checkpoint 之后的外部 effect ledger；
+- `Agent::rollback(&RollbackRequest)` 与 CLI `rollback` 子命令。
 
-本 ADR 规定这些能力的**提案边界**，不把 Git commit 当作 checkpoint 的必要条件，也不把应用层文件恢复描述为 OS 级隔离。
+本 ADR 规定这些能力的**设计边界和实现限制**，不把 Git commit 当作 checkpoint 的必要条件，也不把应用层文件恢复描述为 OS 级隔离。阶段二代码和测试已经存在，但在正式激活前仍按实验性能力处理。
 
 ## 2. 决策摘要
 
@@ -44,33 +45,19 @@ assess → Policy (L2) → Sandbox (L3) → Approval (L4)
 7. rollback 采用稳定的 operation ID；重复请求必须幂等，不得再次产生状态变更。
 8. 失败动作形成脱敏 failed-path 指纹；回退后的重新规划不得重复等价失败动作。
 9. 默认 backend 是 Pangu Artifact store；Git 仅是显式可选 backend，默认不得创建 commit、branch、tag 或修改 index。
-10. 在本 ADR 获得显式批准、且对应代码与测试合入前，本提案不修改当前生效的 `BOUNDARY.md` 不变量，也不改变任何运行时行为。
+10. 阶段二实现不改变默认运行行为：未显式启用时 checkpoint/rollback 不可用；启用后仍受本文和 `BOUNDARY.md` 的条件性不变量约束。
 
-### 2.1 批准前硬门槛
+### 2.1 阶段二实现门槛（已满足的部分）
 
-在本 ADR 被**显式批准**，且对应代码与测试合入之前，实现者不得：
+ADR 的批准门槛已经留下批准记录。阶段二实现还必须满足以下条件才可从“实验性 opt-in”升级为正式激活：
 
-- 修改 `docs/BOUNDARY.md` 第 4 节的不变量编号或语义；
-- 在 `pangu-agent` 中新增 checkpoint/rollback 状态机分支；
-- 扩展 `ToolAssessment` 的公开字段以承载 `EffectDescriptor`；
-- 在 Journal 中写入 v2 事件；
-- 修改 `[checkpoint]` 配置的默认值或让 CLI 暴露相关开关；
-- 在 README 或 ROADMAP 中把 F7 描述为“已支持”。
+- 所有 workspace 测试、clippy、格式检查和 CLI 集成测试通过；
+- 每个适用的 checkpoint/rollback 不变量都有独立测试，并同步到 `BOUNDARY.md`；
+- 恢复失败、崩溃遗留锁、operation ledger 和重复请求的 operator recovery 流程有明确文档；
+- v1 Journal、禁用 checkpoint 的旧配置和默认 Artifact backend 的兼容性得到保留；
+- 文档不再把实现状态误写成默认支持。
 
-违反以上任一条，视为边界漂移，应先回退相关改动，再重新进行 ADR 评审。显式批准必须留下可审计的批准记录（日期、批准者/评审记录和所批准版本）；仅有讨论、路线图勾选或代码草稿不构成批准。
-
-### 2.2 生效前禁止事项
-
-在 ADR-0001 获得显式批准前，实现者不得：
-
-- 修改 `docs/BOUNDARY.md` 第 4 节；
-- 新增 checkpoint/rollback 状态机；
-- 扩展 `ToolAssessment` 的公开字段；
-- 写入 Journal v2 事件；
-- 暴露 CLI 开关；
-- 在 `README.md` 或 `docs/ROADMAP.md` 中声称 checkpoint/rollback 已支持。
-
-这些禁止事项与 2.1 的批准前硬门槛同样适用；路线图勾选、讨论或代码草稿不构成批准。
+阶段二实现已加入代码和测试，但本 ADR 仍不把实验性能力当作默认承诺。
 
 ## 3. 目标与非目标
 
@@ -90,7 +77,7 @@ assess → Policy (L2) → Sandbox (L3) → Approval (L4)
 - 不允许模型自行扩大 roots、网络、凭据、预算或审批权限；
 - 不把 checkpoint 失败伪装成动作失败前的安全回滚；
 - 不让 Journal replay 自动执行文件恢复或其它副作用；
-- 不在本提案中承诺多 Agent DAG、远程 Runner 或办公连接器实现。
+- 不在本 ADR 中承诺多 Agent DAG、远程 Runner 或办公连接器实现。
 
 ## 4. 术语和数据模型
 
@@ -216,54 +203,35 @@ FailedPathRecord 的清除规则如下：
 - clear 本身是内部 maintenance `VerifiedAction`，必须经过既有 L1–L4 链；
 - 被清除记录标记为 `superseded`，不得删除或改写原始失败证据。
 
-## 5. 提议的新增不变量（尚未激活）
+## 5. 阶段二 checkpoint/rollback 不变量（实验性 opt-in）
 
-本节的 8 条拟新增不变量在 ADR 激活后，必须作为 `BOUNDARY.md` 第 4 节第 12–19 条插入；现有第 1–11 条的编号和语义保持不变。在激活前，不得将这些拟新增不变量写入 `BOUNDARY.md` 正文。
+以下 8 条规则已经由阶段二代码和测试实现，并同步列为 `BOUNDARY.md` 第 12–19 条的实验性/条件性不变量。它们只适用于显式启用 checkpoint、通过有效 contract 绑定的运行；在正式激活前，不能据此宣称默认 checkpoint/rollback 支持，也不改变第 1–11 条的语义。
 
-以下规则将在代码和测试完成后进入 `BOUNDARY.md`。在本次文档提案中，它们不是当前已实现保证。
+- `I-Checkpoint-After-Verified-Action`：只有成功 `VerifiedAction` 对应的成功 `ToolFinished` 才能产生 checkpoint。
+- `I-Checkpoint-Atomic`：快照、manifest、稳定事件指针、session node 和完成 marker 必须可验证；缺失或损坏的 checkpoint 不得成为回退源。
+- `I-Rollback-Trigger`：rollback 只能由 typed `RollbackRequest` 触发，并绑定目标 checkpoint、来源 session node、理由和可选 failed-path 引用。
+- `I-Irreversible-Requires-Human`：外部 mutation 必须在执行前声明、记账并取得明确人工允许。
+- `I-Rollback-Scope`：rollback 只恢复工作区和 session 状态，不执行外部补偿、Git、网络、子进程或连接器。
+- `I-Rollback-Idempotent`：同一 `(checkpoint_id, rollback_id)` 只产生一次状态变更；已完成 operation 的重试只修复缺失的 transition node/审计事件。
+- `I-Failed-Path-Not-Repeated`：同一 run 中等价失败动作在执行前阻断；引用必须绑定当前 contract、policy、工具和资源摘要。
+- `I-No-Implicit-Git-Commit`：默认只使用 Pangu Artifact；不得隐式创建或修改 Git commit、branch、tag、stash 或 index。
 
-### `I-Checkpoint-After-Verified-Action`
+这些规则的实现和验收状态见 [`BOUNDARY.md`](../BOUNDARY.md) 第 4.1 节、测试矩阵和本文第 13 节。
 
-只有成功完成的 `VerifiedAction` 才能产生 checkpoint。blocked、失败、无效调用、未完成动作和 `finish` 控制调用不能产生可恢复 checkpoint。
+### 实现注记
 
-### `I-Checkpoint-Atomic`
-
-快照、manifest、事件指针和会话节点必须作为一个可验证的逻辑提交。任一组成部分缺失、损坏或未持久化时，Artifact 只能标记为 incomplete，不能被回退逻辑信任。
-
-### `I-Rollback-Trigger`
-
-rollback 只能由包含目标 checkpoint、来源 session node、理由和失败路径/用户请求引用的 typed `RollbackRequested` 触发。模型不能只凭自然语言或未经验证的路径参数触发恢复。第一版不默认在失败后自动回退。
-
-### `I-Irreversible-Requires-Human`
-
-外部 mutation 必须在执行前声明为 `irreversible`，并得到 L4 外部 handler 的明确人工允许。Policy allow、模型参数、默认模式和历史批准不能降级该要求。
-
-### `I-Rollback-Scope`
-
-rollback 只能修改工作区和会话状态。它不能执行网络补偿、外部 API、子进程、连接器动作或隐式 Git 操作。默认情况下，若 checkpoint 之后发生不可逆外部 mutation，则拒绝整次 rollback。
-
-### `I-Rollback-Idempotent`
-
-同一 `(checkpoint_id, rollback_id)` 的重复请求必须返回同一确定结果。已完成的恢复不能再次写文件、再次生成副作用或生成第二个成功终态。
-
-### `I-Failed-Path-Not-Repeated`
-
-失败路径必须被记录并在后续执行前检查。回退后的重新规划不得再次提交等价失败动作；重复请求必须被确定性阻断并留下审计记录。清除 failed-path 必须有显式的新 GoalContract/PlanNode 和审计理由。
-
-### `I-No-Implicit-Git-Commit`
-
-checkpoint 默认是 Pangu Artifact。不得隐式创建 Git commit、branch、tag、stash、index 修改或远程操作。Git backend 只有在用户显式选择、策略允许并完成审批时才能执行独立动作。
+`commit_after_success` 会拒绝非 `ToolFinished`、非 v2 sealed receipt 或 effect metadata 与已验证 action 不一致的事件。带 session node 的 Artifact 只有写入 `COMMITTED` marker 后才可加载。`Agent::rollback` 在 Policy、Approval 和外部 effect 检查前短路已完成的 operation；恢复期间会在锁内再次检查 effect ledger 和 workspace digest。
 
 ## 6. L1–L4 映射
 
-| 层 | 提案职责 | 必须保持的现有边界 |
+| 层 | 阶段二职责 | 必须保持的现有边界 |
 |---|---|---|
 | L1 `GoalContract` | 冻结 checkpoint 开关、Artifact 根、快照限制、失败策略、rollback 模式和所有有效 digest | 模型不能动态放宽 roots、预算、审批或恢复范围 |
-| L2 `Policy` | 评估内部 checkpoint/rollback capability；拒绝模型直接请求未声明的外部 mutation 或任意恢复 | deny 优先、default deny、规则不能被模型或 rollback 覆盖 |
-| L3 `Sandbox` | 校验快照/恢复路径、canonical roots、symlink、禁止 glob、文件数/字节数、临时目录和原子恢复资源 | 这是应用层资源验证，不是 OS/VM/容器隔离 |
-| L4 `Approval` | 对不可逆外部 mutation 和 rollback 的明确人工确认；`Never` 下拒绝而不是自动允许 | 模型不是批准来源；NoAnswer/超时 fail closed |
+| L2 `Policy` | 用 `evaluate_internal` 评估不可由模型命名的 checkpoint capability；正常 deny 优先，匹配的 allow/ask 仍生效；rollback 仍是显式 `rollback` capability | 没有匹配规则时内部 checkpoint 由 L1 显式开关授权；模型不能借此获得任意恢复权限 |
+| L3 `Sandbox` | 由 `SnapshotRequest` 和 `Sandbox` 校验快照/恢复路径、canonical roots、symlink、禁止 glob、文件数/字节数和临时资源 | 这是应用层资源验证，不是 OS/VM/容器隔离 |
+| L4 `Approval` | 对不可逆外部 mutation 始终要求明确人工允许；rollback 始终要求 L4；checkpoint 只有在 Policy 返回匹配 `ask` 时才进入 L4 | 模型不是批准来源；`Never`、NoAnswer、超时均 fail closed |
 | Agent | 维护成功动作、session node、checkpoint 和 rollback 状态机；只通过私有 `VerifiedAction` 进入 Executor | 不直接从 Agent/CLI 调用文件系统或外部补偿 |
-| Artifact store | 保存不可变 manifest/blob、执行受控恢复、维护 operation ledger | 不自行决定 Policy、Approval 或预算 |
+| Artifact store | 保存不可变 manifest/blob、执行受控恢复、维护 operation/session/failed-path/effect ledger | 不自行决定 Policy、Approval 或预算；崩溃遗留锁需 operator 检查，不自动猜测恢复 |
 
 ### 6.1 checkpoint 与预算交互
 
@@ -275,19 +243,21 @@ checkpoint 和 rollback 属于内部 maintenance action，不产生模型 token 
 
 ```text
 ToolExecutor::execute(&VerifiedAction)
-  → ToolFinished(ok=true, event_id)
+  → ToolStarted(receipt) → [external effect ledger before execute]
+  → ToolFinished(ok=true, sealed v2 event_id)
   → internal checkpoint capability
-       assess → Policy → Sandbox → Approval → VerifiedAction
-  → snapshot + session node commit
+       Policy::evaluate_internal → SnapshotRequest/Sandbox
+       → Approval only when Policy returns ask
+  → snapshot + session node + COMMITTED marker
   → CheckpointCreated(event_ref, checkpoint_id, session_node_id)
 ```
 
 规则：
 
-- `ToolFinished` 的稳定事件 ID 是 checkpoint 的来源指针；
+- `ToolFinished` 的稳定 v2 event ID、序号、hash 和 effect metadata 是 checkpoint 的来源指针；
+- 外部 mutation 在执行前写入 effect ledger；工具失败或进程崩溃不会使 ledger 假定外部动作未发生；
 - checkpoint 事件自身不能替代成功动作的 evidence；
-- checkpoint 失败时不能静默声称“已检查点”；
-- 在 required 模式下，checkpoint 失败会使 run 进入明确失败/需输入状态；
+- checkpoint 失败时不能静默声称“已检查点”；`fail_run` 进入失败，`needs_input` 进入需人工输入；
 - 已经发生的外部动作不能因 checkpoint 失败而被假定撤销；
 - checkpoint/rollback 自身属于内部 maintenance action，不再递归触发新的 checkpoint；其状态变化仍要记录事件。
 
@@ -295,12 +265,13 @@ ToolExecutor::execute(&VerifiedAction)
 
 ```text
 RollbackRequested
-  → validate checkpoint / boundary / session / failed path
-  → reject if forbidden external effect occurred
+  → validate typed request / checkpoint / boundary / source session node
+  → short-circuit an already-applied operation after source-digest binding
+  → validate failed-path reference and reject if forbidden external effect occurred
   → Policy → Sandbox → Approval
-  → internal rollback VerifiedAction
-  → staged restore + compare-and-swap
-  → atomic commit
+  → durable RollbackStarted receipt + operation transition binding
+  → staged restore + compare-and-swap + exact final digest
+  → save transition session node
   → RollbackApplied(rollback_id, checkpoint_id, session_node_id)
 ```
 
@@ -314,7 +285,9 @@ RollbackRequested
 
 恢复过程中不得调用 Git、网络、子进程或连接器。Journal、manifest 和 operation ledger 的审计写入是允许的 bookkeeping，不属于外部或业务副作用，但必须本身有界、原子且可审计。若实现选择 Git backend，Git 动作必须是独立、显式、可审批的 VerifiedAction，不能成为 rollback 的隐藏步骤。
 
-若 rollback 在任一阶段失败，必须回到本次 `RollbackRequested` 前的逻辑状态，并按可恢复性进入 `Failed` 或 `NeedsInput` 终态；禁止对同一失败自动发起第二次 rollback。失败事件必须记录失败阶段、脱敏原因和可审计的失败上下文，不得把部分恢复伪装成成功。
+若 rollback 在 workspace mutation 前失败，逻辑状态保持不变；若 mutation 阶段失败，Artifact store 尝试撤销已安装路径、恢复原目录权限并重新检查 digest。operation ledger 会记录 `Failed`，同一失败不会自动重试。失败事件必须记录 `failure_stage`、脱敏原因和可审计的失败上下文，不得把部分恢复伪装成成功。
+
+如果进程在 restore 已写入、但 operation/node/marker 尚未完成时崩溃，`.rollback-operation.lock` 会故意留下。新的操作不会猜测恢复；operator 必须先检查 checkpoint、operation、workspace digest、临时目录和 session ledger，再决定删除锁、标记失败或人工完成 transition。Windows 上的原子文件替换还受目标文件 rename hand-off 限制，operator 应把 replace-backup 临时文件视为恢复证据而不是自动清理。并发 workspace writer 不持有 Artifact lock 时，最终 digest/CAS 会拒绝不确定覆盖；实现不宣称提供文件系统级隔离。
 
 ### 7.3 重新规划
 
@@ -326,22 +299,20 @@ rollback 成功后创建新的 session node：
 - 向模型只提供脱敏的失败类别、路径摘要和不可重复约束；
 - Runtime 在执行前再次检查 failed-path，不能只依赖 prompt 遵守。
 
-## 8. 事件契约提案
+## 8. 事件契约设计
 
-当前 `pangu-journal/v1` 事件枚举不包含 checkpoint/rollback 事件。建议启用该能力时引入 `pangu-journal/v2`，保留 v1 读取能力，不重写旧 Journal。
+阶段二实现使用 `pangu-journal/v2` 承载 checkpoint/rollback 事件；`pangu-journal/v1` 的读取、字段和哈希兼容保留，不重写旧 Journal。启用 checkpoint 的运行从 v2 Journal receipt 开始；MemSink 也为测试生成同形状的稳定内存 receipt。
 
 ### 8.1 新事件
 
-建议新增：
+已实现的事件：
 
-- `CheckpointCreated`；
-- `CheckpointFailed`；
-- `RollbackRequested`；
-- `RollbackStarted`；
-- `RollbackApplied`；
-- `RollbackSkippedAlreadyApplied`；
-- `RollbackFailed`；
+- `CheckpointCreated` / `CheckpointFailed`；
+- `RollbackRequested` / `RollbackStarted` / `RollbackApplied`；
+- `RollbackSkippedAlreadyApplied` / `RollbackFailed`；
 - `FailedPathRecorded`。
+
+v2 receipt 由 Journal/MemSink 在写入时封存，包含 schema、连续 `seq`、`prev_sha`、内容 `sha` 和由位置/内容计算的 `evt_<sha256>` ID。TeeSink 对多个带稳定 receipt 的 durable sink 比较这些字段，不一致即失败。
 
 ### 8.2 现有事件扩展
 
@@ -366,7 +337,7 @@ run_id
 可选 journal_id / seq / sha
 ```
 
-如果未来要求所有 sink 返回 Journal 的 sealed receipt，应以独立、向后兼容的 API 扩展 `EventSink`，不能破坏现有嵌入方的 `emit` 调用。
+`EventSink::emit` 保持向后兼容；需要来源 receipt 的内部路径使用向后兼容的 `emit_with_receipt`。旧 sink 没有稳定 receipt 时不能被当作 checkpoint 来源。
 
 ### 8.4 Replay 规则
 
@@ -378,9 +349,9 @@ Journal replay 只做：
 
 replay 不自动恢复文件、不执行 Git、不调用外部补偿，也不把 `RollbackApplied` 重放成第二次副作用。
 
-## 9. 配置提案
+## 9. 配置设计
 
-建议新增可选配置，默认关闭：
+已实现的可选配置，默认关闭：
 
 ```toml
 [checkpoint]
@@ -400,9 +371,11 @@ rollback_requires_approval = true
 - `artifact_root` 必须是显式 writable root 内的 canonical 路径；
 - Artifact 自身目录不进入工作区快照；
 - 所有大小、文件数和路径限制进入有效 `GoalContract` digest；
-- `backend = "git"` 只能是显式选择，不能由默认值触发 commit；
+- `backend = "git"` 当前未实现；显式设置会在 runtime 启动时失败，不能由默认值触发 commit；
 - 不允许通过模型参数改变 checkpoint 根目录、限制或 backend；
 - 启用 checkpoint 后，旧的未绑定 contract 不得直接用于新 run。
+
+CLI 的全局开关是 `--checkpoint`（可写 `--enable-checkpoint`），rollback 目标使用 `--checkpoint-id`/`--target-checkpoint`，避免与全局开关产生参数歧义。`rollback` 拒绝 unattended，并通过 stdin approval 请求一次明确确认。
 
 ## 10. 兼容性和迁移
 
@@ -470,12 +443,29 @@ rollback_requires_approval = true
 7. 更新 `BOUNDARY.md` 规范文本、`ARCHITECTURE.md` 当前实现说明和 README 用户说明；
 8. 只有所有测试和兼容性检查通过后，才允许把配置默认或 CLI 行为公开。
 
-## 14. 待确认事项
+### 13.1 当前阶段二进度
 
-- checkpoint 是否默认关闭（提案：关闭）；
-- 存在不可逆外部动作时是否阻止整次 rollback（提案：阻止）；
-- rollback 是否始终需要 L4（提案：需要，`Never` 拒绝）；
-- failed-path 第一版是否只覆盖可执行 ToolCall（提案：是）；
-- Git backend 是否允许显式创建 commit（提案：允许，但必须是独立、显式、可审批动作）。
+已实现并有测试覆盖的范围：
 
-在这些问题确认并取得本 ADR 的显式批准、且对应代码与测试合入前，本 ADR 不授权实现者修改生效中的 `BOUNDARY.md` 语义、改变运行时行为或宣称当前版本已经支持 checkpoint/rollback。
+- `EffectDescriptor`、资源声明一致性和 Policy 前 fail-closed 校验；
+- Artifact 内容寻址快照、manifest/blob 校验、临时目录发布、`COMMITTED` marker 和 session node 事务；
+- 精确恢复、权限恢复、CAS/最终 digest、跨进程锁、幂等 operation ledger、Failed operation 不自动重试和 transition node 修复；
+- 外部 effect ledger、failed-path ledger、同 run 等价失败阻断和脱敏失败事件；
+- Agent 成功 `ToolFinished` 后的 checkpoint、内部 Policy/Sandbox/L4 链、typed rollback、预算检查和 source/target/session 绑定；
+- Journal v1/v2、稳定 receipt、TeeSink receipt 一致性、CLI rollback 和真实子进程集成测试；
+- symlink、特殊文件、损坏 blob/marker、路径穿越、stale lock、CLI flag 兼容和效果作用域测试；
+- [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) operator recovery 运行手册，覆盖证据保全、stale lock、failed operation、CAS drift、外部副作用和 Windows replacement hand-off。
+
+尚未宣称正式激活的原因：checkpoint 仍是默认关闭的实验性 opt-in；Windows 文件替换 hand-off、崩溃遗留 `.rollback-operation.lock` 的 operator-only 恢复，以及不持有 Artifact lock 的并发 workspace writer 仍需部署者按第 7.2 节和 [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) 处理。完成这些限制的跨平台验证和最终验收前，本文及 README 不把 checkpoint/rollback 描述为默认支持。
+
+## 14. 已确认的设计决策与当前实现边界
+
+本次批准确认以下设计选择；阶段二代码已经实现其中的 Artifact/Agent/CLI 路径，但仍保持实验性 opt-in：
+
+- checkpoint 默认关闭；没有显式启用和有效 contract 不得创建 checkpoint；
+- checkpoint 之后发生不可逆外部 mutation 时，默认阻止整次 rollback；不实现外部补偿；
+- rollback 始终需要 L4 明确批准，`Never`/无答案/超时均拒绝；
+- failed-path 第一版只覆盖可执行 `ToolCall`，不把自然语言计划当作稳定路径身份；
+- Git backend 当前未实现，且永远不能成为 rollback 的隐藏步骤；未来若实现必须是独立、显式、可审批的 capability。
+
+阶段二的恢复限制和 operator 流程已经写入第 7.2 节及 [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md)；在正式激活前，本文不把 checkpoint/rollback 描述为默认支持，也不允许模型直接触发它。

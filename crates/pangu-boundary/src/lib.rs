@@ -14,7 +14,10 @@ pub use approval::{
     StdinApproval, Unattended,
 };
 pub use budget::{Breach, Budget};
-pub use config::{BoundaryConfig, BoundarySection, CliOverrides, Config, EnvSection};
+pub use config::{
+    BoundaryConfig, BoundarySection, CheckpointBackend, CheckpointFailurePolicy, CheckpointSection,
+    CliOverrides, Config, EnvSection,
+};
 pub use goal::{GoalContract, GoalStatus};
 pub use policy::{ActionRequest, Decision, Effect, Policy, Rule};
 pub use risk::Risk;

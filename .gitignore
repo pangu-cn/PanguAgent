@@ -5,3 +5,11 @@ Cargo.lock
 *.jsonl
 !tests/fixtures/**
 .env
+
+# 本地手工验证残留：根目录产物不进入版本库
+/*.log
+/*.txt
+/*.err
+/*.json
+/path-debug.*
+/.status-temp

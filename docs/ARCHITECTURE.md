@@ -4,6 +4,8 @@
 
 ## 核心目标
 
+> checkpoint/rollback 的阶段二代码目前是**默认关闭的实验性 opt-in**。本节描述其实现结构；在正式激活前，不把它当作 v0.1 的默认产品承诺。
+
 - **G1（诚实）**：没有成功工具证据，模型不能把运行标为 `complete`。
 - **G2（可审计）**：每个运行通过 `EventSink` 发出事件；CLI 使用带 SHA-256 链的 JSONL Journal。
 - **G3（自主但不越界）**：模型可以连续规划，但副作用只能走中心 capability 入口。
@@ -61,14 +63,52 @@ ApprovalHandler（L4）
 构造 VerifiedAction（字段私有，构造函数不对外开放）
         │
         ▼
-ToolStarted → ToolExecutor::execute(&VerifiedAction)
+ToolStarted(v2 receipt) → [external mutation ledger] → ToolExecutor::execute(&VerifiedAction)
         │
         ├─ error ──────────────► ToolFinished(ok=false) + error tool_result
         ▼
-ToolFinished(ok=true, evidence) → tool_result → 下一回合
+ToolFinished(ok=true, sealed v2 receipt) → checkpoint（仅成功动作）
+        │
+        ├─ checkpoint 失败 ────► CheckpointFailed + fail_run/needs_input
+        ▼
+CheckpointCreated + session node + COMMITTED marker
 ```
 
+checkpoint 的内部链是 `Policy::evaluate_internal → SnapshotRequest/Sandbox →（仅 ask 时）Approval → ArtifactStore`；它不递归创建 checkpoint。rollback 不通过模型工具触发，而是由 `Agent::rollback(&RollbackRequest)` 或 operator CLI 调用，并经过 rollback Policy、Sandbox 和 L4。
+
 `ToolExecutor` 是受信适配器边界：Agent 不把模型文本直接转换成 shell 命令，也不给模型一个可以绕过 `assess` 的执行方法。`assess` 收到的 `&Sandbox` 只能用于解析和验证；真正执行必须使用 `VerifiedAction` 中已经解析的资源和 `cwd`。
+
+成功 `ToolFinished` 后的阶段二 checkpoint 链如下：
+
+```text
+ToolExecutor::execute(&VerifiedAction)
+  → ToolStarted (v2 receipt)
+  → external mutation ledger (执行前)
+  → ToolFinished(ok=true, sealed receipt)
+  → Policy::evaluate_internal
+  → SnapshotRequest / Sandbox
+  → Approval（仅匹配 ask 时）
+  → content-addressed snapshot + session node + COMMITTED
+  → CheckpointCreated
+```
+
+checkpoint 只接受成功 `VerifiedAction` 对应的 `ToolFinished`；失败、被拒绝、超预算、`finish` 控制调用和非 v2/伪造 receipt 都不能产生 checkpoint。外部 mutation 在 adapter 执行前记账，所以工具错误或进程崩溃不会让 ledger 假定外部动作没有发生。
+
+rollback 的结构化流程是：
+
+```text
+RollbackRequested
+  → load target/source artifact and bind session/contract/policy
+  → validate failed-path reference
+  → reject external effect after target
+  → Policy → Sandbox → Approval
+  → RollbackStarted + durable operation transition binding
+  → staged exact restore + CAS + final digest
+  → transition session node
+  → RollbackApplied / RollbackSkippedAlreadyApplied
+```
+
+`ArtifactStore` 在进程内 mutex 和跨进程 `.rollback-operation.lock` 下执行 ledger、快照、恢复和 node 写入。带 session node 的 checkpoint 必须有 `COMMITTED` marker；`load_checkpoint`、manifest、blob、路径、大小和 hash 校验失败均 fail closed。重复 `(checkpoint_id, rollback_id)` 在 Policy/Approval/外部 effect 检查前短路；如果 transition node 丢失，重复请求只按 immutable operation binding 修复 node，不再次写 workspace。
 
 ## 回合与终态
 
@@ -91,8 +131,13 @@ ToolFinished(ok=true, evidence) → tool_result → 下一回合
 RunStarted, TurnStarted, ModelRequest, ModelResponse,
 ToolRequested, PolicyDecision, ApprovalRequested, ApprovalResolved,
 ToolStarted, ToolBlocked, ToolFinished, BudgetExhausted,
-FinishRequested, RunFinished, Note
+FinishRequested, RunFinished, Note,
+CheckpointCreated, CheckpointFailed,
+RollbackRequested, RollbackStarted, RollbackApplied,
+RollbackSkippedAlreadyApplied, RollbackFailed, FailedPathRecorded
 ```
+
+启用 checkpoint 的运行使用 `pangu-journal/v2`；禁用时保留 v1。v2 写入时封存 `schema`、连续 `seq`、`prev_sha`、内容 `sha` 和 `evt_<sha256>` 稳定 ID。`EventSink::emit` 保持兼容，内部 receipt 路径使用 `emit_with_receipt`；TeeSink 比较多个 durable sink 的 receipt，不一致则失败。Journal replay 只校验和索引，不恢复文件、不重放副作用。
 
 每条事件包含 `seq`、`at`、`turn`、可选 tool/call/verdict/risk/rule/invariant/usage/payload。事件字段、payload 和 Journal 写入前会脱敏；消息、字段、payload 和单行 Journal 都有大小上限。
 
@@ -138,9 +183,35 @@ Sandbox 将相对路径解析到 workspace，而不是依赖进程当前目录�
 
 `Never`、`DestructiveAndAbove` 和 `Always` 只决定何时请求人工确认，永远不把请求交给模型；`Never` 会拒绝需要人工/破坏性确认的动作，而不是自动放行。`NoAnswer`、超时和无人值守 handler 都 fail closed。`ApprovalRequest` 的参数和 preview 在展示/事件边界处脱敏。
 
+rollback 始终把动作作为 destructive capability 送入 L2/L3/L4；CLI 使用 stdin approval。内部 checkpoint 是例外：L1 显式开关授权固定的非模型 capability，L2 仍执行 deny/匹配 ask/allow，L3 仍校验 SnapshotRequest/Sandbox，只有匹配 `ask` 才请求 L4。外部 mutation 不论 Policy 如何都必须先取得 L4。
+
 ### Provider 与工具适配器
 
 当前只有 `OpenAiCompatibleProvider`。它将统一的 `Message`/`ToolSpec` 转为 OpenAI `/chat/completions` 请求，限制响应体，并要求每个响应提供有效的 `prompt_tokens` 和 `completion_tokens`；可选的 `cache_read_tokens` 也必须有效并计入输入预算。`Toolkit` 实现 `ToolExecutor`，所有工具在 `assess` 阶段声明资源和风险，在 `execute` 阶段只消费 `VerifiedAction`。Provider 集成测试使用本地 TCP mock server 覆盖成功响应、usage/cache token、非 2xx 脱敏、redirect 禁止和响应体上限，不依赖外部网络或 API key。
+
+## Checkpoint/rollback 实现细节
+
+### Artifact store
+
+`pangu-core::ArtifactStore` 是 Pangu 自己的内容寻址存储：
+
+- `SnapshotRequest` 只接受现有 canonical roots，拒绝越界、symlink、特殊文件和 excluded/forbidden 路径；默认排除 workspace 内 `.pangu` 和 Artifact root；
+- 文件先读入有界内存，manifest/blob 写入临时目录，完成后以 rename 发布；带 session node 的目录只有在 `manifest.json`、embedded node、standalone session node 和 `COMMITTED` marker 全部持久化后才可加载；
+- restore 验证目标完整状态，备份额外目录、应用目录权限、删除目标外路径，并在失败时尝试撤销；最终 workspace digest 必须与 artifact snapshot digest 相等；
+- `RollbackOperation` 记录 source digest、状态、错误、完成时间和 transition node/event binding；`Failed` 不自动重试，`Applied` 重复请求只返回 `AlreadyApplied`；
+- `effects.jsonl`、`failed-paths.jsonl`、session node 和 operation 文件均有大小、schema、路径和引用校验；外部 effect 必须在同一 run 且 checkpoint 之后才阻止 rollback；
+- 进程内锁、跨进程 `create_new` transaction marker、symlink 检查和临时路径清理均 fail closed。发现 stale `.rollback-operation.lock` 时 runtime 不猜测恢复，operator 必须人工检查。
+
+### Effect 与工具声明
+
+`EffectDescriptor` 与 `Risk` 独立：workspace mutation 必须有 write path，process-read 必须有 argv，external-read 必须有 host，external-mutation 至少声明 host/argv/write path 且必须 `irreversible`/destructive；session effect 不能伪装成 filesystem/external effect。声明不一致在 Policy 前失败。
+
+### 已知恢复限制
+
+- Windows 覆盖写入需要 destination backup + rename hand-off；中断时 `.replace-backup-*` 是 operator 证据，不能自动当作普通垃圾清理；
+- crash 可能在 workspace 已变更、operation/node 尚未完成之间留下 stale lock；不提供自动猜测或自动补偿；
+- 不持有 Artifact lock 的外部 workspace writer 可能改变文件，最终 digest/CAS 会拒绝不确定结果，但应用层锁不是 OS/VM 隔离；
+- replay 永不自动执行 restore，Git backend 当前明确未实现。
 
 ## 不变量测试矩阵
 
@@ -158,6 +229,14 @@ Sandbox 将相对路径解析到 workspace，而不是依赖进程当前目录�
 | I-Real-Toolkit-Execution | `crates/pangu-toolkit/tests/toolkit_integration.rs` | read/list/search/write 经过真实 Agent capability 链；越界、forbidden glob、symlink 和输出超限无副作用 |
 | I-Provider-Fail-Closed | `crates/pangu-provider/tests/openai_compatible.rs` | usage、非 2xx 脱敏、redirect 和响应体上限均 fail closed |
 | I-Child-Env-Cleaned | sandbox implementation | child env 是 allow-list 子集 |
+| I-Checkpoint-After-Verified-Action | `crates/pangu-agent/src/test_support.rs` | 只有成功 v2 `ToolFinished` 创建 checkpoint |
+| I-Checkpoint-Atomic | `crates/pangu-core/src/artifact.rs` | manifest/blob/node/marker 缺失或损坏时拒绝加载 |
+| I-Rollback-Trigger | `crates/pangu-agent/src/test_support.rs` | typed request、source/target/session/digest 绑定 |
+| I-Irreversible-Requires-Human | agent/core tests | effect ledger 先于执行，未批准/外部 mutation 后拒绝 |
+| I-Rollback-Scope | artifact/agent tests | rollback 不执行外部资源，只改 workspace/session |
+| I-Rollback-Idempotent | artifact/agent/invariant tests | operation CAS、重复请求、transition node 修复和 Failed operation 不自动重试 |
+| I-Failed-Path-Not-Repeated | agent/core tests | 同 run 等价失败执行前阻断，跨 run/错误 digest 拒绝 |
+| I-No-Implicit-Git-Commit | `tests/invariants.rs`, config tests | Git backend 显式失败，默认不触发 Git |
 
 ## 已知边界
 
@@ -165,4 +244,5 @@ Sandbox 将相对路径解析到 workspace，而不是依赖进程当前目录�
 - DNS 解析和 provider endpoint 仍依赖用户配置；当前网络闸门会 check/recheck DNS，但没有把已验证的解析结果固定到连接所使用的 IP，因此仍存在 DNS rebinding / TOCTOU 限制。这不是抵抗恶意网络对手的隔离方案。
 - 墙钟预算在 Agent 的 provider/tool phase 边界检查，内置适配器有各自超时；任意外部 trusted adapter 或同步 OS DNS 解析不会被通用 Agent future 强制抢占，宿主需要提供有界适配器。
 - Journal replay 当前提供完整性校验和摘要，不重新执行工具。
+- checkpoint/rollback 阶段二实现默认关闭、仅实验性 opt-in；Windows replace hand-off、stale lock 和无锁并发 writer 的限制见“已知恢复限制”，不构成 OS 级隔离或正式支持声明。operator 处理步骤和证据清单见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
 - 默认 `pangu run` 需要用户提供 API key 和模型输入/输出价格；`pangu --demo` 使用本地 scripted provider 并显式声明零价格来验证状态机。

@@ -29,13 +29,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check workspace
-        run: cargo check --workspace
+        run: cargo check --workspace --all-targets --all-features
 
       - name: Run all tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --all-features
 
       - name: Run strict Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run local demo smoke test
         run: cargo run -q -p pangu -- --demo

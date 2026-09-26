@@ -12,7 +12,7 @@ use pangu_agent::{Agent, Provider};
 use pangu_boundary::{
     CliOverrides, Config, GoalContract, Policy, Sandbox, StdinApproval, Unattended,
 };
-use pangu_core::{ChatResponse, Journal, Message, TeeSink, ToolCall, Usage};
+use pangu_core::{ChatResponse, Journal, Message, RollbackRequest, TeeSink, ToolCall, Usage};
 use pangu_provider::OpenAiCompatibleProvider;
 use pangu_toolkit::Toolkit;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -36,11 +36,20 @@ struct Cli {
     max_turns: Option<u32>,
     #[arg(long = "max-cost-usd", global = true)]
     max_cost_usd: Option<f64>,
+    #[arg(
+        long = "checkpoint",
+        visible_alias = "enable-checkpoint",
+        global = true,
+        conflicts_with = "no_checkpoint"
+    )]
+    checkpoint: bool,
+    #[arg(long = "no-checkpoint", global = true)]
+    no_checkpoint: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
-#[derive(Clone, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 enum Commands {
     Doctor {
         #[arg(long = "journal")]
@@ -54,6 +63,18 @@ enum Commands {
         goal: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
+    },
+    Rollback {
+        #[arg(long = "checkpoint-id", visible_alias = "target-checkpoint")]
+        checkpoint_id: String,
+        #[arg(long)]
+        source_node: String,
+        #[arg(long)]
+        rollback_id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "cli")]
+        requested_by: String,
     },
 }
 
@@ -73,6 +94,23 @@ async fn main() -> Result<()> {
         Some(Commands::Config { file }) => config_command(file),
         Some(Commands::Run { goal, dry_run }) => {
             run_command(&args, goal, dry_run || args.dry_run).await
+        }
+        Some(Commands::Rollback {
+            checkpoint_id,
+            source_node,
+            rollback_id,
+            reason,
+            requested_by,
+        }) => {
+            rollback_command(
+                &args,
+                checkpoint_id,
+                source_node,
+                rollback_id,
+                reason,
+                requested_by,
+            )
+            .await
         }
         None if args.demo => demo(&args).await,
         None => {
@@ -141,6 +179,13 @@ async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
         max_turns: args.max_turns,
         max_cost_usd: args.max_cost_usd,
         unattended: args.unattended,
+        checkpoint_enabled: if args.checkpoint {
+            Some(true)
+        } else if args.no_checkpoint {
+            Some(false)
+        } else {
+            None
+        },
         ..Default::default()
     };
     config = config.apply(&overrides)?;
@@ -156,6 +201,94 @@ async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
     if !status.is_success() {
         bail!("agent ended with status {status}");
     }
+    Ok(())
+}
+
+async fn rollback_command(
+    args: &Cli,
+    checkpoint_id: String,
+    source_session_node_id: String,
+    rollback_id: String,
+    reason: String,
+    requested_by: String,
+) -> Result<()> {
+    if args.unattended {
+        bail!("rollback requires an explicit human approval and cannot run unattended");
+    }
+    let (mut config, files) = Config::load(args.config.as_deref())?;
+    config = config.apply(&CliOverrides {
+        workspace: args.workspace.clone(),
+        max_turns: args.max_turns,
+        max_cost_usd: args.max_cost_usd,
+        unattended: false,
+        checkpoint_enabled: if args.checkpoint {
+            Some(true)
+        } else if args.no_checkpoint {
+            Some(false)
+        } else {
+            None
+        },
+        ..Default::default()
+    })?;
+    if !config.checkpoint.enabled {
+        bail!("checkpoint/rollback is disabled; enable it in config or pass --checkpoint");
+    }
+    let request = RollbackRequest {
+        rollback_id,
+        checkpoint_id,
+        source_session_node_id,
+        reason,
+        failed_path_ref: None,
+        requested_by,
+    };
+    request.validate()?;
+    let mut contract = GoalContract::from_config("rollback maintenance", &config)?;
+    contract.config_files = files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    if contract.is_unattended() {
+        bail!("rollback cannot run with an unattended approval mode");
+    }
+    if args.dry_run {
+        println!(
+            "rollback dry run: checkpoint={} source_node={} rollback_id={}",
+            request.checkpoint_id, request.source_session_node_id, request.rollback_id
+        );
+        return Ok(());
+    }
+    let policy = Arc::new(Policy::new(config.rules.clone())?);
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary)?);
+    let journal_path = contract
+        .workspace()
+        .join(".pangu")
+        .join(format!("journal-rollback-{}.jsonl", unix_nanos()));
+    let journal = Arc::new(Journal::create_v2(&journal_path)?);
+    let console = Arc::new(pangu_core::ConsoleSink::new(true, false));
+    let sink = Arc::new(TeeSink::new(vec![journal, console]));
+    let approval: Arc<dyn pangu_boundary::ApprovalHandler> = Arc::new(StdinApproval::new(
+        contract.approval_mode,
+        Duration::from_secs(config.boundary.approval.ask_timeout_secs),
+    ));
+    let agent = Agent::new(
+        contract,
+        policy,
+        sandbox,
+        Arc::new(DemoProvider {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(Toolkit::new()),
+        approval,
+        sink,
+    )?;
+    let result = agent.rollback(request).await?;
+    println!(
+        "rollback: {:?}\ncheckpoint: {}\nsession_node: {}\njournal: {}",
+        result.disposition,
+        result.artifact.checkpoint_id,
+        result.session_node_id.as_deref().unwrap_or("<unchanged>"),
+        journal_path.display()
+    );
     Ok(())
 }
 
@@ -245,7 +378,11 @@ async fn execute_goal(
         .workspace()
         .join(".pangu")
         .join(format!("journal-{}.jsonl", unix_nanos()));
-    let journal = Arc::new(Journal::create(&journal_path)?);
+    let journal = Arc::new(if contract.checkpoint.enabled {
+        Journal::create_v2(&journal_path)?
+    } else {
+        Journal::create(&journal_path)?
+    });
     let console = Arc::new(pangu_core::ConsoleSink::new(true, false));
     let sink = Arc::new(TeeSink::new(vec![journal, console]));
     let approval: Arc<dyn pangu_boundary::ApprovalHandler> =
@@ -316,5 +453,112 @@ impl Provider for DemoProvider {
             messages: vec![Message::assistant_calls("", vec![call])],
             usage: Usage::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_uses_checkpoint_id_without_shadowing_global_enable_flag() {
+        let cli = Cli::try_parse_from([
+            "pangu",
+            "--checkpoint",
+            "rollback",
+            "--checkpoint-id",
+            "checkpoint-1",
+            "--source-node",
+            "node-1",
+            "--rollback-id",
+            "rollback-1",
+            "--reason",
+            "operator recovery",
+        ])
+        .expect("rollback arguments should parse");
+        assert!(cli.checkpoint);
+        match cli.command {
+            Some(Commands::Rollback { checkpoint_id, .. }) => {
+                assert_eq!(checkpoint_id, "checkpoint-1")
+            }
+            other => panic!("expected rollback command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_checkpoint_flag_still_works_for_run() {
+        let cli = Cli::try_parse_from(["pangu", "--checkpoint", "run", "goal"])
+            .expect("run arguments should parse");
+        assert!(cli.checkpoint);
+        assert!(matches!(cli.command, Some(Commands::Run { .. })));
+        let alias = Cli::try_parse_from(["pangu", "--enable-checkpoint", "run", "goal"])
+            .expect("checkpoint alias should parse");
+        assert!(alias.checkpoint);
+    }
+
+    #[tokio::test]
+    async fn rollback_dry_run_validates_the_opt_in_config_before_reporting_success() {
+        let root = std::env::temp_dir().join(format!(
+            "pangu-cli-rollback-dry-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.checkpoint.enabled = true;
+        config.checkpoint.artifact_root = root.join(".pangu/checkpoints");
+        config.unattended = false;
+        let config_path = root.join("boundary.toml");
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let cli = Cli::try_parse_from([
+            "pangu",
+            "--config",
+            config_path.to_str().unwrap(),
+            "rollback",
+            "--checkpoint-id",
+            "checkpoint-1",
+            "--source-node",
+            "node-1",
+            "--rollback-id",
+            "rollback-1",
+            "--reason",
+            "dry run",
+            "--dry-run",
+        ])
+        .unwrap();
+        rollback_command(
+            &cli,
+            "checkpoint-1".into(),
+            "node-1".into(),
+            "rollback-1".into(),
+            "dry run".into(),
+            "cli-test".into(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn old_ambiguous_rollback_flag_is_rejected_instead_of_panicking() {
+        let result = Cli::try_parse_from([
+            "pangu",
+            "rollback",
+            "--checkpoint",
+            "checkpoint-1",
+            "--source-node",
+            "node-1",
+            "--rollback-id",
+            "rollback-1",
+            "--reason",
+            "operator recovery",
+        ]);
+        assert!(result.is_err());
     }
 }

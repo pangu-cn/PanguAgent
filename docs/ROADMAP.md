@@ -1,6 +1,6 @@
 # Pangu Agent 未来开发路线图（草案）
 
-> **状态：待用户选择** · **基线：v0.1** · **定位：以安全边界为核心吸收优秀 Agent 经验，而不是复制竞品**
+> **状态：阶段二实验性实现已存在，F7 尚未正式激活** · **基线：v0.1** · **定位：以安全边界为核心吸收优秀 Agent 经验，而不是复制竞品**
 
 本文把“Hermes Agent、Pi Agent、ZCode、WorkBuddy、DeepSeek Harness（DSH）、OpenHands、SWE-agent、Aider、Cline”作为第一组参照对象。这里的“所有 Agent”暂按用户点名的九类理解；不把宣传语当作已验证的竞品结论，也不进行没有统一基准的性能排名。
 
@@ -372,18 +372,18 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [ ] **F4 Plan/Act 与逐步审批**：借鉴 Cline 和 OpenHands 的计划/执行分离；Plan 阶段只读探索，Act 阶段逐项显示 diff、命令和影响范围。
 - [ ] **F5 Issue-to-patch 评测 profile**：借鉴 SWE-agent，把 issue、仓库版本、测试、patch、trajectory 和成本固定为可复现实验；benchmark 分数不替代验收。
 - [ ] **F6 控制平面与 backend/automation profile**：借鉴 OpenHands Agent Canvas，支持本地、Docker、VM、远程 backend 和计划/webhook 任务；每个 backend 和任务都独立认证、限额、幂等和审计。
-- [x] **F7 Pangu Artifact 检查点与受限回退（需求已确认；ADR 待批准；代码未实现）**：候选设计在现有 L1–L4 内增加成功 VerifiedAction 后的工作区快照、事件指针和会话节点；回退只恢复文件系统/会话状态，不回退外部副作用；默认不自动 commit。详细提案见 [`docs/adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md)。在 ADR 显式批准且代码与测试合入前，不得把它描述为已支持。
+- [x] **F7 Pangu Artifact 检查点与受限回退（需求已确认；ADR 已批准；阶段二实现已存在；默认关闭、实验性 opt-in、未正式激活）**：已实现成功 VerifiedAction 后的工作区快照、稳定事件指针、session node、operation ledger、typed rollback、failed-path/effect ledger、Journal v2 receipt 和 CLI 子命令；回退只恢复文件系统/会话状态，不回退外部副作用；默认不自动 commit。详细实现边界见 [`docs/adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md) 和 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)。当前不得把它描述为默认支持。
 
-#### F7 准入映射（提案，不是当前行为）
+#### F7 阶段二映射（实现但实验性）
 
-- **L1**：将 checkpoint 开关、Artifact 根、大小/文件限制、失败策略、rollback 模式和有效 digest 冻结到 `GoalContract`；
-- **L2**：内部 checkpoint/rollback capability 仍 default deny；模型不能直接请求任意路径恢复，也不能用 Policy allow 覆盖 deny；
-- **L3**：快照和恢复只能访问已验证 roots，拒绝 symlink、越界、禁止 glob、外部路径和超限资源；
-- **L4**：`external_mutation + irreversible` 和 rollback 都必须有明确人工确认；`Never` 拒绝而不是自动放行；
-- **新增不变量**：`I-Checkpoint-After-Verified-Action`、`I-Checkpoint-Atomic`、`I-Rollback-Trigger`、`I-Irreversible-Requires-Human`、`I-Rollback-Scope`、`I-Rollback-Idempotent`、`I-Failed-Path-Not-Repeated`、`I-No-Implicit-Git-Commit`；
-- **事件契约**：新增 checkpoint、rollback、failed-path 事件和稳定 event reference；旧 Journal 不重写；
-- **测试门**：每个不变量都要有独立测试，且必须覆盖外部副作用、幂等、快照损坏、失败路径阻断和配置/事件兼容；
-- **实施前提**：先取得 ADR 显式批准并记录批准版本，再实现强制代码和测试；批准前不得修改 BOUNDARY 第 4 节、Agent 状态机、公开 ToolAssessment、Journal v2、checkpoint 配置或 CLI，也不得把 F7 描述为已支持。
+- **L1**：已将 checkpoint 开关、Artifact 根、大小/文件限制、失败策略、rollback 模式和有效 digest 冻结到 `GoalContract`；默认仍关闭。
+- **L2**：固定 checkpoint capability 使用 `Policy::evaluate_internal`；正常 deny 优先，匹配 allow/ask 生效，模型不能直接请求任意路径恢复。rollback 仍由普通 Policy default deny 约束。
+- **L3**：`SnapshotRequest`/`Sandbox` 校验快照和恢复只能访问已验证 roots，拒绝 symlink、越界、禁止 glob、外部路径、特殊文件和超限资源。
+- **L4**：`external_mutation + irreversible` 和 rollback 都必须有明确人工确认；checkpoint 只有匹配 `ask` 才进入 L4；`Never` 拒绝而不是自动放行。
+- **条件性不变量**：`I-Checkpoint-After-Verified-Action`、`I-Checkpoint-Atomic`、`I-Rollback-Trigger`、`I-Irreversible-Requires-Human`、`I-Rollback-Scope`、`I-Rollback-Idempotent`、`I-Failed-Path-Not-Repeated`、`I-No-Implicit-Git-Commit` 已实现并同步到 `BOUNDARY.md` 第 4.1 节。
+- **事件契约**：已加入 checkpoint、rollback、failed-path 事件和稳定 v2 event receipt；旧 Journal 不重写，v1 读取兼容保留。
+- **测试门**：已覆盖外部副作用、幂等、快照损坏、失败路径阻断、wall-clock budget、TeeSink receipt、真实 CLI 子进程、stale lock 和配置/事件兼容。
+- **正式激活门**：operator recovery 运行手册已补充；仍需跨平台最终验证和 Windows replace hand-off/并发 writer 限制的部署确认；在此之前不把 F7 描述为默认支持。详见 [`docs/CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
 
 ### 选择建议
 
@@ -394,7 +394,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 代码场景可选：F1、F2、F3、F4
 第二批：B2、B3、D3、D4、F5
 按需：B6（仅在需要本地 JEV 时开启，默认关闭）、F6（需要远程/自动化控制面时）
-待 ADR 批准：F7（批准前不得实现或描述为已支持；批准后仍须完成边界不变量、代码和测试）
+阶段二实现已存在但仍为实验性 opt-in：F7（Artifact/Agent/CLI、事件和测试已完成；正式激活与支持声明仍受 operator recovery、跨平台和最终验收门约束）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```
 
@@ -411,7 +411,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - 固定当前 v0.1 的事件、配置、Journal 和 capability schema；
 - 为每个候选特性写一页 ADR：目标、非目标、权限、数据、成本、失败恢复；
 - 固定参照 Agent 的版本和公开资料，形成“可复现实验”而不是印象比较；
-- 为 F7 checkpoint/rollback 完成 ADR、边界不变量草案、事件/配置兼容方案和风险评估；
+- 为 F7 checkpoint/rollback 完成 ADR、边界不变量条件文本、事件/配置兼容方案和风险评估（ADR 已批准；阶段二实现已存在，仍需正式激活门）；
 - 建立威胁模型：提示注入、恶意 skill、凭据泄漏、越权、供应链、DoS、成本耗尽、产物造假。
 
 **完成门**
@@ -422,13 +422,14 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 ### R1：v0.2——可恢复、可解释、可扩展
 
-**候选**：A1–A5、B1、B4、C5、F1、F2、F3；F7 仅在 ADR、边界不变量、代码和测试批准后进入实现。
+**候选**：A1–A5、B1、B4、C5、F1、F2、F3；F7 阶段二实现已完成大部分验收，仍是默认关闭的实验性 opt-in，只有在条件性不变量、operator recovery 和跨平台最终验收完成后才可正式激活。
 
 **完成门**
 
 - 中断后可从 Journal/会话节点恢复，不能重复执行已完成的副作用；
 - checkpoint 只在成功 VerifiedAction 后形成，回退只作用于工作区/会话状态；
 - 外部不可逆副作用、失败路径阻断、快照原子性和 rollback 幂等性均有独立测试；
+- stale lock、Windows replace hand-off 和无锁并发 writer 的 operator recovery 限制已经写入运行手册，且不会被自动猜测；
 - 事件流能区分 `agent_start/turn/tool/terminal`，并有 schema 版本；
 - `doctor`/dry-run 能解释“为什么允许/拒绝”，不泄露 secret；
 - 扩展无法绕过 `assess → Policy → Sandbox → Approval → VerifiedAction`；
@@ -490,7 +491,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 这些不是对竞品的攻击性评价，而是 Pangu 以后引入同类能力时必须显示或测试的风险。
 
-W-43~W-47 是 F7 的风险摘要；具体控制以 [`ADR-0001`](adr/0001-checkpoint-rollback.md) 第 11 节为准，如有冲突以 ADR 为准。
+W-43~W-47 是 F7 的风险摘要；完整激活后具体控制以 [`ADR-0001`](adr/0001-checkpoint-rollback.md) 第 11 节为准；当前生效边界仍以 [`docs/BOUNDARY.md`](BOUNDARY.md) 为准。
 
 | ID | 警示 | 触发场景 | 必须的控制 |
 |---|---|---|---|
@@ -609,6 +610,6 @@ JEV/服务不可用、超时或非法输出时的 fallback：
 - [SWE-agent 官方仓库](https://github.com/SWE-agent/SWE-agent) / [官方文档](https://swe-agent.com/latest/) / [mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent)
 - [Aider 官方仓库](https://github.com/Aider-AI/aider) / [官方文档](https://aider.chat/docs/) / [Repo Map 说明](https://aider.chat/docs/repomap.html) / [Git 集成说明](https://aider.chat/docs/git.html)
 - [Cline 官方仓库](https://github.com/cline/cline) / [官方文档](https://docs.cline.bot/) / [CLI 文档](https://github.com/cline/cline/blob/main/apps/cli/README.md)
-- [Checkpoint/Rollback ADR 提案](adr/0001-checkpoint-rollback.md)（待实现，不是当前行为承诺）
+- [Checkpoint/Rollback ADR](adr/0001-checkpoint-rollback.md)（已批准；阶段二实现已存在；默认关闭、实验性 opt-in、未正式激活）
 
-WorkBuddy 的闭源部分应以实际产品、官方文档、隐私条款和可复现实验为准；DeepSeek Harness 当前处于 developer preview，官方明确提示尚未经过安全审计且可能发生兼容性破坏。OpenHands 当前将控制台与 SDK/Agent Server 分布在不同仓库；SWE-agent 官方 README 已提示 mini-SWE-agent 取代主项目；Cline 的多端能力和 JetBrains 插件开放范围也需按版本重新核验。在未完成核验前，本文只把这些项目的公开定位作为产品设计参考，不把营销描述、benchmark 分数或某入口的默认行为当作全系统安全或质量证明。F7 的 checkpoint/rollback 规则目前只存在于 ADR 提案和路线图准入映射中；在代码、规范不变量和测试完成前，不应把它当作 v0.1 的现有能力。
+WorkBuddy 的闭源部分应以实际产品、官方文档、隐私条款和可复现实验为准；DeepSeek Harness 当前处于 developer preview，官方明确提示尚未经过安全审计且可能发生兼容性破坏。OpenHands 当前将控制台与 SDK/Agent Server 分布在不同仓库；SWE-agent 官方 README 已提示 mini-SWE-agent 取代主项目；Cline 的多端能力和 JetBrains 插件开放范围也需按版本重新核验。在未完成核验前，本文只把这些项目的公开定位作为产品设计参考，不把营销描述、benchmark 分数或某入口的默认行为当作全系统安全或质量证明。F7 的 checkpoint/rollback 规则目前已记录在已批准 ADR、路线图准入映射、阶段二实现、`BOUNDARY.md` 条件性不变量和 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) 中；在正式激活门、跨平台最终验收和 operator recovery 限制确认前，不应把它当作 v0.1 的默认能力。

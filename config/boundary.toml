@@ -36,6 +36,16 @@ hosts = []
 [boundary.env]
 allow = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "USERPROFILE"]
 
+[checkpoint]
+enabled = false
+backend = "artifact"
+artifact_root = ".pangu/checkpoints"
+max_snapshot_bytes = 67108864
+max_snapshot_files = 10000
+max_snapshot_file_bytes = 4194304
+failure_policy = "fail_run"
+rollback_requires_approval = true
+
 [goal]
 require_evidence = true
 min_successful_tool_calls = 1

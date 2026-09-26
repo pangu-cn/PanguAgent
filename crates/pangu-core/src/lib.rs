@@ -4,6 +4,8 @@
 //! runtime, provider, and toolkit layers. Policy decisions belong in
 //! `pangu-boundary`; this crate does not decide whether an action is allowed.
 
+pub mod artifact;
+pub mod checkpoint;
 pub mod error;
 pub mod events;
 pub mod glob;
@@ -13,10 +15,20 @@ pub mod messages;
 pub mod replay;
 pub mod util;
 
+pub use artifact::{
+    ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
+    RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,
+    FAILED_PATH_LEDGER_FILE, ROLLBACK_OPERATION_SCHEMA_VERSION,
+};
+pub use checkpoint::{
+    ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
+    ExternalEffectSummary, FailedPathRecord, FailedPathStatus, FailureClass, RollbackRequest,
+    SessionNode, CHECKPOINT_SCHEMA_VERSION, FAILED_PATH_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+};
 pub use error::{Error, Result};
 pub use events::{
     redact_event, redact_text, redact_value, Event, EventKind, EventSink, JournalMeta, MemSink,
-    NullSink, Price, TeeSink, Usage,
+    NullSink, Price, TeeSink, Usage, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
 };
 pub use glob::Glob;
 pub use journal::{ConsoleSink, Journal};

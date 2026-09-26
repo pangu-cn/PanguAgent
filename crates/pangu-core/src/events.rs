@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, Value};
 
+pub const JOURNAL_FORMAT_V1: &str = "pangu-journal/v1";
+pub const JOURNAL_FORMAT_V2: &str = "pangu-journal/v2";
+
 const MAX_EVENT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_EVENT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -25,6 +28,30 @@ pub enum EventKind {
     FinishRequested,
     RunFinished,
     Note,
+    CheckpointCreated,
+    CheckpointFailed,
+    RollbackRequested,
+    RollbackStarted,
+    RollbackApplied,
+    RollbackSkippedAlreadyApplied,
+    RollbackFailed,
+    FailedPathRecorded,
+}
+
+impl EventKind {
+    pub fn is_v2_only(self) -> bool {
+        matches!(
+            self,
+            Self::CheckpointCreated
+                | Self::CheckpointFailed
+                | Self::RollbackRequested
+                | Self::RollbackStarted
+                | Self::RollbackApplied
+                | Self::RollbackSkippedAlreadyApplied
+                | Self::RollbackFailed
+                | Self::FailedPathRecorded
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +60,14 @@ pub struct Event {
     pub seq: u64,
     pub at: String,
     pub kind: EventKind,
+    /// Stable identifier assigned when a v2 event is sealed by Journal.
+    /// Legacy v1 records omit this field and retain their original hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Absent means the legacy `pangu-journal/v1` format. v2 records carry
+    /// an explicit format marker so unknown schemas fail closed on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     pub turn: u32,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +88,14 @@ pub struct Event {
     pub usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_mutation: Option<bool>,
     #[serde(default)]
     pub prev_sha: String,
     #[serde(default)]
@@ -67,6 +110,8 @@ impl Event {
             seq: 0,
             at: crate::now_rfc3339(),
             kind,
+            event_id: None,
+            schema: None,
             turn,
             message,
             tool: None,
@@ -78,9 +123,19 @@ impl Event {
             duration_ms: None,
             usage: None,
             payload: None,
+            effect_scope: None,
+            reversibility: None,
+            action_digest: None,
+            external_mutation: None,
             prev_sha: String::new(),
             sha: String::new(),
         }
+    }
+
+    pub fn new_v2(kind: EventKind, turn: u32, message: impl Into<String>) -> Self {
+        let mut event = Self::new(kind, turn, message);
+        event.schema = Some(JOURNAL_FORMAT_V2.to_string());
+        event
     }
 
     pub fn tool(mut self, tool: &str) -> Self {
@@ -139,6 +194,35 @@ impl Event {
         self
     }
 
+    pub fn effect_scope(mut self, scope: impl Into<String>) -> Self {
+        self.effect_scope = Some(crate::truncate_middle(
+            &redact_text(&scope.into()),
+            MAX_EVENT_FIELD_BYTES,
+        ));
+        self
+    }
+
+    pub fn reversibility(mut self, reversibility: impl Into<String>) -> Self {
+        self.reversibility = Some(crate::truncate_middle(
+            &redact_text(&reversibility.into()),
+            MAX_EVENT_FIELD_BYTES,
+        ));
+        self
+    }
+
+    pub fn action_digest(mut self, digest: impl Into<String>) -> Self {
+        self.action_digest = Some(crate::truncate_middle(
+            &redact_text(&digest.into()),
+            MAX_EVENT_FIELD_BYTES,
+        ));
+        self
+    }
+
+    pub fn external_mutation(mut self, value: bool) -> Self {
+        self.external_mutation = Some(value);
+        self
+    }
+
     /// Canonical JSON used by the journal hash chain. Object keys are sorted
     /// recursively so a downstream `serde_json/preserve_order` feature cannot
     /// change the hash representation.
@@ -162,6 +246,118 @@ impl Event {
         hasher.update(canonical.as_bytes());
         hex::encode(hasher.finalize())
     }
+
+    /// Validate a stable v2 event receipt independently of a particular
+    /// journal implementation. This is used by checkpoint code before it
+    /// trusts a sink-provided event as the source of an artifact.
+    pub fn validate_v2_receipt(&self) -> Result<()> {
+        self.validate_shape()?;
+        if self.schema.as_deref() != Some(JOURNAL_FORMAT_V2)
+            || self.prev_sha.is_empty()
+            || self.sha.is_empty()
+        {
+            return Err(Error::Config(
+                "event is not a complete pangu-journal/v2 receipt".into(),
+            ));
+        }
+        crate::replay::validate_v2_metadata(self)?;
+        let event_id = self
+            .event_id
+            .as_deref()
+            .ok_or_else(|| Error::Config("v2 event is missing event_id".into()))?;
+        let mut identity_event = self.clone();
+        identity_event.event_id = None;
+        let identity = format!("event-id:{}:{}", self.seq, identity_event.canonical());
+        let expected_event_id = format!("evt_{}", Self::compute_sha(&self.prev_sha, &identity));
+        if event_id != expected_event_id {
+            return Err(Error::Config("v2 event_id receipt is invalid".into()));
+        }
+        if self.sha != Self::compute_sha(&self.prev_sha, &self.canonical()) {
+            return Err(Error::Config("v2 event content receipt is invalid".into()));
+        }
+        Ok(())
+    }
+
+    /// Validate the bounded wire shape of an event before it is persisted or
+    /// replayed. Content redaction is deliberately separate: callers may
+    /// construct a large/sensitive event, but sinks must sanitize it first
+    /// and replay must reject any record that bypassed that boundary.
+    pub(crate) fn validate_shape(&self) -> Result<()> {
+        validate_event_text("at", &self.at, MAX_EVENT_FIELD_BYTES)?;
+        validate_event_text("message", &self.message, MAX_EVENT_MESSAGE_BYTES)?;
+        for (field, value) in [
+            ("tool", self.tool.as_deref()),
+            ("call_id", self.call_id.as_deref()),
+            ("verdict", self.verdict.as_deref()),
+            ("risk", self.risk.as_deref()),
+            ("rule_id", self.rule_id.as_deref()),
+            ("invariant", self.invariant.as_deref()),
+            ("effect_scope", self.effect_scope.as_deref()),
+            ("reversibility", self.reversibility.as_deref()),
+            ("action_digest", self.action_digest.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_event_text(field, value, MAX_EVENT_FIELD_BYTES)?;
+            }
+        }
+        if self.event_id.as_deref().is_some_and(|id| {
+            !id.strip_prefix("evt_").is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        }) {
+            return Err(Error::Config(
+                "event_id is not a stable v2 identifier".into(),
+            ));
+        }
+        if self.prev_sha.len() > 128 || self.sha.len() > 128 {
+            return Err(Error::Config(
+                "event hash fields exceed the supported bound".into(),
+            ));
+        }
+        if !self.prev_sha.is_empty()
+            && self.prev_sha != crate::journal::GENESIS
+            && (self.prev_sha.len() != 64
+                || !self.prev_sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(Error::Config(
+                "event prev_sha is not a SHA-256 digest".into(),
+            ));
+        }
+        if !self.sha.is_empty()
+            && (self.sha.len() != 64 || !self.sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(Error::Config("event sha is not a SHA-256 digest".into()));
+        }
+        if let Some(payload) = &self.payload {
+            let size = serde_json::to_string(payload)?.len();
+            if size > MAX_EVENT_PAYLOAD_BYTES {
+                return Err(Error::Config(
+                    "event payload exceeds the supported bound".into(),
+                ));
+            }
+        }
+        match self.schema.as_deref() {
+            None | Some(JOURNAL_FORMAT_V1) | Some(JOURNAL_FORMAT_V2) => {}
+            Some(other) => {
+                return Err(Error::Config(format!(
+                    "unsupported journal event schema `{other}`"
+                )))
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_event_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(Error::Config(format!(
+            "event {field} is empty, unbounded, or contains control characters"
+        )));
+    }
+    Ok(())
 }
 
 fn clean_event_field(input: &str, max_bytes: usize) -> String {
@@ -289,6 +485,9 @@ pub fn redact_value(value: &Value) -> Value {
 }
 
 pub fn redact_event(mut event: Event) -> Event {
+    let preserve_v2_receipt = event.schema.as_deref() == Some(JOURNAL_FORMAT_V2)
+        && event.event_id.is_some()
+        && event.validate_v2_receipt().is_ok();
     event.at = clean_event_field(&event.at, MAX_EVENT_FIELD_BYTES);
     event.message = clean_event_field(&event.message, MAX_EVENT_MESSAGE_BYTES);
     event.prev_sha = crate::truncate_middle(&event.prev_sha, 128);
@@ -311,6 +510,21 @@ pub fn redact_event(mut event: Event) -> Event {
     if let Some(invariant) = event.invariant.as_mut() {
         *invariant = clean_event_field(invariant, MAX_EVENT_FIELD_BYTES);
     }
+    if let Some(event_id) = event.event_id.as_mut() {
+        *event_id = clean_event_field(event_id, MAX_EVENT_FIELD_BYTES);
+    }
+    if let Some(schema) = event.schema.as_mut() {
+        *schema = clean_event_field(schema, MAX_EVENT_FIELD_BYTES);
+    }
+    if let Some(scope) = event.effect_scope.as_mut() {
+        *scope = clean_event_field(scope, MAX_EVENT_FIELD_BYTES);
+    }
+    if let Some(reversibility) = event.reversibility.as_mut() {
+        *reversibility = clean_event_field(reversibility, MAX_EVENT_FIELD_BYTES);
+    }
+    if let Some(digest) = event.action_digest.as_mut() {
+        *digest = clean_event_field(digest, MAX_EVENT_FIELD_BYTES);
+    }
     event.payload = event.payload.as_ref().map(|value| {
         let value = redact_value(value);
         let size = serde_json::to_string(&value)
@@ -322,6 +536,15 @@ pub fn redact_event(mut event: Event) -> Event {
             value
         }
     });
+    if preserve_v2_receipt {
+        let mut identity_event = event.clone();
+        identity_event.event_id = None;
+        let identity = format!("event-id:{}:{}", event.seq, identity_event.canonical());
+        event.event_id = Some(format!(
+            "evt_{}",
+            Event::compute_sha(&event.prev_sha, &identity)
+        ));
+    }
     event.refresh_sha();
     event
 }
@@ -331,6 +554,14 @@ pub trait EventSink: Send + Sync {
     /// Persist one event. Implementations must return an error to the caller;
     /// an audit failure may not be silently converted into a successful run.
     async fn emit(&self, event: Event) -> Result<()>;
+
+    /// Persist an event and return the sealed receipt when the sink has one.
+    /// Older sinks keep working through the default implementation; a
+    /// journal-backed sink overrides it with the stable v2 event ID/sequence.
+    async fn emit_with_receipt(&self, event: Event) -> Result<Event> {
+        self.emit(event.clone()).await?;
+        Ok(redact_event(event))
+    }
 }
 
 pub struct NullSink;
@@ -343,13 +574,33 @@ impl EventSink for NullSink {
 }
 
 #[derive(Default)]
+struct MemState {
+    events: Vec<Event>,
+    seq: u64,
+    prev_sha: String,
+    format: Option<String>,
+}
+
 pub struct MemSink {
-    events: std::sync::Mutex<Vec<Event>>,
+    state: std::sync::Mutex<MemState>,
+}
+
+impl Default for MemSink {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(MemState {
+                events: Vec::new(),
+                seq: 0,
+                prev_sha: crate::journal::GENESIS.to_string(),
+                format: None,
+            }),
+        }
+    }
 }
 
 impl MemSink {
     pub fn snapshot(&self) -> Vec<Event> {
-        self.events.lock().expect("mem sink lock").clone()
+        self.state.lock().expect("mem sink lock").events.clone()
     }
 
     pub fn kinds(&self) -> Vec<EventKind> {
@@ -358,16 +609,72 @@ impl MemSink {
             .map(|event| event.kind)
             .collect()
     }
+
+    fn seal_and_push(&self, event: Event) -> Result<Event> {
+        let mut state = self.state.lock().expect("mem sink lock");
+        if state.seq == u64::MAX {
+            return Err(Error::Other("memory event sequence is exhausted".into()));
+        }
+        let format = match event.schema.as_deref() {
+            None | Some(JOURNAL_FORMAT_V1) => JOURNAL_FORMAT_V1,
+            Some(JOURNAL_FORMAT_V2) => JOURNAL_FORMAT_V2,
+            Some(other) => {
+                return Err(Error::Config(format!(
+                    "unsupported journal event schema `{other}`"
+                )))
+            }
+        };
+        if let Some(existing) = &state.format {
+            if existing != format {
+                return Err(Error::Config(
+                    "memory sink cannot mix v1 and v2 event schemas".into(),
+                ));
+            }
+        }
+        if format == JOURNAL_FORMAT_V1 && event.kind.is_v2_only() {
+            return Err(Error::Config(
+                "v2-only event cannot be written to a v1 memory sink".into(),
+            ));
+        }
+        let mut sealed = redact_event(event);
+        sealed.event_id = None;
+        if format == JOURNAL_FORMAT_V1 {
+            // Keep the richer in-memory shape for legacy embedders. The
+            // on-disk Journal strips these fields before writing v1; MemSink
+            // is not a serialized journal and existing callers rely on the
+            // richer receipt.
+            sealed.schema = None;
+        } else {
+            sealed.schema = Some(JOURNAL_FORMAT_V2.to_string());
+            crate::replay::validate_v2_metadata(&sealed)?;
+        }
+        sealed.seq = state.seq;
+        sealed.prev_sha = state.prev_sha.clone();
+        sealed.validate_shape()?;
+        if format == JOURNAL_FORMAT_V2 {
+            let identity = format!("event-id:{}:{}", state.seq, sealed.canonical());
+            sealed.event_id = Some(format!(
+                "evt_{}",
+                Event::compute_sha(&state.prev_sha, &identity)
+            ));
+        }
+        sealed.sha = Event::compute_sha(&sealed.prev_sha, &sealed.canonical());
+        state.events.push(sealed.clone());
+        state.seq = state.seq.saturating_add(1);
+        state.prev_sha = sealed.sha.clone();
+        state.format = Some(format.to_string());
+        Ok(sealed)
+    }
 }
 
 #[async_trait::async_trait]
 impl EventSink for MemSink {
     async fn emit(&self, event: Event) -> Result<()> {
-        self.events
-            .lock()
-            .expect("mem sink lock")
-            .push(redact_event(event));
-        Ok(())
+        self.seal_and_push(event).map(|_| ())
+    }
+
+    async fn emit_with_receipt(&self, event: Event) -> Result<Event> {
+        self.seal_and_push(event)
     }
 }
 
@@ -384,10 +691,43 @@ impl TeeSink {
 #[async_trait::async_trait]
 impl EventSink for TeeSink {
     async fn emit(&self, event: Event) -> Result<()> {
+        // Use the receipt path even for callers that do not need the returned
+        // event. Otherwise two durable sinks could silently diverge merely by
+        // going through the legacy `emit` method.
+        self.emit_with_receipt(event).await.map(|_| ())
+    }
+
+    async fn emit_with_receipt(&self, event: Event) -> Result<Event> {
+        let mut receipt: Option<Event> = None;
         for sink in &self.sinks {
-            sink.emit(redact_event(event.clone())).await?;
+            let candidate = sink.emit_with_receipt(redact_event(event.clone())).await?;
+            candidate.validate_shape()?;
+            if candidate.schema.as_deref() == Some(JOURNAL_FORMAT_V2)
+                && candidate.event_id.is_some()
+            {
+                candidate.validate_v2_receipt()?;
+            }
+            if let Some(previous) = &receipt {
+                if let (Some(previous_id), Some(candidate_id)) =
+                    (previous.event_id.as_deref(), candidate.event_id.as_deref())
+                {
+                    if previous.schema != candidate.schema
+                        || previous.seq != candidate.seq
+                        || previous.prev_sha != candidate.prev_sha
+                        || previous.sha != candidate.sha
+                        || previous_id != candidate_id
+                    {
+                        return Err(Error::Other(
+                            "event tee durable receipts are inconsistent".into(),
+                        ));
+                    }
+                }
+            }
+            if receipt.is_none() || candidate.event_id.is_some() {
+                receipt = Some(candidate);
+            }
         }
-        Ok(())
+        receipt.ok_or_else(|| Error::Other("event tee has no sinks".into()))
     }
 }
 
@@ -452,10 +792,19 @@ pub struct JournalMeta {
 }
 
 impl JournalMeta {
-    pub const FORMAT: &'static str = "pangu-journal/v1";
+    pub const FORMAT: &'static str = JOURNAL_FORMAT_V1;
+    pub const FORMAT_V2: &'static str = JOURNAL_FORMAT_V2;
 
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn to_value_for_format(&self, format: &str) -> Value {
+        let mut value = self.to_value();
+        if let Value::Object(object) = &mut value {
+            object.insert("format".into(), Value::String(format.to_string()));
+        }
+        value
     }
 }
 
