@@ -59,6 +59,9 @@ fn temp_path(label: &str) -> std::path::PathBuf {
 
 struct OneShotProvider {
     responses: Mutex<VecDeque<ChatResponse>>,
+    /// Length of the history each call was made with. Tests that care whether a
+    /// run really continued a stored conversation read this back.
+    seen_histories: Mutex<Vec<usize>>,
 }
 
 #[async_trait]
@@ -75,7 +78,11 @@ impl Provider for OneShotProvider {
         "invariant test provider".into()
     }
 
-    async fn chat(&self, _messages: Vec<Message>, _tools: Vec<ToolSpec>) -> Result<ChatResponse> {
+    async fn chat(&self, messages: Vec<Message>, _tools: Vec<ToolSpec>) -> Result<ChatResponse> {
+        self.seen_histories
+            .lock()
+            .expect("provider history lock")
+            .push(messages.len());
         Ok(self
             .responses
             .lock()
@@ -286,6 +293,7 @@ async fn invariant_i_honest_terminal_complete_requires_evidence() {
             )],
             usage: Usage::default(),
         }])),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let approval = Arc::new(ScriptedApproval::new(
         ApprovalMode::DestructiveAndAbove,
@@ -463,6 +471,7 @@ async fn model_cannot_invoke_reserved_internal_checkpoint_capabilities() {
                 usage: Usage::default(),
             },
         ])),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let tool = Arc::new(ReservedTool {
         executions: AtomicUsize::new(0),
@@ -527,6 +536,7 @@ async fn phase1_missing_effect_fails_closed_before_policy_and_executor() {
                 usage: Usage::default(),
             },
         ])),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let sink = Arc::new(MemSink::default());
     let tool = Arc::new(MissingEffectTool {
@@ -849,6 +859,7 @@ fn phase2_agent(
     let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
     let provider = Arc::new(OneShotProvider {
         responses: Mutex::new(VecDeque::from(responses)),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let tool = Arc::new(Phase2Tool {
         path: workspace.join("state.txt"),
@@ -1270,6 +1281,7 @@ fn invariant_i_no_implicit_git_checkpoint_backend() {
     let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
     let provider = Arc::new(OneShotProvider {
         responses: Mutex::new(VecDeque::new()),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let result = Agent::new(
         contract,
@@ -1503,4 +1515,230 @@ fn invariant_i_resumed_conversation_carries_no_authorization() {
         decision.rule_id.is_some() || decision.invariant.is_some(),
         "a decision must be attributable to a rule or an invariant, never to restored content"
     );
+}
+
+/// ADR-0004 §4.3 exercised end to end: a resumed run **continues** the stored
+/// conversation, and continuing is not the same as being trusted.
+///
+/// Both halves matter, and either alone would be weak:
+///
+/// 1. the resumed run really continued — asserted from the provider's side: it
+///    was called with the four stored messages, not with a freshly seeded
+///    system+user pair on top of them. A resume that quietly re-seeded would
+///    look identical from the outside except for the count, which is why this
+///    reads the history length rather than "the run produced some output".
+/// 2. the tool call made *after* the resume went through the gates again. The
+///    first run was granted approval for its write; the resumed run gets no
+///    approval at all, and the workspace must stay exactly as the first run left
+///    it. If resume had carried authority forward, the second write would have
+///    landed.
+#[tokio::test]
+async fn invariant_i_resume_continues_the_conversation_but_re_evaluates_every_action() {
+    let root = temp_path("resume-gates");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("state.txt"), "initial").expect("state");
+
+    // The rule *asks* rather than allows, so approval is the only thing that
+    // differs between the two runs. That is the property under test: the first
+    // run is approved, the resumed one is not.
+    let rules = vec![Rule::ask("ask-phase2", "test_tool", "phase2 gated action")];
+    let mut config = phase2_config(&root, rules.clone());
+    config.conversation.enabled = true;
+    config.conversation.artifact_root = root.join(".pangu/conversations");
+    config.conversation.save_every_turn = true;
+    config.validate().expect("resume config");
+
+    // --- first run: one approved write, then a clean finish -----------------
+    let (first_agent, _tool, _sink) = phase2_agent(
+        config.clone(),
+        &root,
+        vec![
+            phase2_response("test_tool", serde_json::json!({"value": "one"})),
+            phase2_response("finish", serde_json::json!({"status": "complete"})),
+        ],
+        vec![pangu_boundary::ApprovalResponse::AllowOnce],
+        false,
+        false,
+    );
+    let first_outcome = first_agent.run().await.expect("first run");
+    assert_eq!(first_outcome.status.as_str(), "complete");
+    assert_eq!(
+        std::fs::read_to_string(root.join("state.txt")).expect("state"),
+        "one",
+        "the first run's approved write must have landed, otherwise the rest proves nothing"
+    );
+
+    // --- the run persisted a conversation, and the whole exchange is in it --
+    let ids = first_agent
+        .resumable_conversations()
+        .expect("conversations were listed");
+    assert!(
+        ids.len() >= 2,
+        "per-turn saving plus the final save should leave more than one snapshot, got {}",
+        ids.len()
+    );
+    let stored = pangu_core::ArtifactStore::open(root.join(".pangu/conversations"))
+        .expect("store")
+        .load_conversation(ids.last().expect("an id"))
+        .expect("load");
+    assert_eq!(
+        stored
+            .messages
+            .iter()
+            .map(pangu_core::Message::role)
+            .collect::<Vec<_>>(),
+        vec![
+            pangu_core::MessageRole::System,
+            pangu_core::MessageRole::User,
+            pangu_core::MessageRole::Assistant,
+            pangu_core::MessageRole::Tool,
+            pangu_core::MessageRole::Assistant,
+            pangu_core::MessageRole::Tool,
+        ],
+        "the stored history must contain the whole first exchange: \
+         system, goal, the approved write, and the finish"
+    );
+
+    // --- resume, with no approval available this time -----------------------
+    let resumed_config = config.clone();
+    let second_tool = Arc::new(Phase2Tool {
+        path: root.join("state.txt"),
+        executions: AtomicUsize::new(0),
+        external: false,
+        fail_execution: false,
+    });
+    let second_provider = Arc::new(OneShotProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            phase2_response("test_tool", serde_json::json!({"value": "two"})),
+            phase2_response("finish", serde_json::json!({"status": "complete"})),
+        ])),
+        seen_histories: Mutex::new(Vec::new()),
+    });
+    // Built by hand rather than via `phase2_agent`, because that helper cannot
+    // hand back the provider it used — and the whole point of the first
+    // assertion below is what the provider saw.
+    let contract = pangu_boundary::GoalContract::from_config("phase2 invariant", &resumed_config)
+        .expect("contract");
+    let policy = Arc::new(Policy::new(rules).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&resumed_config.boundary).expect("sandbox"));
+    let second_sink = Arc::new(MemSink::default());
+    let observable = Agent::new(
+        contract,
+        policy,
+        sandbox,
+        second_provider.clone(),
+        second_tool,
+        Arc::new(pangu_boundary::ScriptedApproval::new(
+            pangu_boundary::ApprovalMode::DestructiveAndAbove,
+            Vec::new(),
+        )),
+        second_sink.clone(),
+    )
+    .expect("agent")
+    .resume_from(&stored)
+    .expect("resume");
+    let second_outcome = observable.run().await.expect("resumed run");
+    let second_events = second_sink.snapshot();
+
+    // Property 1: continued, not restarted.
+    let seen = second_provider.seen_histories.lock().expect("lock").clone();
+    assert_eq!(
+        seen.first(),
+        Some(&6),
+        "the resumed run must call the model with exactly the six stored \
+         messages; a re-seeded run would have sent eight, with the system and \
+         goal turns prepended a second time"
+    );
+    assert_eq!(
+        seen.len(),
+        2,
+        "the scripted run makes exactly two model calls"
+    );
+    assert_eq!(
+        seen[1], 8,
+        "the second call must also carry the exchange the resumed turn added"
+    );
+
+    // Property 2: the post-resume write was re-evaluated and refused, and the
+    // refusal is on the record rather than merely absent from the file.
+    let blocked = second_events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolBlocked)
+        .expect("the resumed run's write must be recorded as blocked");
+    assert!(
+        blocked.message.contains("human approval was not granted"),
+        "the block must name the reason, got: {}",
+        blocked.message
+    );
+    assert!(
+        !second_events
+            .iter()
+            .any(|event| event.kind == EventKind::ToolFinished),
+        "no tool should have executed in the resumed run, yet one is recorded as finished"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("state.txt")).expect("state"),
+        "one",
+        "a resumed run must not carry the first run's approval forward"
+    );
+
+    // Property 3: the scripted provider called `finish` with `complete` on its
+    // second turn, and the run still ended `failed`. A run that has had a tool
+    // refused is not reported as finished, so a stored conversation cannot be
+    // replayed into a run that looks successful.
+    assert!(
+        second_events
+            .iter()
+            .any(|event| event.kind == EventKind::FinishRequested),
+        "the scripted provider was supposed to call finish on its last turn"
+    );
+    assert_eq!(
+        second_outcome.status.as_str(),
+        "failed",
+        "a refusal during a resumed run must not be overridable by the model"
+    );
+    assert!(second_outcome.evidence.is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+fn config_for_resume(root: &std::path::Path) -> pangu_boundary::Config {
+    let mut config = phase2_config(
+        root,
+        vec![Rule::ask("ask-phase2", "test_tool", "phase2 gated action")],
+    );
+    config.conversation.enabled = true;
+    config.conversation.artifact_root = root.join(".pangu/conversations");
+    config.validate().expect("resume config");
+    config
+}
+
+/// A history that lost its system turn must be refused rather than resumed: the
+/// system turn is where the boundary instructions live, and silently running
+/// without it is how a run would continue into a context that was never told
+/// what it is not allowed to do.
+#[test]
+fn invariant_i_a_conversation_without_its_system_turn_cannot_be_resumed() {
+    let root = temp_path("resume-no-system");
+    std::fs::create_dir_all(&root).expect("workspace");
+    let config = config_for_resume(&root);
+    let (agent, _tool, _sink) = phase2_agent(config, &root, Vec::new(), Vec::new(), false, false);
+    let messages = vec![pangu_core::Message::user("just a user turn")];
+    let snapshot = pangu_core::ConversationSnapshot {
+        schema_version: pangu_core::conversation::CONVERSATION_SCHEMA_VERSION,
+        snapshot_id: "snap-1".into(),
+        session_node_id: None,
+        run_id: "run-1".into(),
+        history_digest: pangu_core::ConversationSnapshot::digest_of(&messages).expect("digest"),
+        messages,
+        compaction: None,
+        created_at: pangu_core::now_rfc3339(),
+    };
+    match agent.resume_from(&snapshot) {
+        Ok(_) => panic!("a history with no system turn must be refused"),
+        Err(error) => assert!(
+            error.to_string().contains("system turn"),
+            "the error must name what is missing, got: {error}"
+        ),
+    }
+    std::fs::remove_dir_all(root).ok();
 }

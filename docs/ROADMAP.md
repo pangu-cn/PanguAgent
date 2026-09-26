@@ -329,10 +329,13 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - **勘察修正**：ROADMAP 原文把“会话树”和“对话恢复”写在一起，但 `SessionNode` 树只记**工作区快照**，不记对话——`Agent::run()` 的 `history` 每次在内存里从零构造，从不持久化。因此“恢复工作区”= F7 的 rollback（已做），“恢复对话继续聊”当时**无法实现**。Journal 也不够：`ModelRequest` 只记 `messages=2 tools=7` 计数、`ModelResponse` 只记 `provider response received`，都不带消息内容。
   - **附带发现**：`SessionNode.history_digest` 声明并校验了，但全仓库**无任何非 None 赋值**，是死字段。
   - 已完成（ADR-0004，用户选定 A1b 路线）：`ConversationSnapshot` + Artifact store 存取（`save_conversation` / `load_conversation` / `list_conversations`）、显式压缩并记录 `compacted_from_digest`、12 个单测 + 1 个不变式。
-  - **纠正一处早期夸大**：`SessionNode.history_digest` 那个死字段**至今仍无任何非 None 赋值**。被真正赋值的是 `ConversationSnapshot.history_digest`——一个新结构上的新字段，不是同一个字段。两者要打通，前提是先接入 agent 运行循环（见下方未完成项）。
+  - **第二阶段已完成（接入 agent 运行循环）**：`ConversationRuntime` 在每轮 turn 后与终局（无论成败）各存一次快照；`Agent::resume_from` / `resume_latest` 恢复且**不重复 seed** system+goal；配置默认 `enabled: false`，缺段即关闭（老配置升级后不会突然开始写文件）；CLI `pangu conversation list|show`。
+  - **“恢复不携带授权”的端到端证据**：provider 实际收到**恰好 6 条**已存消息（重新 seed 会是 8 条）；首轮获批写入 `one`，恢复后无审批、规则为 `ask`，工作区仍是 `one`，事件流里有 `ToolBlocked`、**无** `ToolFinished`；恢复后第二轮脚本调用 `finish {"status":"complete"}`，运行仍报 `failed`、evidence 为空。
+  - **接进循环后抓到的真问题**：① 快照 id 曾用未脱敏的 goal 文本（journal 对 goal 做了 `redact_text`，放进**路径**等于撤销该规则），改为 `short_hash(redact_text(...))`；② `max_turns=1` 的运行会**丢弃模型第一条响应**（`Breach::Turns` 在响应并入 history 之前就判定超预算）——既有行为，本次未改，记此备忘。
+  - **纠正一处早期夸大**：`SessionNode.history_digest` 那个死字段**至今仍无任何非 None 赋值**。被真正赋值的是 `ConversationSnapshot.history_digest`——一个新结构上的新字段，不是同一个字段。两者要打通，接入 agent 运行循环是前提（已完成），还需会话树本身（见下方未完成项）。
   - **核心保证**：恢复的历史**只是模型输入**。它不携带任何 `Decision`/`Effect`/已批准记忆；resume 后第一次发起工具调用仍走完整 `Policy → Sandbox → Approval`。不提供任何到判定的转换。
-  - **安全边界**：存储前脱敏（`redact_text`/`redact_value`）、内容 digest 读时校验（篡改即拒）、空历史**拒绝恢复**（否则等于静默重开会话）、快照不可变（保护压缩出处链可解）、压缩必须非空摘要且必须真的丢弃内容、压缩必须用新 `snapshot_id`。
-  - **未包含（有意排除）**：tree 导航（祖先/子节点/公共祖先）、branch/fork、CLI 子命令、agent 运行循环的 save/restore 钩子；**fork 的工作区隔离完全未解决**（两条分支共享同一工作区必然互相覆盖）；跨机器同步、协作编辑。
+  - **安全边界**：存储前脱敏（`redact_text`/`redact_value`）、内容 digest 读时校验（篡改即拒）、空历史**拒绝恢复**（否则等于静默重开会话）、**缺 system 轮的快照拒绝恢复**（否则是恢复进一个从没被告知边界的上下文）、快照不可变（保护压缩出处链可解）、压缩必须非空摘要且必须真的丢弃内容、压缩必须用新 `snapshot_id`。
+  - **未包含（有意排除）**：tree 导航（祖先/子节点/公共祖先/按 checkpoint 定位）、每节点回放、branch/fork；**fork 的工作区隔离完全未解决**（两条分支共享同一工作区必然互相覆盖）；跨机器同步、协作编辑。
 - [x] **A2 结构化事件兼容层**：在现有 Journal 之外提供稳定的 JSONL/NDJSON 事件流、事件版本和迁移器；借鉴 Pi JSON/RPC、ZCode 协议层、DeepSeek Harness 的 SessionEvent、OpenHands Agent Server 和 Cline headless 模式。
   - 已有：Journal（`pangu-journal/v1`、`/v2`），带 `prev_sha`/`sha` 哈希链与 `event_id` 回执（v2）。但这是**内部存储格式**，18 个 `Option` 字段 + `deny_unknown_fields`，外部工具要么绑死内部结构、要么把审计链当数据流读。
   - 已完成（ADR-0003）：独立的 `pangu-stream/1` 契约——闭集 `StreamEvent`（非 `Value`）、`EventMigrator`、`StreamWriter`（`EventSink` 实现）、`read_stream`、CLI `pangu events read|contract`。
@@ -345,6 +348,20 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - 已完成（ADR-0002）：`pangu explain` 投影 `Policy → Sandbox → Approval` 三层，逐条规则报出 `decided` / `matched_but_refused` / `no_match` / `not_reached`，并做遮蔽（死规则）分析。报告固定带 `advisory: true` / `authoritative: false`，不提供到 `Effect` 的转换，因此不可能被当作授权。
   - **未包含（有意排除）**：预算耗尽点预测、从 Journal 解释历史判定（依赖 A2 的稳定事件契约）、规则修改建议。
 - [ ] **A5 会话导出与隐私检查**：导出前扫描 secret、绝对路径、命令输出和大对象；借鉴 Pi session export、SWE-agent trajectory 和 Cline history。
+- [ ] **A6 无限上下文（切片、组装与写回）**：会话历史本地全量留存、不受模型上下文窗口限制；按需切片，只把当前需要的部分传上去，返回的内容再并回总上下文。详见 [`docs/adr/0005-context-assembly.md`](docs/adr/0005-context-assembly.md)。
+  - **动机（仓库里的真实痛点）**：现在不是裁剪，是终止。`crates/pangu-agent/src/lib.rs` 的三处独立检查点（`Breach::InputTokens`）一旦 `estimated_input >= max_input_tokens` 就把 `terminal` 置为 `BudgetExhausted` 并 `break`，默认阈值 200,000。长任务今天只有两种结局：塞得下，或者死。
+  - **与 A1 的关系（重要）**：这是 A1 路线的**分叉**，不是叠加。A1b 路线是"全量 + 显式压缩"= 有损但连续（压缩后原文没了，只留 `compacted_from_digest` 指针）；A6 是"全量留存 + 按需切片"= 无损但非连续。两者不能同时是默认。A6 定为**主路线**，`ConversationSnapshot::compacted()` 降级为"某个切片摘要的一种降级模式"而非会话级一次性压缩。
+  - **“需要哪个”不能由模型决定**：模型能裁掉 system 轮（边界指令在哪），也能裁掉“上次这个操作被拒了”的历史然后重试——正是 `invariant_i_failed_path_not_repeated` 防的事。组装 = **不可协商强制集**（system 轮 / goal / 被拒路径 / 未完成工具调用 / 最近 N 轮）+ 模型**请求**集；模型只能*请求*，不能*排除*。每次组装把**每个切片的来源与选取理由**写进事件流。
+  - **写回是新攻击面，不是纯功能**：模型返回内容写回本地 = 模型能改本地状态。这是“模型输出不是授权”的加强版——不是授权了 `Effect`，是**篡改了未来的输入**。因此写回只能**追加**为新切片，原切片不动；记 `derived_from`（哪个切片的第几版）；快照整体仍 append-only 不变；写回内容显式标 `unverified`（它没过 `Policy`/`Sandbox`），并扩展 `invariant_i_resumed_conversation_carries_no_authorization` 覆盖它。
+  - **诚实边界（`无限` 二字的代价）**：
+    - 能给的是**“本地留存不受模型上下文窗口限制”**；给不了字面意义的“无上限”。现有硬界是 `MAX_CONVERSATION_BYTES = 8 MiB` / `MAX_CONVERSATION_MESSAGES = 10_000` / `MAX_MESSAGE_CONTENT_BYTES = 256 KiB`（`crates/pangu-core/src/conversation.rs`）。A6 把这三个改为**可配置且默认大幅提高**（如 512 MiB / 100,000 条），但保留上界：否则无法回答“这次花了多少”（G4 成本有界），且保存失败要上抛、病态循环能写爆存储。**上界进 `doctor` 报告。**
+    - 超出切片预算时**仍然会终止**。组装器有降级链 `full → summary → omit-with-reason`，但降到无可降级时必须死，不能无限降级。**不允许出现“永不终止的运行”。**
+    - 同 §1 已有规矩（“不能把项目目录误认为安全沙箱；应用层限制不能宣传成 OS 级隔离”）：“无限上下文”是**营销名，不是承诺**。README/CLI 输出不得出现无界的可验证性暗示。
+  - **子阶段**：A6-1 切片存储（`ContextSlice`，append-only，复用 `ArtifactStore`；顺带补切片寻址——现有 `Message` 无 id/时间戳，`crates/` 内也**无任何**检索/嵌入/摘要能力）→ A6-2 组装器（`assemble(forced, requested, budget) -> (AssembledContext, AssemblyReport)`）→ A6-3 概要模式（降级链）→ A6-4 写回 → A6-5 接入运行循环（替代“超限即终止”，保留终止作兜底）。
+  - **与 F1 合并机制，不要各做一套**：F1「Repo Map」已经在做“生成可解释的、显示来源/时效/token budget 的上下文”，它本质就是“代码库这一类内容的切片”。F1 应**消费** A6 的组装接口，否则两个“选什么进 prompt”的地方必然分叉。
+  - **不阻塞于 A1-3**：A6 只需 A1-1（已做，会话持久化）。切片单位用 **turn**（一次 user/assistant/tool 交换）即可起步，tree 节点是更优雅的单位但不是前提。
+  - **待复核（用户已授权按默认写入，语义仍需确认）**：写回的**具体**语义（模型改写后的切片 vs 模型的正常新消息）决定了工作量和风险档次，见 ADR §3。
+
 
 ### B. 扩展、技能和模型
 

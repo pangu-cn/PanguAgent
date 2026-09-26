@@ -24,6 +24,7 @@ use pangu_core::{
 };
 
 mod checkpoint;
+pub mod conversation;
 mod effect;
 
 pub use effect::{EffectDescriptor, EffectScope, Reversibility};
@@ -356,6 +357,10 @@ pub struct Agent {
     approval: Arc<dyn ApprovalHandler>,
     event_sink: Arc<dyn EventSink>,
     checkpoint: Option<Arc<checkpoint::CheckpointRuntime>>,
+    conversation: Option<Arc<conversation::ConversationRuntime>>,
+    /// History to continue from. Model input only: it carries no decision and
+    /// no approval, and every action in the resumed run is re-evaluated.
+    resume_from: Option<Vec<Message>>,
 }
 
 impl Agent {
@@ -380,6 +385,7 @@ impl Agent {
             ));
         }
         let checkpoint = checkpoint::CheckpointRuntime::from_contract(&contract)?;
+        let conversation = conversation::ConversationRuntime::from_contract(&contract)?;
         Ok(Self {
             contract,
             policy,
@@ -389,7 +395,52 @@ impl Agent {
             approval,
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
+            conversation: conversation.map(Arc::new),
+            resume_from: None,
         })
+    }
+
+    /// Continue from a stored conversation.
+    ///
+    /// The restored history is **model input only**. It does not carry a
+    /// decision, an effect, or any memory of an approval, and this method does
+    /// not skip a single gate: every tool call the resumed run makes is
+    /// re-evaluated through `Policy -> Sandbox -> Approval` exactly as in a
+    /// fresh run.
+    ///
+    /// The workspace is *not* restored. That is rollback's job, and doing it
+    /// here would mean a resume could silently change files without the
+    /// compare-and-swap, approval, and effect accounting that rollback goes
+    /// through. Resuming a conversation while the workspace is in a different
+    /// state is the operator's call to make, visibly, with
+    /// `pangu rollback`.
+    pub fn resume_from(mut self, conversation: &pangu_core::ConversationSnapshot) -> Result<Self> {
+        conversation.validate()?;
+        let history = conversation.restore()?;
+        conversation::validate_resumable(&history)?;
+        self.resume_from = Some(history);
+        Ok(self)
+    }
+
+    /// The conversation ids this agent could resume from, oldest first.
+    pub fn resumable_conversations(&self) -> anyhow::Result<Vec<String>> {
+        match &self.conversation {
+            Some(runtime) => runtime.list().map_err(|error| anyhow!(error)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Continue from the most recently stored conversation.
+    pub fn resume_latest(self) -> Result<Self> {
+        let Some(runtime) = &self.conversation else {
+            return Err(anyhow!(
+                "conversation persistence is disabled; enable `conversation.enabled` to resume"
+            ));
+        };
+        let Some(latest) = runtime.latest()? else {
+            return Err(anyhow!("no stored conversation to resume from"));
+        };
+        self.resume_from(&latest)
     }
 
     /// Run the agent. The event sink is the streaming audit interface; this
@@ -1189,10 +1240,16 @@ impl Agent {
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut evidence = Vec::new();
-        let mut history = vec![
-            Message::system(self.contract.system_prompt()),
-            Message::user(self.contract.goal.clone()),
-        ];
+        let mut history = match &self.resume_from {
+            // A resumed history already carries its system turn and goal.
+            // Re-seeding them would duplicate the instructions at the head and
+            // leave the model with two goals.
+            Some(history) => {
+                conversation::validate_resumable(history)?;
+                history.clone()
+            }
+            None => conversation::seed_history(self.contract.system_prompt(), &self.contract.goal),
+        };
         let mut terminal = None;
         let mut last_turn = 0;
         let mut checkpoint_state = self
@@ -1436,9 +1493,24 @@ impl Agent {
                     terminal = Some(GoalStatus::BudgetExhausted);
                 }
             }
+            // Per-turn save, so a crash mid-run is still resumable. Gated on
+            // `save_every_turn` because it costs a write per turn.
+            if let Some(runtime) = &self.conversation {
+                if runtime.saves_every_turn() && terminal.is_none() {
+                    runtime.save(&self.contract.goal, &history, None)?;
+                }
+            }
+
             if terminal.is_some() {
                 break;
             }
+        }
+
+        // Persist the conversation at the end whatever the outcome. A run that
+        // hit a budget or failed partway is exactly the one an operator wants
+        // to resume, so a save only on success would be useless.
+        if let Some(runtime) = &self.conversation {
+            runtime.save(&self.contract.goal, &history, None)?;
         }
 
         let status = terminal.unwrap_or(GoalStatus::Failed);

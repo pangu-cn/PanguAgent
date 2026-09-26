@@ -30,6 +30,7 @@ pub struct Config {
     pub budget: Budget,
     pub boundary: BoundarySection,
     pub checkpoint: CheckpointSection,
+    pub conversation: ConversationSection,
     pub goal: GoalSection,
     pub rules: Vec<Rule>,
     pub unattended: bool,
@@ -62,6 +63,34 @@ pub struct CheckpointSection {
     pub max_snapshot_file_bytes: u64,
     pub failure_policy: CheckpointFailurePolicy,
     pub rollback_requires_approval: bool,
+}
+
+/// Persisted conversation history, so an interrupted run can resume.
+///
+/// Off by default, like checkpointing. A stored conversation is a record of
+/// what the model was told, not an authorization: restoring one does not
+/// carry any decision or approval into the resumed run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConversationSection {
+    pub enabled: bool,
+    /// Artifact store root for conversation snapshots. Kept separate from
+    /// `checkpoint.artifact_root` so the two features can be enabled,
+    /// retained, or cleaned up independently.
+    pub artifact_root: PathBuf,
+    /// Save after every turn, not just at terminal states. Costs a write per
+    /// turn and buys recovery from a crash mid-run.
+    pub save_every_turn: bool,
+}
+
+impl Default for ConversationSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            artifact_root: PathBuf::from(".pangu/conversations"),
+            save_every_turn: true,
+        }
+    }
 }
 
 impl Default for CheckpointSection {
@@ -997,6 +1026,24 @@ mod tests {
         assert!(!loaded.checkpoint.enabled);
         assert_eq!(loaded.checkpoint.backend, CheckpointBackend::Artifact);
         assert!(loaded.checkpoint.rollback_requires_approval);
+    }
+
+    /// A config written before conversation persistence existed has no
+    /// `[conversation]` section. It must still load, and it must load *off*: a
+    /// missing section cannot mean "start writing files", because that would
+    /// change what an existing deployment does the first time it upgrades.
+    #[test]
+    fn old_config_without_conversation_section_loads_with_defaults() {
+        let base = Config::embedded().unwrap();
+        let mut value = toml::Value::try_from(&base).unwrap();
+        value.as_table_mut().unwrap().remove("conversation");
+        let loaded = Config::from_toml(&toml::to_string(&value).unwrap()).unwrap();
+        assert!(
+            !loaded.conversation.enabled,
+            "an absent section must not turn conversation persistence on"
+        );
+        assert!(loaded.conversation.save_every_turn);
+        assert!(loaded.conversation.artifact_root.is_relative());
     }
 
     #[test]

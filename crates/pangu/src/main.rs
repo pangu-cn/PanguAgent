@@ -104,6 +104,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Persisted conversation history. Resume continues a conversation; it
+    /// never restores the workspace, which is `pangu rollback`'s job.
+    Conversation {
+        #[command(subcommand)]
+        action: ConversationCommands,
+    },
     /// Inspect a stable event stream. Read-only, and never an authorization.
     Events {
         #[command(subcommand)]
@@ -143,6 +149,22 @@ enum ArtifactCommands {
     Inspect {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Conversation history commands. `list` and `show` are read-only; a resume
+/// still goes through every gate.
+#[derive(Clone, Debug, Subcommand)]
+enum ConversationCommands {
+    /// List stored conversations, oldest first.
+    List,
+    /// Show one conversation's metadata without its full text.
+    Show {
+        /// Snapshot id. Defaults to the most recent.
+        #[arg(long)]
+        id: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -223,6 +245,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Conversation { action }) => match action {
+            ConversationCommands::List => conversation_list(&args),
+            ConversationCommands::Show { id, json } => conversation_show(&args, id, json),
+        },
         Some(Commands::Events { action }) => match action {
             EventsCommands::Read { path, json, kind } => events_read(&path, kind, json),
             EventsCommands::Contract { json } => events_contract(json),
@@ -487,6 +513,88 @@ fn events_contract(json: bool) -> Result<()> {
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_default(),
                 kind.stability().as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build the conversation store the agent would use, without running anything.
+///
+/// Reuses the agent's own runtime so the CLI and a real run agree on where
+/// conversations live and which of them are readable.
+fn conversation_store(
+    args: &Cli,
+) -> Result<Option<pangu_agent::conversation::ConversationRuntime>> {
+    let (mut config, _) = Config::load(args.config.as_deref())?;
+    if let Some(workspace) = &args.workspace {
+        config.boundary.workspace = workspace.clone();
+    }
+    let contract = GoalContract::from_config("conversation maintenance", &config)?;
+    Ok(pangu_agent::conversation::ConversationRuntime::from_contract(&contract)?)
+}
+
+fn conversation_list(args: &Cli) -> Result<()> {
+    let Some(store) = conversation_store(args)? else {
+        println!("conversation persistence is disabled; enable `conversation.enabled`");
+        return Ok(());
+    };
+    let ids = store.list().map_err(|e| anyhow::anyhow!(e))?;
+    if ids.is_empty() {
+        println!("no stored conversations");
+        return Ok(());
+    }
+    for id in ids {
+        let snapshot = store.load(&id).map_err(|e| anyhow::anyhow!(e))?;
+        println!(
+            "{}  turn-less  messages={}  digest={}  {}{}",
+            id,
+            snapshot.messages.len(),
+            &snapshot.history_digest[..16],
+            snapshot.created_at,
+            match &snapshot.compaction {
+                Some(record) => format!("  [compacted: -{} message(s)]", record.dropped_messages),
+                None => String::new(),
+            }
+        );
+    }
+    Ok(())
+}
+
+fn conversation_show(args: &Cli, id: Option<String>, json: bool) -> Result<()> {
+    let Some(store) = conversation_store(args)? else {
+        return Err(anyhow::anyhow!(
+            "conversation persistence is disabled; enable `conversation.enabled`"
+        ));
+    };
+    let snapshot = match id {
+        Some(id) => store.load(&id).map_err(|e| anyhow::anyhow!(e))?,
+        None => store
+            .latest()
+            .map_err(|e| anyhow::anyhow!(e))?
+            .ok_or_else(|| anyhow::anyhow!("no stored conversation to show"))?,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        println!(
+            "id: {}
+run: {}
+created: {}
+messages: {}
+digest: {}
+derived: true
+authoritative: false",
+            snapshot.snapshot_id,
+            snapshot.run_id,
+            snapshot.created_at,
+            snapshot.messages.len(),
+            snapshot.history_digest,
+        );
+        if let Some(record) = &snapshot.compaction {
+            println!(
+                "compacted from {} (dropped {}, kept {})",
+                record.compacted_from_digest, record.dropped_messages, record.kept_messages
             );
         }
     }

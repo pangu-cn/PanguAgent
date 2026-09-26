@@ -118,9 +118,11 @@ ConversationSnapshot {
 - 跨机器同步、协作编辑：明确不做。
 - A5 的导出隐私检查会作用在 `ConversationSnapshot` 上。
 
-## 7. 实现状态（第一阶段）
+## 7. 实现状态
 
-已实现（`crates/pangu-core/src/conversation.rs`，12 个单元测试含 3 个 store 往返测试；`tests/invariants.rs` 1 个不变式）：
+### 7.1 第一阶段：对话表示
+
+已实现（`crates/pangu-core/src/conversation.rs`，12 个单元测试含 3 个 store 往返测试）：
 
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
@@ -133,8 +135,34 @@ ConversationSnapshot {
 | 压缩防空洞 | 完成 | 空摘要被拒；未丢弃任何内容的压缩被拒；伪造的 `dropped_messages: 0` 记录被拒 |
 | store 存取 | 完成 | `save_conversation` / `load_conversation` / `list_conversations`，复用 store 的锁与 symlink 拒绝 |
 | 体积与条数边界 | 完成 | 8 MiB 总量 / 10,000 条 / 单条 256 KiB |
-| "恢复不携带授权" | 完成 | `invariant_i_resumed_conversation_carries_no_authorization`：断言恢复值只有 `Message`、消息形状无 `effect`/`decision`/`approved` 等字段、把恢复文本喂回 `Policy::evaluate` 时判定仍来自规则或不变量而非历史内容 |
+| "恢复不携带授权"（表示层） | 完成 | `invariant_i_resumed_conversation_carries_no_authorization`：断言恢复值只有 `Message`、消息形状无 `effect`/`decision`/`approved` 等字段、把恢复文本喂回 `Policy::evaluate` 时判定仍来自规则或不变量而非历史内容 |
+
 
 **实现中发现并修正的一个真 API 缺陷**：`compacted()` 最初沿用原 `snapshot_id`，而 store 的不可变检查会直接拒绝——等于**压缩产物永远存不下来**，而这正是压缩存在的理由。已改为必须显式传入新的 `snapshot_id`（复用同一个 id 时直接报错），并在文档里说明原因：改写会毁掉新记录声称所来自的那份历史。
 
-**本阶段未做**（不是遗漏，是本 ADR 阶段划分的边界）：tree 导航与 `branch`/`fork`、CLI 子命令、agent 运行循环的 save/restore 钩子（因此**尚未能真正 resume 一次运行**，现在具备的是"可持久化、可校验、可显式压缩的对话表示"）。**fork 的工作区隔离完全未解决**，见第 6 节。
+### 7.2 第二阶段：接入 agent 运行循环
+
+第一阶段完成后，保存的对话没有任何东西会写入或读取它——`Agent::run()` 每次从零构造 history。现在这条链接通了。
+
+| 项 | 状态 | 证据 |
+| --- | --- | --- |
+| 配置开关 | 完成 | `ConversationSection { enabled, artifact_root, save_every_turn }`；默认 `enabled: false`。`old_config_without_conversation_section_loads_with_defaults` 断言**缺段即关闭**——老配置升级后不会突然开始写文件 |
+| contract 绑定 | 完成 | `GoalContract.conversation`，与 checkpoint 同样的 canonicalize 处理：仅当启用时解析 `artifact_root` |
+| 运行期写入 | 完成 | `ConversationRuntime::save`，每轮 turn 结束（`save_every_turn`）与**终局无论成败**各存一次。错误上抛不静默 |
+| 恢复入口 | 完成 | `Agent::resume_from(&ConversationSnapshot)` / `resume_latest` / `resumable_conversations`；恢复时**不再重复 seed** system+goal |
+| 恢复前校验 | 完成 | `validate_resumable`：首条必须是 `Message::System`，空历史报错。缺 system 轮 = 恢复进一个从没被告知边界的上下文 |
+| CLI | 完成 | `pangu conversation list` / `show [--json]`；未启用时明确报"关闭"而不是显示空列表 |
+| "恢复不携带授权"（端到端） | 完成 | `invariant_i_resume_continues_the_conversation_but_re_evaluates_every_action`，三个性质一起断言（见下） |
+
+**接进运行循环后抓到的两个真问题**：
+
+1. **快照 id 里写进了未脱敏的目标文本。** 最初用 `self.contract.goal` 作 id 的一部分，于是 `conv_读取 Cargo.toml 并报告包名_...json` 这样的文件名出现在磁盘和 `ls` 输出里。journal 对 goal 明确做了 `redact_text`——把同一段文本原样放进**路径**等于撤销了那条规则。改为 `short_hash(redact_text(...))`。
+2. **`max_turns = 1` 的运行会丢弃模型的第一条响应。** 写测试时发现存下来的历史只有 `[System, User]`。原因不在新代码：`run_inner` 在收到响应后、把它并入 history **之前**就检查 `budget_breaches(turn, ...)`，而 `Breach::Turns` 的判据是"已完成的轮数 >= 上限"，所以上限为 1 时第一条响应刚到手就被判定超预算并丢弃。测试改用 2。**未改动这处行为**——它是既有设计，且与本次目标无关，但记在这里以免下次再被绊住。
+
+**"恢复不携带授权"的端到端证据**（`invariant_i_resume_continues_the_conversation_but_re_evaluates_every_action`）一次断言三个性质，缺一不可：
+
+- **续上了，不是重开**：provider 被调用时收到的是**恰好 6 条**已存消息。恢复若偷偷重新 seed，发的会是 8 条（system+goal 又来一遍）。这一条从 provider 侧读实际看到的消息条数，不看"运行有输出"这种间接信号。
+- **恢复后的动作重新过闸**：第一轮拿到 `AllowOnce` 写入了 `one`；恢复后的运行**没有**任何审批，规则是 `ask`。工作区仍是 `one`，且事件流里有 `ToolBlocked`（理由写明 `human approval was not granted`）、**没有** `ToolFinished`。
+- **模型不能把被拒的运行说成完成**：恢复后的第二轮脚本调用了 `finish {"status": "complete"}`，运行仍报 `failed`、evidence 为空。
+
+**本阶段未做**：tree 导航（祖先/子节点/公共祖先/按 checkpoint 定位）、每节点回放、`branch`/`fork`。**fork 的工作区隔离完全未解决**，见第 6 节。`SessionNode.history_digest` 依然是死字段——会话树接入运行循环是第三阶段的事。
