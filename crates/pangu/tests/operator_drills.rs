@@ -711,6 +711,15 @@ fn drill_replace_backup_is_preserved_and_blocks_artifact_writes() {
         // exists on this platform.
         let result = outcome.expect("POSIX has no replacement hand-off");
         assert_eq!(result.disposition, RestoreDisposition::Applied);
+        // The workspace already matched the target snapshot, so applying the
+        // restore leaves the bytes alone. Checking it on both platforms keeps
+        // the "the planted evidence changed nothing" claim honest everywhere
+        // rather than only where the write is refused.
+        assert_eq!(
+            workspace_before,
+            tree_digest(&fixture.workspace),
+            "an applied restore must not rewrite a workspace that already matched"
+        );
     }
 
     assert!(backup.exists(), "the backup is evidence and must survive");
