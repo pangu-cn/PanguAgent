@@ -32,7 +32,21 @@ jobs:
         run: cargo check --workspace --all-targets --all-features
 
       - name: Run all tests
-        run: cargo test --workspace --all-targets --all-features
+        shell: bash
+        run: |
+          # tee keeps the full test output as a downloadable artifact: the
+          # annotations endpoint only reports an exit code, which is not enough
+          # to tell a failing assertion from a fixture collision.
+          set -o pipefail
+          cargo test --workspace --all-targets --all-features 2>&1 | tee all-tests.log
+
+      - name: Archive all-tests log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: all-tests.log
+          if-no-files-found: warn
 
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
