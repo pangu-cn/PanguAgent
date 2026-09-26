@@ -34,11 +34,26 @@ jobs:
       - name: Run all tests
         shell: bash
         run: |
-          # tee keeps the full test output as a downloadable artifact: the
-          # annotations endpoint only reports an exit code, which is not enough
-          # to tell a failing assertion from a fixture collision.
-          set -o pipefail
+          # tee keeps the full test output as a downloadable artifact, and the
+          # failure summary is re-emitted as ::error:: annotations: the job log
+          # needs admin rights and the artifact download needs authentication,
+          # but annotations are readable by anyone who can read the repository.
+          set +e
           cargo test --workspace --all-targets --all-features 2>&1 | tee all-tests.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            esc() { printf '%s' "$1" | tr -d '\r' | sed -e 's/%/%25/g' -e 's/:/%3A/g'; }
+            {
+              grep -E '^test .* FAILED$' all-tests.log | head -20 || true
+              grep -E '^ +--> ' all-tests.log | head -10 || true
+              grep -E 'panicked at' all-tests.log | head -10 || true
+            } | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=cargo test failure::$(esc "$line")"
+            done
+            echo "::error title=cargo test failure::exit code $status (full log in the test-log artifact)"
+          fi
+          exit "$status"
 
       - name: Archive all-tests log
         if: always()
