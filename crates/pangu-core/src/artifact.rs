@@ -23,6 +23,7 @@ use crate::checkpoint::{
     FailedPathRecord, FailedPathStatus, SessionNode, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_FILES,
     MAX_SNAPSHOT_FILE_BYTES,
 };
+use crate::conversation::{ConversationSnapshot, MAX_CONVERSATION_BYTES};
 use crate::{now_rfc3339, redact_text, Error, Glob, Result};
 
 pub const ARTIFACT_STORE_SCHEMA_VERSION: u32 = 1;
@@ -797,6 +798,78 @@ impl ArtifactStore {
         }
         let bytes = serialize_bounded(node, MAX_SESSION_NODE_BYTES, "session node ledger record")?;
         write_atomic(&path, &bytes)
+    }
+
+    /// Persist a conversation snapshot.
+    ///
+    /// Stored beside the checkpoints rather than in a store of its own: content
+    /// addressing, the process lock, and the symlink rejection are already
+    /// exercised here, and a second storage path would mean a second set of
+    /// integrity rules to trust. Snapshots are append-only — a `snapshot_id`
+    /// is never rewritten — so a later compaction adds a new record and
+    /// leaves the earlier one readable.
+    pub fn save_conversation(&self, conversation: &ConversationSnapshot) -> Result<()> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| Error::Other("artifact operation lock is poisoned".into()))?;
+        let _process_lock = StoreProcessLock::acquire(&self.root)?;
+        conversation.validate()?;
+        validate_id("snapshot_id", &conversation.snapshot_id)?;
+        let bytes = serde_json::to_vec(conversation)?;
+        crate::conversation::validate_encoded_size(&bytes)?;
+        let path = self.conversation_path(&conversation.snapshot_id)?;
+        if path_exists_without_symlink(&path)? {
+            // Rewriting would invalidate every compaction record that points
+            // at this digest, so an existing snapshot is immutable.
+            return Err(Error::Config(format!(
+                "conversation snapshot already exists and is immutable: {}",
+                conversation.snapshot_id
+            )));
+        }
+        write_atomic(&path, &bytes)
+    }
+
+    /// Load a conversation snapshot and verify its digest.
+    pub fn load_conversation(&self, snapshot_id: &str) -> Result<ConversationSnapshot> {
+        validate_id("snapshot_id", snapshot_id)?;
+        let path = self.conversation_path(snapshot_id)?;
+        let bytes = read_regular_file_bounded(&path, MAX_CONVERSATION_BYTES as u64)?;
+        let conversation: ConversationSnapshot = serde_json::from_slice(&bytes)?;
+        // Validate on the way out, not only on the way in: the file may have
+        // been edited since it was written, and a tampered history restored as
+        // if intact is exactly the failure this must not allow.
+        conversation.validate()?;
+        Ok(conversation)
+    }
+
+    /// Every stored snapshot id, sorted.
+    pub fn list_conversations(&self) -> Result<Vec<String>> {
+        let sessions = self.root.join("conversations");
+        if !path_exists_without_symlink(&sessions)? {
+            return Ok(Vec::new());
+        }
+        reject_symlink_components(&sessions)?;
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&sessions)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_suffix(".json") {
+                validate_id("snapshot_id", id)?;
+                ids.push(id.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn conversation_path(&self, snapshot_id: &str) -> Result<PathBuf> {
+        let directory = self.root.join("conversations");
+        if !path_exists_without_symlink(&directory)? {
+            fs::create_dir(&directory)?;
+        }
+        reject_symlink_components(&directory)?;
+        Ok(directory.join(format!("{}.json", safe_id(snapshot_id)?)))
     }
 
     pub fn compute_workspace_digest(&self, request: &SnapshotRequest) -> Result<String> {

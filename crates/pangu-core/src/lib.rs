@@ -6,6 +6,7 @@
 
 pub mod artifact;
 pub mod checkpoint;
+pub mod conversation;
 pub mod error;
 pub mod events;
 pub mod glob;
@@ -26,6 +27,10 @@ pub use checkpoint::{
     ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
     ExternalEffectSummary, FailedPathRecord, FailedPathStatus, FailureClass, RollbackRequest,
     SessionNode, CHECKPOINT_SCHEMA_VERSION, FAILED_PATH_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+};
+pub use conversation::{
+    redact_messages, validate_encoded_size, CompactionRecord, ConversationSnapshot,
+    MAX_CONVERSATION_BYTES, MAX_CONVERSATION_MESSAGES,
 };
 pub use error::{Error, Result};
 pub use events::{
