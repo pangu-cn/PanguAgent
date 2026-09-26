@@ -167,8 +167,10 @@ runtime 的下一次操作仍会看到 lock 并 fail closed；本手册不授权
 # 单个事故分支的回归测试（cargo test -p pangu --test operator_drills）
 cargo test -p pangu --test operator_drills
 
-# 产出可归档的逐平台证据；不设变量时直接打印到 stdout
-PANGU_DRILL_REPORT=evidence.jsonl cargo test -p pangu --test operator_drills -- --nocapture
+# 产出可归档的逐平台证据；不设变量时直接打印到 stdout。
+# PANGU_DRILL_REPORT 必须是绝对路径（cargo test 在包目录运行测试二进制）。
+PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEAD)" \
+  cargo test -p pangu --test operator_drills -- --nocapture
 ```
 
 | Drill | 对应分支 | 断言 |
@@ -217,7 +219,16 @@ PANGU_DRILL_REPORT=evidence.jsonl cargo test -p pangu --test operator_drills -- 
 
 | 平台 | 工具链 | 提交 | `cargo test --workspace --all-targets` | clippy `-D warnings` | operator drill（7 项） | 证据 |
 |------|--------|------|-----------------------------------|--------------------|-------------------|------|
-| Windows（本机） | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| Windows 10.0.26200 x86_64 | rustc 1.98.0 | `c7f5e39` | 通过（141 项，0 失败，含 `pangu --demo`） | 0 error / 0 warning | 7/7 pass | [`evidence/f7-drills-windows.jsonl`](evidence/f7-drills-windows.jsonl) |
 | Ubuntu（CI） | 待 CI | 待 CI | 待 CI | 待 CI | 待 CI | 等待 CI artifact |
+
+本机记录：2026-09-25 在 Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0 上，针对提交 `c7f5e39` 运行 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --all-targets`、`cargo run -q -p pangu -- --demo` 与第 6 节的 7 个 drill，结果如上表；drill 报告由该提交自身产生，并记录了每次 drill 的平台与机制。
+
+已知覆盖边界（不是待办，而是事实）：
+
+- 本机只能提供 Windows 证据。**Ubuntu 结果必须来自真实 CI 运行**，不得由本机结果或推断代替；CI 已配置双平台 drill 步骤与 artifact 上传。
+- `failed-operation` 在 Unix 以“不可写目录”阻断，root 环境下记为 `skipped`；因此 Ubuntu 报告可能不包含该机制，不代表通过。
+- `replace-backup` 在 POSIX 无 hand-off 语义，Ubuntu 报告该项为 `not-applicable`，不能据此声称 Unix 也验证了 replacement 保护。
+- drill 证明 fail closed 与证据存在，**不证明** Pangu 能自动完成恢复；并发 writer、无人工输入、外部副作用的处置仍需部署者按第 4 节人工裁决。
 
 相关设计边界见 [`BOUNDARY.md`](BOUNDARY.md)、[`ARCHITECTURE.md`](ARCHITECTURE.md) 和 [`adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md)。

@@ -4,6 +4,8 @@ Cargo.lock
 .pangu/
 *.jsonl
 !tests/fixtures/**
+# 验收证据是刻意入库的（CHECKPOINT_RECOVERY.md §8.1 引用它们）
+!docs/evidence/*.jsonl
 .env
 
 # 本地手工验证残留：根目录产物不进入版本库
