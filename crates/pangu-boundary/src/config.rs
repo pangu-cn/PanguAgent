@@ -898,6 +898,14 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    /// The platform temporary directory can sit behind a symlink or junction on
+    /// CI runners, and the runtime refuses such paths for artifact roots and
+    /// journals. Resolve it once so fixtures satisfy that policy.
+    fn test_temp_root() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        std::fs::canonicalize(&base).unwrap_or(base)
+    }
+
     use super::*;
 
     #[test]
@@ -910,7 +918,7 @@ mod tests {
 
     #[test]
     fn boundary_digest_uses_effective_roots() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-digest-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -946,7 +954,7 @@ mod tests {
 
     #[test]
     fn enabled_checkpoint_is_bound_to_an_effective_absolute_root() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-checkpoint-config-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -993,7 +1001,7 @@ mod tests {
 
     #[test]
     fn contract_and_sandbox_preserve_configured_root_order() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-root-order-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

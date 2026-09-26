@@ -462,6 +462,7 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
         ),
         Err(error) => error.to_string(),
     };
+    let error_of_restore = error.clone();
     drop(blocked);
     assert!(
         !error.is_empty(),
@@ -469,12 +470,18 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
     );
 
     // The failure is durably recorded with a reason, and the workspace is not
-    // left looking like a successful rollback.
+    // left looking like a successful rollback. The restore's own error is
+    // carried into the panic: without it a missing record is indistinguishable
+    // from a refusal that happened before the operation was ever written.
     let operation = fixture
         .store
         .load_operation(&target.checkpoint_id, "rollback-drill-2")
-        .expect("load operation")
-        .expect("failed operation must be recorded");
+        .unwrap_or_else(|error| {
+            panic!("load the operation ledger: {error}; restore reported: {error_of_restore}")
+        })
+        .unwrap_or_else(|| {
+            panic!("failed operation must be recorded; restore reported: {error_of_restore}")
+        });
     assert_eq!(
         operation.status,
         pangu_core::RollbackOperationStatus::Failed,

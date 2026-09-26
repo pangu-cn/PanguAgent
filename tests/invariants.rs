@@ -29,6 +29,18 @@ use serde_json::json;
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// A temporary root that satisfies the runtime's symlink policy.
+///
+/// `ArtifactStore` and `Journal` both refuse a path whose components include a
+/// symlink or junction, which is deliberate: a checkpoint root that can be
+/// swapped underneath the process is not a trustworthy recovery source. The
+/// platform temporary directory does not honour that policy -- on CI runners
+/// and on macOS it can sit behind a link -- so tests must resolve it first.
+fn test_temp_root() -> std::path::PathBuf {
+    let base = std::env::temp_dir();
+    std::fs::canonicalize(&base).unwrap_or(base)
+}
+
 fn temp_path(label: &str) -> std::path::PathBuf {
     // Nanoseconds matter here: `Journal::create` refuses a path that already
     // exists, and the process id plus a per-process counter is reused once the
@@ -38,7 +50,7 @@ fn temp_path(label: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
+    test_temp_root().join(format!(
         "pangu-invariant-{label}-{}-{nanos}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)

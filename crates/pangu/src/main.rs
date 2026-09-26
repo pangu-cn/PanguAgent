@@ -547,6 +547,14 @@ impl Provider for DemoProvider {
 
 #[cfg(test)]
 mod tests {
+    /// The platform temporary directory can sit behind a symlink or junction on
+    /// CI runners, and the runtime refuses such paths for artifact roots and
+    /// journals. Resolve it once so fixtures satisfy that policy.
+    fn test_temp_root() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        std::fs::canonicalize(&base).unwrap_or(base)
+    }
+
     use super::*;
 
     #[test]
@@ -587,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_dry_run_validates_the_opt_in_config_before_reporting_success() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-cli-rollback-dry-run-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

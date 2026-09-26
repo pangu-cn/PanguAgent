@@ -1,5 +1,13 @@
 #[cfg(test)]
 mod tests {
+    /// The platform temporary directory can sit behind a symlink or junction on
+    /// CI runners, and the runtime refuses such paths for artifact roots and
+    /// journals. Resolve it once so fixtures satisfy that policy.
+    fn test_temp_root() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        std::fs::canonicalize(&base).unwrap_or(base)
+    }
+
     use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
@@ -211,7 +219,7 @@ mod tests {
     }
 
     fn setup(options: SetupOptions) -> (Agent, Arc<CountingTool>, Arc<MemSink>, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-agent-test-{}-{}-{}",
             std::process::id(),
             TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -459,7 +467,7 @@ mod tests {
     async fn journal_v2_receipt_is_bound_to_the_published_checkpoint() {
         // Nanoseconds: see the note in tests/invariants.rs. A reused process id
         // plus counter would inherit another run's journal and workspace.
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-agent-journal-receipt-{}-{}-{}",
             std::process::id(),
             TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -651,7 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_restores_an_older_checkpoint_and_is_idempotent() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-agent-rollback-test-{}-{}-{}",
             std::process::id(),
             TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -797,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_wall_clock_budget_stops_after_slow_approval() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-agent-rollback-budget-{}-{}-{}",
             std::process::id(),
             TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -889,7 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_mutation_after_a_checkpoint_blocks_rollback() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_root().join(format!(
             "pangu-agent-external-rollback-{}-{}-{}",
             std::process::id(),
             TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
