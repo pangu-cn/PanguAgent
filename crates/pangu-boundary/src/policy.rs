@@ -373,19 +373,100 @@ impl Policy {
     /// Deny rules always take precedence. Among non-deny rules, the first
     /// match wins, preserving predictable ask/allow ordering.
     pub fn evaluate(&self, request: &ActionRequest<'_>, workspace: &Path) -> Decision {
+        let Some(denial) = self.path_denial(request) else {
+            return self.evaluate_matched_rule(request, workspace);
+        };
+        denial
+    }
+
+    /// Evaluate a fixed, non-model maintenance capability. The capability is
+    /// authorized by the explicit L1 checkpoint switch, while normal deny
+    /// rules and matching ask/allow rules still apply. A missing rule is an
+    /// intentional internal allow rather than a model-visible default-deny
+    /// bypass; callers must use this method only for a capability that cannot
+    /// be named or parameterized by a model.
+    pub fn evaluate_internal(
+        &self,
+        request: &ActionRequest<'_>,
+        workspace: &Path,
+        invariant: &str,
+        reason: &str,
+    ) -> Decision {
+        if let Some(denial) = self.path_denial(request) {
+            return denial;
+        }
+        if let Some(rule) = self
+            .rules
+            .iter()
+            .find(|rule| rule.effect == Effect::Deny && rule.matches(request, workspace))
+        {
+            return Decision {
+                effect: Effect::Deny,
+                risk: request.risk,
+                rule_id: Some(rule.id.clone()),
+                reason: rule.reason.clone(),
+                invariant: rule
+                    .invariant
+                    .clone()
+                    .or_else(|| Some("I-No-Silent-Bypass".into())),
+            };
+        }
+        if let Some(rule) = self
+            .rules
+            .iter()
+            .find(|rule| rule.effect != Effect::Deny && rule.matches(request, workspace))
+        {
+            let escalated =
+                rule.effect == Effect::Allow && request.risk.at_least(Risk::Destructive);
+            let (effect, rule_reason) = if escalated {
+                (
+                    Effect::Ask,
+                    format!(
+                        "rule `{}` was escalated to the human gate ({})",
+                        rule.id, request.risk
+                    ),
+                )
+            } else {
+                (rule.effect, rule.reason.clone())
+            };
+            return Decision {
+                effect,
+                risk: request.risk,
+                rule_id: Some(rule.id.clone()),
+                reason: rule_reason,
+                invariant: if escalated {
+                    Some("I-Model-Cannot-Self-Approve".to_string())
+                } else {
+                    rule.invariant
+                        .clone()
+                        .or_else(|| Some(invariant.to_string()))
+                },
+            };
+        }
+        Decision {
+            effect: Effect::Allow,
+            risk: request.risk,
+            rule_id: Some("internal-contract".into()),
+            reason: reason.to_string(),
+            invariant: Some(invariant.to_string()),
+        }
+    }
+
+    fn path_denial(&self, request: &ActionRequest<'_>) -> Option<Decision> {
         let has_parent_traversal = request.paths.iter().any(|path| {
             path.components()
                 .any(|component| matches!(component, std::path::Component::ParentDir))
         });
-        if request.escapes_workspace || has_parent_traversal {
-            return Decision {
-                effect: Effect::Deny,
-                risk: request.risk,
-                rule_id: None,
-                reason: "path traversal is not allowed".into(),
-                invariant: Some("I-Path-Safety".into()),
-            };
-        }
+        (request.escapes_workspace || has_parent_traversal).then(|| Decision {
+            effect: Effect::Deny,
+            risk: request.risk,
+            rule_id: None,
+            reason: "path traversal is not allowed".into(),
+            invariant: Some("I-Path-Safety".into()),
+        })
+    }
+
+    fn evaluate_matched_rule(&self, request: &ActionRequest<'_>, workspace: &Path) -> Decision {
         if let Some(rule) = self
             .rules
             .iter()
@@ -556,5 +637,43 @@ mod tests {
         let decision =
             Policy::empty().evaluate(&ActionRequest::new("read_file", "c", &args), Path::new("/"));
         assert_eq!(decision.effect, Effect::Deny);
+    }
+
+    #[test]
+    fn internal_capability_is_explicitly_allowed_but_respects_deny_and_ask() {
+        let args = json!({});
+        let request = ActionRequest::new("checkpoint", "internal", &args).with(Risk::Reversible);
+        let decision = Policy::empty().evaluate_internal(
+            &request,
+            Path::new("/workspace"),
+            "I-Checkpoint-After-Verified-Action",
+            "checkpoint is enabled by the contract",
+        );
+        assert_eq!(decision.effect, Effect::Allow);
+        assert_eq!(decision.rule_id.as_deref(), Some("internal-contract"));
+
+        let denied = Policy::new(vec![Rule::deny("no-checkpoint", "checkpoint", "blocked")])
+            .unwrap()
+            .evaluate_internal(
+                &request,
+                Path::new("/workspace"),
+                "I-Checkpoint-After-Verified-Action",
+                "unused",
+            );
+        assert_eq!(denied.effect, Effect::Deny);
+
+        let asked = Policy::new(vec![Rule::ask(
+            "confirm-checkpoint",
+            "checkpoint",
+            "confirm",
+        )])
+        .unwrap()
+        .evaluate_internal(
+            &request,
+            Path::new("/workspace"),
+            "I-Checkpoint-After-Verified-Action",
+            "unused",
+        );
+        assert_eq!(asked.effect, Effect::Ask);
     }
 }

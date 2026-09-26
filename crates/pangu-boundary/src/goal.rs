@@ -6,7 +6,7 @@ use pangu_core::{Error, Price, Result};
 
 use crate::approval::ApprovalMode;
 use crate::budget::Budget;
-use crate::config::Config;
+use crate::config::{canonicalize_with_missing, CheckpointSection, Config};
 use crate::sandbox::{absolute_path_from, Sandbox};
 
 /// The immutable, human-supplied portion of one run. The agent builds its
@@ -33,6 +33,8 @@ pub struct GoalContract {
     pub subprocess_output_limit: usize,
     pub max_write_bytes: usize,
     pub max_paths_per_action: usize,
+    #[serde(default)]
+    pub checkpoint: CheckpointSection,
     pub require_evidence: bool,
     pub min_successful_tool_calls: u32,
     pub price: Option<Price>,
@@ -73,6 +75,7 @@ impl GoalContract {
             subprocess_output_limit: 200_000,
             max_write_bytes: 4_194_304,
             max_paths_per_action: 64,
+            checkpoint: CheckpointSection::default(),
             require_evidence: true,
             min_successful_tool_calls: 1,
             price: None,
@@ -95,6 +98,13 @@ impl GoalContract {
             }),
             _ => None,
         };
+        let mut checkpoint = config.checkpoint.clone();
+        if checkpoint.enabled {
+            checkpoint.artifact_root = canonicalize_with_missing(&absolute_path_from(
+                &workspace,
+                &checkpoint.artifact_root,
+            )?)?;
+        }
         let contract = Self {
             goal: goal.into(),
             readable_roots,
@@ -115,6 +125,7 @@ impl GoalContract {
             subprocess_output_limit: config.boundary.subprocess_output_limit,
             max_write_bytes: config.boundary.max_write_bytes,
             max_paths_per_action: config.boundary.max_paths_per_action,
+            checkpoint,
             require_evidence: config.goal.require_evidence,
             min_successful_tool_calls: config.goal.min_successful_tool_calls,
             price,
@@ -180,7 +191,7 @@ impl GoalContract {
         let mut env = self.env_allow.clone();
         env.sort();
         env.dedup();
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "workspace": workspace,
             "readable_roots": readable_roots,
             "writable_roots": writable_roots,
@@ -202,6 +213,14 @@ impl GoalContract {
             "policy_digest": &self.policy_digest,
             "unattended": self.unattended,
         });
+        if self.checkpoint.enabled {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "checkpoint".into(),
+                    serde_json::to_value(&self.checkpoint).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
         pangu_core::hex_sha256(&serde_json::to_string(&value).unwrap_or_default())
     }
 
@@ -314,6 +333,8 @@ impl GoalContract {
                 )));
             }
         }
+        self.checkpoint
+            .validate(&self.workspace, &self.writable_roots)?;
         for pattern in &self.forbidden_globs {
             pangu_core::Glob::new(pattern)?;
         }
