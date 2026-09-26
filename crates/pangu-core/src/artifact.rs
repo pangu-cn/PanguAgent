@@ -31,6 +31,13 @@ pub const ROLLBACK_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_ARTIFACT_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROLLBACK_OPERATION_BYTES: usize = 256 * 1024;
 pub const MAX_SESSION_NODE_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on how many nodes a single session ledger may hold.
+///
+/// Navigation is O(n) over this directory and a corrupted or hostile store
+/// could otherwise make `pangu session tree` walk an unbounded number of
+/// files. It is far above any realistic run length.
+pub const MAX_SESSION_NODES: usize = 100_000;
 pub const MAX_CHECKPOINT_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_FAILED_PATH_LEDGER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EFFECT_LEDGER_BYTES: usize = 8 * 1024 * 1024;
@@ -736,6 +743,52 @@ impl ArtifactStore {
         let artifact = self.load_checkpoint(checkpoint_id)?;
         validate_session_node_for_artifact(&node, &artifact)?;
         Ok(node)
+    }
+
+    /// Enumerate every session node in the ledger.
+    ///
+    /// This is the only way to discover the session tree: nodes are only
+    /// otherwise reachable one id at a time through
+    /// [`Self::load_session_node_by_id`]. A node that fails to parse is an
+    /// error rather than a silent omission — a tree that quietly drops a
+    /// branch would answer "what happened here" incorrectly, which is worse
+    /// than refusing to answer.
+    pub fn list_session_nodes(&self) -> Result<Vec<SessionNode>> {
+        let sessions = self.root.join("sessions");
+        if !path_exists_without_symlink(&sessions)? {
+            return Ok(Vec::new());
+        }
+        reject_symlink_components(&sessions)?;
+        let mut nodes = Vec::new();
+        for entry in std::fs::read_dir(&sessions)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            validate_id("session_node_id", id)?;
+            let path = sessions.join(format!("{id}.json"));
+            reject_symlink_components(&path)?;
+            let node: SessionNode = serde_json::from_slice(&read_regular_file_bounded(
+                &path,
+                MAX_SESSION_NODE_BYTES as u64,
+            )?)?;
+            node.validate()?;
+            if node.session_node_id != id {
+                return Err(Error::Config(
+                    "session node id does not match its ledger path".into(),
+                ));
+            }
+            nodes.push(node);
+        }
+        if nodes.len() > MAX_SESSION_NODES {
+            return Err(Error::Config(format!(
+                "session ledger holds {} nodes, over the {MAX_SESSION_NODES} limit",
+                nodes.len()
+            )));
+        }
+        nodes.sort_by(|left, right| left.session_node_id.cmp(&right.session_node_id));
+        Ok(nodes)
     }
 
     /// Load a session node by its globally unique id. Session nodes are kept

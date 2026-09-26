@@ -131,6 +131,8 @@ pangu events read PATH [--kind KIND] [--json]
 pangu events contract [--json]
 pangu conversation list
 pangu conversation show [--json]
+pangu session tree [--json]
+pangu session replay NODE [--full] [--json]
 pangu run --workspace PATH --max-turns N --max-cost-usd X "GOAL"
 pangu --checkpoint run "GOAL"
 pangu rollback --checkpoint-id ID --source-node NODE --rollback-id OP --reason "..."
@@ -154,6 +156,8 @@ save_every_turn = true
 ```
 
 开启后，agent 在每轮 turn 结束与终局（无论成败）各存一份对话快照到 `Artifact store`，`pangu conversation list|show` 可只读查看。恢复一份快照只是把历史当**模型输入**重新喂回去：快照不携带任何 `Decision` / `Effect` / 已批准记忆，恢复后第一次发起工具调用仍走完整 `Policy → Sandbox → Approval`——第一轮拿到过的审批不会带进第二轮。存储前脱敏、内容 digest 读时校验（磁盘篡改即拒）、空历史与缺 system 轮的快照一律拒绝恢复。设计与非目标见 [`docs/adr/0004-conversation-persistence.md`](docs/adr/0004-conversation-persistence.md)。
+
+`pangu session tree` / `pangu session replay` 是**只读**导航：列出会话节点（roots、children、各节点的 checkpoint），或把某个节点上记录的对话重建出来。两者都不写、不删、不移动节点，`replay` **也不恢复工作区**——那是 `pangu rollback` 的职责，两者不能互相替代。账本是一份可被手工编辑的 JSON 目录，所以遍历对环和缺失 parent 都按**损坏账本**处理：报错或标注，而不是给出一个看起来完整其实残缺的答案。当前已知每次普通运行的树**恰好有一个孤儿**（运行根节点从不落盘），`session tree` 会打 `WARNING`，`session replay` 拒绝执行——详见 [`docs/adr/0004-conversation-persistence.md`](docs/adr/0004-conversation-persistence.md) §7.3。
 
 `--dangerously-unattended` 会把 approval mode 设为 `never`、使用 fail-closed 的 `Unattended` handler，并在 `RunStarted` 元数据中记录 `unattended=true`；需要人工或破坏性风险的动作会被拒绝，读-only 动作仍须通过其它闸门。它不是安全模式，只是明确放弃人工确认。
 

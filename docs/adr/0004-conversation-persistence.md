@@ -165,4 +165,30 @@ ConversationSnapshot {
 - **恢复后的动作重新过闸**：第一轮拿到 `AllowOnce` 写入了 `one`；恢复后的运行**没有**任何审批，规则是 `ask`。工作区仍是 `one`，且事件流里有 `ToolBlocked`（理由写明 `human approval was not granted`）、**没有** `ToolFinished`。
 - **模型不能把被拒的运行说成完成**：恢复后的第二轮脚本调用了 `finish {"status": "complete"}`，运行仍报 `failed`、evidence 为空。
 
-**本阶段未做**：tree 导航（祖先/子节点/公共祖先/按 checkpoint 定位）、每节点回放、`branch`/`fork`。**fork 的工作区隔离完全未解决**，见第 6 节。`SessionNode.history_digest` 依然是死字段——会话树接入运行循环是第三阶段的事。
+### 7.3 第三阶段：树导航与每节点回放
+
+| 项 | 状态 | 证据 |
+| --- | --- | --- |
+| 账本列举 | 完成 | `ArtifactStore::list_session_nodes()`；`MAX_SESSION_NODES = 100_000` 上界。**解析失败即报错而不是跳过**——静默丢一条分支会让"这里发生过什么"答错 |
+| 树导航 | 完成 | `session::SessionTree`（`crates/pangu-core/src/session.rs`，7 个单测）：`roots` / `children` / `ancestors` / `common_ancestor` / `by_checkpoint` / `render` |
+| **环检测** | 完成 | `ancestors()` 双重限界：visited 集合 + 步数上限。账本是手改的 JSON 目录，`parent` 指回祖先就会让朴素遍历**永久挂死**；现在按损坏账本报错。`render()` 同样有环保护 |
+| **孤儿不隐藏** | 完成 | `orphans()` + `ensure_complete()`。缺失的 parent **不提升为 root**——否则一次停在缺口上的遍历，看起来和一次走到历史开头完全一样 |
+| 对话挂到节点 | 完成 | **接线前 `run_inner` 两处都传 `None`**，`session_node_id` 参数是死的。已接上 `checkpoint_state.session_node_id`；`invariant_i_a_saved_conversation_names_a_session_node_that_exists` 钉住 |
+| 每节点回放 | 完成 | `ConversationRuntime::at_node` / `replay_at`；只返回 `Vec<Message>`，**不恢复工作区**（那是 `pangu rollback`），`invariant_i_replaying_a_node_restores_no_workspace_and_grants_nothing` |
+| CLI | 完成 | `pangu session tree [--json]` / `pangu session replay NODE [--full] [--json]`；checkpoint 关闭时明确报错而非列空树 |
+
+**抓到一个真实结构缺口：运行根节点从不落盘。**
+
+`SessionNode` 只在**提交检查点**时写进账本，而 `node_root_…` 只存在于 `RunCheckpointState` 内存里。结果是每次普通运行产生的树都**恰好有一个孤儿**：首个提交的节点其 parent 指向一个不在账本里的 id。
+
+- **不影响 rollback**：`rollback_transition_node_id` 是输入的确定性哈希（`hex_sha256(run_id:checkpoint_id:source_node:rollback_id)`），不查账本。账本原本就是为 rollback 记账设计的（见 `load_session_node_by_id` 的注释），不是为浏览而设计的。
+- **修不了**：`EventRef.event_id` 是**写 Journal 时才分配**的（`events.rs:264`），运行开始时拿不到真实 event id。给根节点编一个就是在可审计结构里塞假值，所以不编。
+- **处理方式**：`SessionTree` 如实报告缺口（`orphans()` / `ensure_complete()` / `render()` 标注 `orphan`），CLI 打 `WARNING`，`session replay` 直接拒绕。`invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden` 钉住这个行为。
+- **待决**：要么接受"运行起点不可回溯"（F7 契约不动），要么改 F7 让 `EventRef` 在事件发出时就分配 `event_id`（影响 Journal 写入路径，F7 仍为 `provisional`）。
+
+**CLI 接线时发现两个既有 bug（均非本次引入，未修）**：
+
+1. `demo()` 只应用了 `CliOverrides { unattended: true }`，**没有**应用 `--checkpoint` / `--no-checkpoint`。所以 `pangu --checkpoint --demo` 会静默不开检查点——用户要求了检查点却没得到，也没有警告。
+2. 自定义相对 `checkpoint.artifact_root`（如 `.pangu/sess-checkpoints`）会让 `--demo` 在一次成功工具动作后报 `checkpoint creation failed`，运行失败；用默认 `.pangu/checkpoints` 则正常。上一提交上可复现，确认与 A1-3 无关。
+
+**本阶段未做**：`branch` / `fork`。**fork 的工作区隔离完全未解决**，见第 6 节。`SessionNode.history_digest` 依然是死字段——现在有真实的节点与对话可供它记录，赋值仍待做。

@@ -1497,7 +1497,15 @@ impl Agent {
             // `save_every_turn` because it costs a write per turn.
             if let Some(runtime) = &self.conversation {
                 if runtime.saves_every_turn() && terminal.is_none() {
-                    runtime.save(&self.contract.goal, &history, None)?;
+                    // Tie the snapshot to the node the run is currently at, so
+                    // `pangu session replay` can find the conversation that
+                    // belongs to a node. `None` when checkpointing is off: a
+                    // conversation may exist without a tree, but never the
+                    // reverse.
+                    let node = checkpoint_state
+                        .as_ref()
+                        .map(|state| state.session_node_id.as_str());
+                    runtime.save(&self.contract.goal, &history, node)?;
                 }
             }
 
@@ -1510,7 +1518,10 @@ impl Agent {
         // hit a budget or failed partway is exactly the one an operator wants
         // to resume, so a save only on success would be useless.
         if let Some(runtime) = &self.conversation {
-            runtime.save(&self.contract.goal, &history, None)?;
+            let node = checkpoint_state
+                .as_ref()
+                .map(|state| state.session_node_id.as_str());
+            runtime.save(&self.contract.goal, &history, node)?;
         }
 
         let status = terminal.unwrap_or(GoalStatus::Failed);

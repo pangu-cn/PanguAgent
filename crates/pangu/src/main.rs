@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use pangu_agent::{Agent, Provider};
@@ -110,6 +110,11 @@ enum Commands {
         #[command(subcommand)]
         action: ConversationCommands,
     },
+    /// Navigate the session tree and replay recorded conversations. Read-only.
+    Session {
+        #[command(subcommand)]
+        action: SessionCommands,
+    },
     /// Inspect a stable event stream. Read-only, and never an authorization.
     Events {
         #[command(subcommand)]
@@ -165,6 +170,28 @@ enum ConversationCommands {
         /// Snapshot id. Defaults to the most recent.
         #[arg(long)]
         id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Read-only navigation over the session node ledger (A1-3). Nothing here
+/// creates, moves, or deletes a node, and replaying a node is not a rollback.
+#[derive(Clone, Debug, Subcommand)]
+enum SessionCommands {
+    /// Show the session tree: roots, children, and each node's checkpoint.
+    Tree {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconstruct the conversation recorded at one node, without restoring the
+    /// workspace. For that, use `pangu rollback`.
+    Replay {
+        /// Session node id.
+        node: String,
+        /// Print the full message list rather than a summary.
+        #[arg(long)]
+        full: bool,
         #[arg(long)]
         json: bool,
     },
@@ -248,6 +275,12 @@ async fn main() -> Result<()> {
         Some(Commands::Conversation { action }) => match action {
             ConversationCommands::List => conversation_list(&args),
             ConversationCommands::Show { id, json } => conversation_show(&args, id, json),
+        },
+        Some(Commands::Session { action }) => match action {
+            SessionCommands::Tree { json } => session_tree(&args, json),
+            SessionCommands::Replay { node, full, json } => {
+                session_replay(&args, &node, full, json)
+            }
         },
         Some(Commands::Events { action }) => match action {
             EventsCommands::Read { path, json, kind } => events_read(&path, kind, json),
@@ -965,6 +998,147 @@ impl Provider for DemoProvider {
             usage: Usage::default(),
         })
     }
+}
+
+/// Open the checkpoint artifact store that holds the session node ledger.
+///
+/// The ledger is written by the checkpoint subsystem, so when checkpointing is
+/// off there is no tree to show. That is reported rather than papered over with
+/// an empty listing: "no nodes" and "the feature that records nodes is off"
+/// are different facts, and an operator reading a report needs to tell them
+/// apart.
+fn session_contract(args: &Cli) -> Result<GoalContract> {
+    let (mut config, _) = Config::load(args.config.as_deref())?;
+    // The `--checkpoint` / `--no-checkpoint` flags are runtime overrides, not
+    // config-file edits. Without applying them here, `pangu --checkpoint
+    // session tree` would read the file and conclude checkpointing is off —
+    // while the run that produced the tree was started with it on.
+    config = config.apply(&CliOverrides {
+        workspace: args.workspace.clone(),
+        checkpoint_enabled: if args.checkpoint {
+            Some(true)
+        } else if args.no_checkpoint {
+            Some(false)
+        } else {
+            None
+        },
+        ..Default::default()
+    })?;
+    if !config.checkpoint.enabled {
+        bail!(
+            "the session tree is written by the checkpoint subsystem; \
+             enable `checkpoint.enabled` or pass --checkpoint"
+        );
+    }
+    Ok(GoalContract::from_config("session maintenance", &config)?)
+}
+
+fn session_tree(args: &Cli, json: bool) -> Result<()> {
+    let contract = session_contract(args)?;
+    let store = pangu_core::ArtifactStore::open(&contract.checkpoint.artifact_root)?;
+    let tree = pangu_core::session::SessionTree::load(&store)?;
+    // An incomplete tree still renders — the gaps are labelled — but it is not
+    // presented as a whole history, because a walk that stops at a missing
+    // parent looks exactly like one that reached the beginning.
+    let complete = tree.ensure_complete().is_ok();
+    if json {
+        let roots: Vec<_> = tree
+            .roots()
+            .iter()
+            .map(|node| {
+                serde_json::json!({
+                    "session_node_id": node.session_node_id,
+                    "parent_session_node_id": node.parent_session_node_id,
+                    "checkpoint_id": node.checkpoint_id,
+                    "history_digest": node.history_digest,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "schema": "pangu-session-tree/1",
+            "nodes": tree.len(),
+            "complete": complete,
+            "orphans": tree.orphans(),
+            "roots": roots,
+            "advisory": true,
+            "authoritative": false,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print!("{}", tree.render());
+        println!("nodes: {}", tree.len());
+        if !complete {
+            eprintln!(
+                "WARNING: {} node(s) name a parent that is not in the ledger;                  this tree is incomplete",
+                tree.orphans().len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn session_replay(args: &Cli, node: &str, full: bool, json: bool) -> Result<()> {
+    let contract = session_contract(args)?;
+    let store = pangu_core::ArtifactStore::open(&contract.checkpoint.artifact_root)?;
+    let tree = pangu_core::session::SessionTree::load(&store)?;
+    // Navigation is checked before the conversation is read, so a cycle is
+    // reported as a broken tree rather than as a missing conversation.
+    tree.ensure_complete()?;
+    tree.node(node)?;
+
+    let runtime = pangu_agent::conversation::ConversationRuntime::from_contract(&contract)?
+        .ok_or_else(|| {
+            anyhow!(
+                "no conversation is recorded for this workspace;                  enable `conversation.enabled` to store them"
+            )
+        })?;
+    let snapshots = runtime.at_node(node)?;
+    let Some(snapshot) = snapshots.last() else {
+        bail!(
+            "session node `{node}` has no recorded conversation;              it may predate conversation persistence, or persistence was off              for the run that created it"
+        );
+    };
+    let messages = snapshot.restore()?;
+
+    if json {
+        let payload = serde_json::json!({
+            "schema": "pangu-session-replay/1",
+            "session_node_id": node,
+            "snapshot_id": snapshot.snapshot_id,
+            "history_digest": snapshot.history_digest,
+            "message_count": messages.len(),
+            "snapshots_at_node": snapshots.len(),
+            "messages": if full { serde_json::to_value(&messages)? } else { serde_json::Value::Null },
+            "note": "a replayed conversation is model input only; it restores no                      workspace and grants no approval. Use `pangu rollback` for the                      workspace.",
+            "advisory": true,
+            "authoritative": false,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("node:     {node}");
+        println!(
+            "snapshot: {} ({} snapshot(s) at this node)",
+            snapshot.snapshot_id,
+            snapshots.len()
+        );
+        println!("digest:   {}", snapshot.history_digest);
+        println!("messages: {}", messages.len());
+        for message in &messages {
+            let preview: String = pangu_core::conversation::message_content(message)
+                .chars()
+                .take(72)
+                .collect();
+            println!(
+                "  {:9} {}",
+                message.role().as_str(),
+                preview.replace('\n', " ")
+            );
+        }
+        if !full {
+            println!("(use --full for the complete message list, or --json)");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

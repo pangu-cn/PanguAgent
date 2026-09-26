@@ -15,6 +15,7 @@ pub mod journal;
 pub mod json;
 pub mod messages;
 pub mod replay;
+pub mod session;
 pub mod stream;
 pub mod util;
 

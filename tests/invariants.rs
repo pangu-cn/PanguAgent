@@ -1742,3 +1742,128 @@ fn invariant_i_a_conversation_without_its_system_turn_cannot_be_resumed() {
     }
     std::fs::remove_dir_all(root).ok();
 }
+
+/// A1-3: a conversation saved during a run must be reachable from the session
+/// node the run was at.
+///
+/// The wiring this pins down was silently absent: `ConversationRuntime::save`
+/// took a `session_node_id` and both call sites in `run_inner` passed `None`,
+/// so every snapshot was an orphan and no node could ever be replayed. A test
+/// that only asserted "a snapshot exists" would have passed the whole time.
+#[tokio::test]
+async fn invariant_i_a_saved_conversation_names_a_session_node_that_exists() {
+    let root = temp_path("session-node-link");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("state.txt"), "initial").expect("state");
+
+    let mut config = phase2_config(
+        &root,
+        vec![Rule::allow(
+            "allow-phase2",
+            "test_tool",
+            "phase2 test action",
+        )],
+    );
+    config.conversation.enabled = true;
+    config.conversation.artifact_root = root.join(".pangu/conversations");
+    config.conversation.save_every_turn = true;
+    config.validate().expect("config");
+
+    let (agent, _tool, _sink) = phase2_agent(
+        config,
+        &root,
+        vec![
+            phase2_response("test_tool", serde_json::json!({"value": "one"})),
+            phase2_finish(),
+        ],
+        Vec::new(),
+        false,
+        false,
+    );
+    agent.run().await.expect("run");
+
+    // Nodes come from the *checkpoint* store: that is the subsystem that writes
+    // them. `test_tool` is a workspace write, so a checkpoint is committed and
+    // a node exists to point at.
+    let node_store =
+        pangu_core::ArtifactStore::open(root.join(".pangu/checkpoints")).expect("node store");
+    let nodes = node_store.list_session_nodes().expect("list");
+    assert!(
+        !nodes.is_empty(),
+        "a run that committed a checkpoint must record a session node"
+    );
+
+    // The assertion that would have failed before the wiring was fixed.
+    let conv_store =
+        pangu_core::ArtifactStore::open(root.join(".pangu/conversations")).expect("conv store");
+    let ids = conv_store.list_conversations().expect("list");
+    assert!(!ids.is_empty(), "the run must have stored a conversation");
+    for id in &ids {
+        let snapshot = conv_store.load_conversation(id).expect("load");
+        let node = snapshot.session_node_id.as_deref().unwrap_or_else(|| {
+            panic!("snapshot {id} is not linked to any session node; the run loop passed None")
+        });
+        assert!(
+            nodes
+                .iter()
+                .any(|candidate| candidate.session_node_id == node),
+            "snapshot {id} names node {node}, which is not in the ledger"
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// An **incomplete** session tree must be reported as incomplete.
+///
+/// This is not a synthetic case. A checkpointed run produces exactly one gap:
+/// the first committed node names `node_root_…` as its parent, and that root
+/// exists only in the run's memory — the ledger has no entry for it. So every
+/// ordinary run's tree is incomplete, and the navigation layer's job is to say
+/// so rather than let a walk that stops at the missing link look like one that
+/// reached the beginning of history.
+///
+/// The gap is recorded, not papered over: fabricating an `EventRef` for the
+/// root would put an invented event id into an auditable structure, and
+/// `Event::event_id` is only assigned when the journal is written.
+#[tokio::test]
+async fn invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden() {
+    let root = temp_path("session-tree-gap");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("state.txt"), "initial").expect("state");
+
+    let config = phase2_config(
+        &root,
+        vec![Rule::allow(
+            "allow-phase2",
+            "test_tool",
+            "phase2 test action",
+        )],
+    );
+    let (agent, _tool, _sink) = phase2_agent(
+        config,
+        &root,
+        vec![
+            phase2_response("test_tool", serde_json::json!({"value": "one"})),
+            phase2_finish(),
+        ],
+        Vec::new(),
+        false,
+        false,
+    );
+    agent.run().await.expect("run");
+
+    let store = pangu_core::ArtifactStore::open(root.join(".pangu/checkpoints")).expect("store");
+    let tree = pangu_core::session::SessionTree::load(&store).expect("tree");
+    assert_eq!(tree.orphans().len(), 1, "exactly the un-persisted run root");
+    let error = tree
+        .ensure_complete()
+        .expect_err("a tree with a missing parent must not present as whole");
+    assert!(
+        error.to_string().contains("incomplete"),
+        "the error must say the history is incomplete, got: {error}"
+    );
+    // Rendering still terminates and still labels the gap.
+    let rendered = tree.render();
+    assert!(rendered.contains("orphan"), "rendered: {rendered}");
+    std::fs::remove_dir_all(root).ok();
+}

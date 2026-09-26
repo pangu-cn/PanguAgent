@@ -103,6 +103,39 @@ impl ConversationRuntime {
     pub fn saves_every_turn(&self) -> bool {
         self.save_every_turn
     }
+
+    /// The stored snapshots that belong to one session node, oldest first.
+    ///
+    /// A node can have several: saving every turn means one snapshot per turn
+    /// while the run sits at the same node. A node with none is normal — the
+    /// run predates conversation persistence, or persistence was off.
+    pub fn at_node(&self, session_node_id: &str) -> Result<Vec<ConversationSnapshot>> {
+        let mut found = Vec::new();
+        for id in self.list()? {
+            let snapshot = self.load(&id)?;
+            if snapshot.session_node_id.as_deref() == Some(session_node_id) {
+                found.push(snapshot);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Reconstruct the conversation as it stood at a session node.
+    ///
+    /// This is **a read, not a resume**. It returns messages and nothing else:
+    /// no `Decision`, no `Effect`, no record of what was approved. Restoring
+    /// the *workspace* to that node is `pangu rollback`, and this function
+    /// neither does that nor is a substitute for it.
+    ///
+    /// When a node holds several snapshots the latest wins, because that is the
+    /// furthest the run got before leaving the node. `None` means the node has
+    /// no conversation recorded — not that the conversation was empty.
+    pub fn replay_at(&self, session_node_id: &str) -> Result<Option<Vec<Message>>> {
+        match self.at_node(session_node_id)?.pop() {
+            Some(snapshot) => Ok(Some(snapshot.restore()?)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// The history a run starts with.
