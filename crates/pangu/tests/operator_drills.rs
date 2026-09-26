@@ -428,8 +428,13 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
     fs::create_dir_all(fixture.workspace.join("old-dir")).expect("old-dir");
     fs::write(fixture.workspace.join("old-dir/old.txt"), "old").expect("seed old-dir");
     fs::write(fixture.workspace.join("state.txt"), "after").expect("edit workspace");
-    let source = fixture.commit("checkpoint-source", "node-source", "event-source", 2);
 
+    // The block has to be in place before the source checkpoint. On Unix the
+    // mechanism is a permission change, and a directory's permissions are part
+    // of the snapshot entry, so setting it afterwards would change the
+    // workspace digest and the restore would stop at the compare-and-swap
+    // check. That would still be a refusal, but it would rehearse drift rather
+    // than a mid-restore write failure, which is what this drill is for.
     let blocked = Blocked::mid_restore(&fixture.workspace);
     if matches!(blocked.mechanism(), "unsupported") {
         record_drill(
@@ -442,6 +447,7 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
     }
     let mechanism = blocked.mechanism();
     let evidence = blocked.evidence();
+    let source = fixture.commit("checkpoint-source", "node-source", "event-source", 2);
     let workspace_before = tree_digest(&fixture.workspace);
     // The failure has to land inside the restore. If the block did not take
     // effect, say so with the runtime's own outcome instead of reporting a
@@ -463,7 +469,6 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
         Err(error) => error.to_string(),
     };
     let error_of_restore = error.clone();
-    drop(blocked);
     assert!(
         !error.is_empty(),
         "the recorded failure must carry a reason"
@@ -498,8 +503,9 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
         "a failed restore must leave the workspace as it was"
     );
 
-    // The same rollback id is never retried automatically.
-    let blocked = Blocked::mid_restore(&fixture.workspace);
+    // The same rollback id is never retried automatically. The original block
+    // is still held, so this walks the same mid-restore failure path again, and
+    // what must stop the retry is the terminal record from the first attempt.
     let retry = fixture
         .store
         .restore_checkpoint_with_expected(

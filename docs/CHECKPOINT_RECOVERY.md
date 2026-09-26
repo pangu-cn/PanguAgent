@@ -126,6 +126,8 @@ runtime 的下一次操作仍会看到 lock 并 fail closed；本手册不授权
 4. 只有在重新建立可信 source session node、重新计算 digest 并完成新的审批后，才能发起新的 typed rollback。
 5. 未知 writer 未查明前，状态按不确定处理。
 
+**权限变化也算 drift。** snapshot 的目录条目记录了权限位，并计入 workspace digest。所以在 Unix 上，为了“腾出写入权限”而 `chmod`，同样会让 compare-and-swap 失败——而且失败发生在写入任何 operation 记录之前，store 里不会留下失败痕迹。这不是可自动绕过的小障碍：operator 要先确认权限变化是否可接受，再重新建立 source session node 并发起新的 typed rollback，不要在原 rollback id 上重试。
+
 ### 4.5 checkpoint 之后存在 external mutation
 
 - rollback 必须阻止。
@@ -195,6 +197,7 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 - Windows 原子替换使用 backup/rename hand-off，运行时中断后需要 operator 介入。
 - 不持有 Artifact lock 的并发 workspace writer 依赖最终 digest/CAS 检测；这不是 OS 或 VM 级隔离。
 - snapshot 不记录 snapshot root 目录自身的权限/元数据，只记录 root 下的子项。
+- 目录权限计入 snapshot digest，因此 Unix 上的 `chmod`（包括为恢复而调整权限）会被当作 drift 拒绝，且拒绝发生在写 operation 记录之前（见第 4.4 节）。
 - Git backend 未实现，也不会隐式创建 commit、branch、tag、stash 或修改 index。
 - `pangu artifact inspect` 只读且有界：条目数、深度、checkpoint/operation 数量和 replacement backup 数量都有上限，截断时显式报告；它不判断 CAS 漂移，也不替代 `pangu rollback` 的前置校验。
 - checkpoint/rollback 仍是默认关闭的实验性 opt-in；本手册不是正式支持或默认激活承诺。
