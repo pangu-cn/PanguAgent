@@ -458,7 +458,7 @@ CLI 的全局开关是 `--checkpoint`（可写 `--enable-checkpoint`），rollba
 - [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) operator recovery 运行手册，覆盖证据保全、stale lock、failed operation、CAS drift、外部副作用和 Windows replacement hand-off。
 - Operator 只读检查与演练：`pangu-core::inspect::inspect_artifact_root`（只读、复用 restore 的 `verify_checkpoint`、有界且脱敏、不注册为 capability），CLI `pangu artifact inspect`；`crates/pangu/tests/operator_drills.rs` 演练 stale lock、failed operation、CAS drift、外部 mutation、replacement backup、只读性与 CLI 退出码，并按平台记录差异（Windows hand-off 与 POSIX rename 语义不同），CI 在 ubuntu/windows 双平台运行并归档 drill 报告。
 
-尚未宣称正式激活的原因：checkpoint 仍是默认关闭的实验性 opt-in；Windows 文件替换 hand-off、崩溃遗留 `.rollback-operation.lock` 的 operator-only 恢复，以及不持有 Artifact lock 的并发 workspace writer 仍需部署者按第 7.2 节和 [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) 处理。operator 证据收集与四个事故分支已有只读工具和可重复 drill，但**跨平台最终验收尚未完成**：本机（Windows）已通过并归档 drill 报告，Ubuntu 结果必须来自真实 CI 运行而不是本机推断，且恢复期间的备份可用性、并发 writer 停止策略和激活批准仍需部署者书面确认。在这些证据齐备前，本文及 README 不把 checkpoint/rollback 描述为默认支持。
+尚未宣称正式激活的原因：checkpoint 仍是默认关闭的实验性 opt-in。operator 证据收集与四个事故分支已有只读工具和可重复 drill，**跨平台验证也已完成**：CI run 36210280753（提交 `1b0245d`）在 `ubuntu-latest` 与 `windows-latest` 上通过 `fmt`/`check`/`test`/`clippy --all-features` 与 7 个 drill，两个平台的原始报告转录在 [`docs/evidence/`](../docs/evidence/)。但 POSIX 上 replacement hand-off 不成立（该项为 `not-applicable`），恢复期间的备份与审计可用性、无人工输入与并发 writer 的停止策略、以及激活批准仍需部署者书面确认。在这些证据齐备前，本文及 README 不把 checkpoint/rollback 描述为默认支持。
 
 ## 14. 已确认的设计决策与当前实现边界
 

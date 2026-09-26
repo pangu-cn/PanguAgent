@@ -206,32 +206,38 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 
 在考虑把该能力从“实验性 opt-in”升级为正式激活前，部署者应保存以下证据。已具备机器化手段和本地实测的项标为 `[x]`，仍需部署环境或人工签署的项保持 `[ ]`：
 
-- [ ] Windows、Unix 和目标部署平台分别通过 snapshot/restore、symlink、权限和 replacement 测试。（Windows 已由本机 `cargo test --workspace --all-targets` 与第 6 节演练覆盖；Unix/其它平台待 CI 与部署环境证据）
 - [x] stale lock、failed operation、CAS drift、Windows replacement backup 有可重复的 operator drill（第 6 节），且 replacement hand-off 与无锁并发 writer 的限制已写成本手册第 4、7 节。
 - [x] 只读证据检查有工具（`pangu artifact inspect`）并有“不修改任何字节”的独立断言。
 - [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。（依赖部署环境）
 - [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。（需部署者书面确认）
 - [x] 配置、CLI、Journal、Artifact schema、inspection schema 和恢复手册版本相互匹配，并在 ADR/ROADMAP/README 中一致标为实验性 opt-in。
 - [x] 默认配置仍关闭 checkpoint，Git backend 仍明确未实现。
-- [ ] Ubuntu/Windows CI 完成 `cargo check/test/clippy --workspace --all-targets --all-features` 并保存跨平台 drill 报告（CI 已配置 drill 步骤与 artifact 上传；等待真实 CI 运行结果，不以本机结果代替）。
+- [x] Ubuntu 与 Windows CI 完成 `cargo fmt --check`、`cargo check/test/clippy --workspace --all-targets --all-features` 并保存跨平台 drill 报告（run 36210280753，提交 `1b0245d`，见 8.1）。
+- [ ] **目标部署平台**单独通过 snapshot/restore、symlink、权限测试。（Windows 与 Ubuntu 已有 CI 证据；replacement hand-off 只在 Windows 成立，POSIX 上该 drill 为 `not-applicable`，见 8.1）
 - [ ] 由 operator/发布负责人明确批准激活；未批准前继续保持实验性 opt-in。
 
 ### 8.1 跨平台验收记录
 
-每次验收把实际结果写在这里，不写推测。CI drill 报告作为 artifact 归档；本机运行的结果保存在 `docs/evidence/`。
+每次验收把实际结果写在这里，不写推测。CI drill 报告作为 artifact 归档并同时发成可公开读取的注解；转录到 `docs/evidence/` 的内容只来自真实运行。
 
-| 平台 | 工具链 | 提交 | `cargo test --workspace --all-targets` | clippy `-D warnings` | operator drill（7 项） | 证据 |
-|------|--------|------|-----------------------------------|--------------------|-------------------|------|
-| Windows 10.0.26200 x86_64 | rustc 1.98.0 | `c7f5e39` | 通过（141 项，0 失败，含 `pangu --demo`） | 0 error / 0 warning | 7/7 pass | [`evidence/f7-drills-windows.jsonl`](evidence/f7-drills-windows.jsonl) |
-| Ubuntu（CI） | 待 CI | 待 CI | 待 CI | 待 CI | 待 CI | 等待 CI artifact |
+| 平台 | 工具链 | 提交 | `cargo test --workspace --all-targets --all-features` | clippy `-D warnings` | operator drill（7 项） | 证据 |
+|------|--------|------|----------------------------------------------------|--------------------|-------------------|------|
+| Windows（GitHub runner） | `dtolnay/rust-toolchain@stable` | `1b0245d` | 通过 | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows.jsonl`](evidence/f7-drills-windows.jsonl) |
+| Ubuntu（GitHub runner） | `dtolnay/rust-toolchain@stable` | `1b0245d` | 通过 | 0 error / 0 warning | 6 pass + 1 not-applicable | [`evidence/f7-drills-ubuntu.jsonl`](evidence/f7-drills-ubuntu.jsonl) |
+| Windows 10.0.26200 x86_64（本机） | rustc 1.98.0 | `1b0245d` | 通过（142 项，0 失败） | 0 error / 0 warning | 7 pass | 同上（同一 commit） |
 
-本机记录：2026-09-25 在 Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0 上，针对提交 `c7f5e39` 运行 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --all-targets`、`cargo run -q -p pangu -- --demo` 与第 6 节的 7 个 drill，结果如上表；drill 报告由该提交自身产生，并记录了每次 drill 的平台与机制。
+本机记录（2026-09-25，Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features`（142 项，0 失败）与 7 个 drill 全部通过。
+
+CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/runs/36210280753)，2026-09-26，提交 `1b0245d`）：`ubuntu-latest` 与 `windows-latest` 两个 job 全部步骤通过。`docs/evidence/` 下的两份报告是从该 run 的 drill 步骤产出的原始内容转录（GitHub artifact 下载需认证，CI 同时把每行发成可公开读取的注解）。
+
+**关于工具链版本**：CI 用的是浮动的 `@stable`，本表不写 CI 的 rustc 具体版本——那只能从 run 日志读到，而 job 日志需要 admin 权限。本机行的 1.98.0 是实测值；按 1.98.0 构建于 2026-08-18、Rust 六周一个发布窗口推算，run 时的 stable 很可能仍是 1.98.0，但这是**推断**，不当作证据。
 
 已知覆盖边界（不是待办，而是事实）：
 
-- 本机只能提供 Windows 证据。**Ubuntu 结果必须来自真实 CI 运行**，不得由本机结果或推断代替；CI 已配置双平台 drill 步骤与 artifact 上传。
-- `failed-operation` 在 Unix 以“不可写目录”阻断，root 环境下记为 `skipped`；因此 Ubuntu 报告可能不包含该机制，不代表通过。
-- `replace-backup` 在 POSIX 无 hand-off 语义，Ubuntu 报告该项为 `not-applicable`，不能据此声称 Unix 也验证了 replacement 保护。
+- **Ubuntu 的 `replace-backup` 是 `not-applicable`，不是通过。** POSIX 的 `rename(2)` 没有 Windows 的 hand-off 窗口，因此 Unix 上不存在需要人工核验的 `.replace-backup-*`。不能据此声称 Unix 也验证了 replacement 保护；该保护只有 Windows 证据。
+- **Ubuntu 的 `failed-operation` 用的是 `read-only-directory` 机制**（把 `nested` 设为不可写），Windows 用的是“只读共享句柄阻断目录 rename”。同一分支在两个平台的阻断方式不同，都必须落在 restore 内部才算演练到；机制名随报告一起记录。
+- 该演练在以 root 运行的账户上记为 `skipped`（root 绕过目录权限）。CI runner 不是 root。
 - drill 证明 fail closed 与证据存在，**不证明** Pangu 能自动完成恢复；并发 writer、无人工输入、外部副作用的处置仍需部署者按第 4 节人工裁决。
+- 本机没有 Linux 环境，Ubuntu 侧的一切结论均以 CI 为准，本机运行不作为补充证据。
 
 相关设计边界见 [`BOUNDARY.md`](BOUNDARY.md)、[`ARCHITECTURE.md`](ARCHITECTURE.md) 和 [`adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md)。
