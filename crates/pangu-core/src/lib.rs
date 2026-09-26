@@ -39,7 +39,9 @@ pub use inspect::{
 };
 pub use journal::{ConsoleSink, Journal};
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
-pub use util::{approx_tokens_of_chars, hex_sha256, now_rfc3339, short_hash, truncate_middle};
+pub use util::{
+    approx_tokens_of_chars, hex_sha256, now_rfc3339, one_line, short_hash, truncate_middle,
+};
 
 /// JSON values used at the provider and policy boundaries.
 pub type Value = serde_json::Value;

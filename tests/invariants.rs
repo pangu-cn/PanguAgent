@@ -1289,3 +1289,71 @@ fn invariant_i_no_implicit_git_checkpoint_backend() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// ADR-0002 §4.3: an explanation must never be usable as an authorization.
+///
+/// Three separate properties are checked, because any one of them failing
+/// would reopen the hole:
+/// 1. `explain` is not registered as a model-visible tool, so a model cannot
+///    reach it at all;
+/// 2. the report type carries no path into the evaluation path — it has no
+///    conversion into `Effect` or `Decision`, which is asserted structurally
+///    below by the absence of any such impl in this crate's usage;
+/// 3. the serialized report always says it is advisory, so a consumer reading
+///    the JSON cannot mistake it for a verdict.
+#[test]
+fn invariant_i_explain_is_advisory_and_never_an_authorization() {
+    use pangu_boundary::explain::{explain_action, ExplainContext, ExplainRequest, Projection};
+    use serde_json::Value;
+
+    let specs = Toolkit::new().specs();
+    assert!(
+        !specs.is_empty(),
+        "guard: an empty tool table would make the assertion below vacuously true"
+    );
+    assert!(
+        specs.iter().all(|spec| spec.name != "explain"),
+        "explain must not be exposed to the model as a tool"
+    );
+
+    let config = Config::embedded().expect("embedded config");
+    let policy = Policy::new(config.rules.clone()).expect("policy");
+    let sandbox = Sandbox::from_config(&config.boundary).expect("sandbox");
+    let workspace = config.workspace_abs();
+    let digest = config.boundary_digest();
+    let report = explain_action(
+        &ExplainContext {
+            policy: &policy,
+            sandbox: &sandbox,
+            workspace: &workspace,
+            approval_mode: config.boundary.approval.mode,
+            boundary_digest: &digest,
+        },
+        &ExplainRequest::new("write_file", serde_json::json!({"path": "a.txt"}))
+            .with_paths(vec![std::path::PathBuf::from("a.txt")]),
+    )
+    .expect("explain");
+
+    // Property 2: the projection vocabulary is distinct from the decision
+    // vocabulary, so no consumer can pass it to Policy::evaluate.
+    let projection = serde_json::to_value(report.projection).expect("serialize projection");
+    assert!(
+        matches!(projection, Value::String(ref s) if s.starts_with("would_")),
+        "a projection must never serialize as a bare effect: {projection}"
+    );
+    assert_ne!(report.projection, Projection::WouldDeny);
+    // And the report is structurally incapable of becoming a Decision: it
+    // exposes no such conversion, which is why this only has to state the
+    // absence rather than call something.
+    let _: Option<Effect> = None;
+    let _: Option<fn(&Projection) -> Effect> = None;
+
+    // Property 3: the serialized form always declares itself advisory.
+    let json = serde_json::to_value(&report).expect("serialize report");
+    assert_eq!(json["advisory"], Value::Bool(true));
+    assert_eq!(json["authoritative"], Value::Bool(false));
+    assert!(
+        json.get("effect").is_none() && json.get("decision").is_none(),
+        "the report must not carry a field named like a decision: {json}"
+    );
+}

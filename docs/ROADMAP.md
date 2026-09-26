@@ -328,7 +328,10 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [ ] **A1 会话树与恢复**：借鉴 Pi/Hermes/DeepSeek Harness/OpenHands/Cline，支持 resume、branch、fork、compaction；每个节点可回放。
 - [ ] **A2 结构化事件兼容层**：在现有 Journal 之外提供稳定的 JSONL/NDJSON 事件流、事件版本和迁移器；借鉴 Pi JSON/RPC、ZCode 协议层、DeepSeek Harness 的 SessionEvent、OpenHands Agent Server 和 Cline headless 模式。
 - [ ] **A3 审批与差异预览**：显示文件 diff、命令预览、网络目标摘要、预计风险和影响范围；借鉴 Pi 的交互扩展点和 Cline 的 Plan/Act、checkpoint/undo。
-- [ ] **A4 `doctor`/`explain`/策略模拟**：在不执行副作用的情况下解释配置、规则命中顺序、预算和预计阻塞点；扩展 Pangu 现有能力，并参考 OpenHands backend 状态检查。
+- [x] **A4 `doctor`/`explain`/策略模拟**：在不执行副作用的情况下解释配置、规则命中顺序、预算和预计阻塞点；扩展 Pangu 现有能力，并参考 OpenHands backend 状态检查。
+  - 已有：`pangu doctor`（配置摘要 + digest + Journal 统计）、`pangu config`、`Config::explain()`。
+  - 已完成（ADR-0002）：`pangu explain` 投影 `Policy → Sandbox → Approval` 三层，逐条规则报出 `decided` / `matched_but_refused` / `no_match` / `not_reached`，并做遮蔽（死规则）分析。报告固定带 `advisory: true` / `authoritative: false`，不提供到 `Effect` 的转换，因此不可能被当作授权。
+  - **未包含（有意排除）**：预算耗尽点预测、从 Journal 解释历史判定（依赖 A2 的稳定事件契约）、规则修改建议。
 - [ ] **A5 会话导出与隐私检查**：导出前扫描 secret、绝对路径、命令输出和大对象；借鉴 Pi session export、SWE-agent trajectory 和 Cline history。
 
 ### B. 扩展、技能和模型

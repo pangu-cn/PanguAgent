@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use pangu_agent::{Agent, Provider};
 use pangu_boundary::{
-    CliOverrides, Config, GoalContract, Policy, Sandbox, StdinApproval, Unattended,
+    explain_action, CliOverrides, Config, ExplainContext, ExplainRequest, GoalContract, Policy,
+    Risk, Sandbox, StdinApproval, Unattended,
 };
 use pangu_core::{ChatResponse, Journal, Message, RollbackRequest, TeeSink, ToolCall, Usage};
 use pangu_provider::OpenAiCompatibleProvider;
@@ -76,11 +77,59 @@ enum Commands {
         #[arg(long, default_value = "cli")]
         requested_by: String,
     },
+    /// Explain what the boundary would do with a hypothetical action.
+    ///
+    /// Advisory only: it executes nothing, writes nothing, and is never an
+    /// authorization. A real run re-evaluates everything.
+    Explain {
+        /// Tool name as the model would request it.
+        #[arg(long)]
+        tool: String,
+        /// Arguments as `key=value` pairs, or a single JSON object.
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Resource paths the action would touch.
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        /// Network hosts the action would reach.
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        /// Full argv for a command action.
+        #[arg(long = "arg0")]
+        argv: Vec<String>,
+        /// Risk class. Defaults to the human-risk end, matching an
+        /// unclassified tool call.
+        #[arg(long, value_enum)]
+        risk: Option<RiskArg>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Read-only operator tooling. Nothing here repairs or cleans evidence.
     Artifact {
         #[command(subcommand)]
         action: ArtifactCommands,
     },
+}
+
+/// Risk classes accepted on the command line. Kept separate from the boundary
+/// enum so the CLI surface cannot grow without a deliberate change.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum RiskArg {
+    ReadOnly,
+    Reversible,
+    Destructive,
+    NeedsHuman,
+}
+
+impl From<RiskArg> for Risk {
+    fn from(value: RiskArg) -> Self {
+        match value {
+            RiskArg::ReadOnly => Self::ReadOnly,
+            RiskArg::Reversible => Self::Reversible,
+            RiskArg::Destructive => Self::Destructive,
+            RiskArg::NeedsHuman => Self::NeedsHuman,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -108,6 +157,26 @@ async fn main() -> Result<()> {
     match args.command.clone() {
         Some(Commands::Doctor { journal }) => doctor(&args, journal.as_deref()),
         Some(Commands::Config { file }) => config_command(file),
+        Some(Commands::Explain {
+            tool,
+            args: arg_pairs,
+            paths,
+            hosts,
+            argv,
+            risk,
+            json,
+        }) => explain_command(
+            &args,
+            ExplainInvocation {
+                tool,
+                raw_args: arg_pairs,
+                paths,
+                hosts,
+                argv,
+                risk,
+                json,
+            },
+        ),
         Some(Commands::Run { goal, dry_run }) => {
             run_command(&args, goal, dry_run || args.dry_run).await
         }
@@ -145,6 +214,110 @@ async fn main() -> Result<()> {
             run_command(&args, goal, args.dry_run).await
         }
     }
+}
+
+/// The hypothetical action, collected from the command line.
+struct ExplainInvocation {
+    tool: String,
+    raw_args: Vec<String>,
+    paths: Vec<PathBuf>,
+    hosts: Vec<String>,
+    argv: Vec<String>,
+    risk: Option<RiskArg>,
+    json: bool,
+}
+
+/// Explain what the boundary would do with a hypothetical action.
+///
+/// This is a projection, not a decision. It executes nothing, writes nothing,
+/// emits no event, and is never consulted by the evaluation path. A real run
+/// re-evaluates everything, and the real result wins if the two disagree.
+fn explain_command(args: &Cli, invocation: ExplainInvocation) -> Result<()> {
+    let ExplainInvocation {
+        tool,
+        raw_args,
+        paths,
+        hosts,
+        argv,
+        risk,
+        json,
+    } = invocation;
+
+    let (config, files) = Config::load(args.config.as_deref())?;
+    let policy = Policy::new(config.rules.clone())?;
+    let sandbox = Sandbox::from_config(&config.boundary)?;
+    let workspace = config.workspace_abs();
+
+    let request = ExplainRequest::new(tool, parse_explain_args(&raw_args)?)
+        .with_paths(paths)
+        .with_hosts(hosts)
+        .with_argv(argv)
+        .with_risk(risk.map_or(Risk::NeedsHuman, Risk::from));
+    // A path that reaches outside the configured workspace is exactly the case
+    // an operator most needs explained, so say so rather than letting an
+    // absolute path silently look in-bounds.
+    if request.paths.iter().any(|path| path.is_absolute()) {
+        eprintln!(
+            "note: absolute paths are resolved as given; the projection reports whether they \
+             fall inside the configured roots"
+        );
+    }
+
+    let context = ExplainContext {
+        policy: &policy,
+        sandbox: &sandbox,
+        workspace: &workspace,
+        approval_mode: config.boundary.approval.mode,
+        boundary_digest: &config.boundary_digest(),
+    };
+    let report = explain_action(&context, &request)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eprintln!("loaded config from {files:?}");
+        print!("{}", report.summary());
+        for trace in &report.rules {
+            println!(
+                "  rule {:<24} {:<6} {:<18} {}",
+                trace.rule_id,
+                trace.effect.as_str(),
+                trace.status.as_str(),
+                trace.detail
+            );
+        }
+        for note in &report.notes {
+            println!("  note: {note}");
+        }
+    }
+    Ok(())
+}
+
+/// Accept either a single JSON object or repeated `key=value` pairs. Anything
+/// that is neither is an error rather than a silently coerced string, because
+/// a mistyped argument would otherwise produce a confident wrong explanation.
+fn parse_explain_args(raw: &[String]) -> Result<serde_json::Value> {
+    if raw.len() == 1 && raw[0].trim_start().starts_with('{') {
+        return Ok(serde_json::from_str(&raw[0])?);
+    }
+    let mut object = serde_json::Map::new();
+    for pair in raw {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            pangu_core::Error::Config(format!(
+                "explain --arg expects `key=value` or one JSON object, got `{pair}`"
+            ))
+        })?;
+        let value = value.trim();
+        let parsed = match value {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            "null" => serde_json::Value::Null,
+            _ if value.parse::<i64>().is_ok() => serde_json::from_str(value)?,
+            _ => serde_json::Value::String(value.to_string()),
+        };
+        object.insert(key.to_string(), parsed);
+    }
+    Ok(serde_json::Value::Object(object))
 }
 
 fn doctor(args: &Cli, journal: Option<&std::path::Path>) -> Result<()> {

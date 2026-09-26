@@ -4,6 +4,7 @@
 pub mod approval;
 pub mod budget;
 pub mod config;
+pub mod explain;
 pub mod goal;
 pub mod policy;
 pub mod risk;
@@ -17,6 +18,10 @@ pub use budget::{Breach, Budget};
 pub use config::{
     BoundaryConfig, BoundarySection, CheckpointBackend, CheckpointFailurePolicy, CheckpointSection,
     CliOverrides, Config, EnvSection,
+};
+pub use explain::{
+    explain_action, DeadRule, ExplainContext, ExplainReport, ExplainRequest, Layer, LayerOutcome,
+    LayerReport, Projection, RuleStatus, RuleTrace, EXPLAIN_SCHEMA,
 };
 pub use goal::{GoalContract, GoalStatus};
 pub use policy::{ActionRequest, Decision, Effect, Policy, Rule};
