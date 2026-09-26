@@ -30,8 +30,16 @@ use serde_json::json;
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn temp_path(label: &str) -> std::path::PathBuf {
+    // Nanoseconds matter here: `Journal::create` refuses a path that already
+    // exists, and the process id plus a per-process counter is reused once the
+    // id wraps around. Without the timestamp a leftover journal from an
+    // earlier run turns a passing test into a fail-closed error.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     std::env::temp_dir().join(format!(
-        "pangu-invariant-{label}-{}-{}",
+        "pangu-invariant-{label}-{}-{nanos}-{}",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
@@ -645,6 +653,37 @@ async fn phase2_event_tee_rejects_inconsistent_durable_receipts() {
         ))
         .await;
     assert!(result.is_err());
+}
+
+/// Regression guard for a CI-only failure.
+///
+/// `Journal::create` refuses a path that already exists so a previous chain is
+/// never overwritten, and the tests used to derive their path from the process
+/// id plus a per-process counter. Once the id wrapped around, a run inherited a
+/// leftover journal and the fail-closed error surfaced as a test failure. The
+/// two properties together are the contract: the path must be unique, and a
+/// collision must stay a refusal rather than a silent overwrite.
+#[test]
+fn test_paths_are_unique_and_journal_creation_refuses_an_existing_path() {
+    use pangu_core::Event;
+
+    let first = temp_path("uniqueness");
+    let second = temp_path("uniqueness");
+    assert_ne!(first, second, "temp_path must not repeat a path");
+
+    let path = temp_path("journal-refusal");
+    let journal = Journal::create_v2(&path).expect("create a journal");
+    drop(journal);
+    let refusal = Journal::create_v2(&path)
+        .err()
+        .expect("creating over an existing journal must be refused");
+    assert!(
+        refusal.to_string().contains("already exists"),
+        "the refusal must say why: {refusal}"
+    );
+    assert_ne!(path, temp_path("journal-refusal-other"));
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = Event::new_v2(EventKind::Note, 0, "unused");
 }
 
 #[test]

@@ -457,10 +457,16 @@ mod tests {
 
     #[tokio::test]
     async fn journal_v2_receipt_is_bound_to_the_published_checkpoint() {
+        // Nanoseconds: see the note in tests/invariants.rs. A reused process id
+        // plus counter would inherit another run's journal and workspace.
         let root = std::env::temp_dir().join(format!(
-            "pangu-agent-journal-receipt-{}-{}",
+            "pangu-agent-journal-receipt-{}-{}-{}",
             std::process::id(),
-            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         let mut config = Config::embedded().unwrap();
@@ -646,9 +652,13 @@ mod tests {
     #[tokio::test]
     async fn rollback_restores_an_older_checkpoint_and_is_idempotent() {
         let root = std::env::temp_dir().join(format!(
-            "pangu-agent-rollback-test-{}-{}",
+            "pangu-agent-rollback-test-{}-{}-{}",
             std::process::id(),
-            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         let file = root.join("state.txt");
@@ -788,9 +798,13 @@ mod tests {
     #[tokio::test]
     async fn rollback_wall_clock_budget_stops_after_slow_approval() {
         let root = std::env::temp_dir().join(format!(
-            "pangu-agent-rollback-budget-{}-{}",
+            "pangu-agent-rollback-budget-{}-{}-{}",
             std::process::id(),
-            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         let file = root.join("state.txt");
@@ -876,9 +890,13 @@ mod tests {
     #[tokio::test]
     async fn external_mutation_after_a_checkpoint_blocks_rollback() {
         let root = std::env::temp_dir().join(format!(
-            "pangu-agent-external-rollback-{}-{}",
+            "pangu-agent-external-rollback-{}-{}-{}",
             std::process::id(),
-            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         let file = root.join("state.txt");

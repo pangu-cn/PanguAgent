@@ -11,8 +11,16 @@ use pangu_core::{
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn temp_root(label: &str) -> PathBuf {
+    // Nanoseconds keep a run from inheriting a leftover directory: a reused
+    // process id plus a per-process counter would otherwise silently reuse
+    // another run's workspace, and the artifact store would start from state
+    // this run never created.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "pangu-cli-process-{label}-{}-{}",
+        "pangu-cli-process-{label}-{}-{nanos}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
