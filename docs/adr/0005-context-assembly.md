@@ -175,6 +175,7 @@ laya 必须是**可选**的（B6 同样默认关闭）。它不可用时，短�
   - **向后兼容**：JSON 对空白不敏感，`from_slice` 照常解析旧单行文件，**无需迁移**；新文件多行、旧文件单行可共存。
   - **摘要不受影响**：`digest_of` 哈希的是 `to_vec(messages)` 即**逻辑消息**，不是文件字节，所以换存储格式不作废任何已有摘要。
   - **行号稳定的前提已具备**：`save_conversation` 遇到重名直接报 `already exists and is immutable`，快照严格只写一次。
+- **A6-0 已完成**：`conversation::encode_linewise` 让快照落盘变成「一条消息一行」，实测 6 条消息 = 8 行（头 + 6 + 尾）。**向后兼容已验证**：单测用旧编码器 `serde_json::to_vec` 造的文件仍能解析且 digest 完好，无需迁移，两种布局可共存于同一 store。`digest_of` 哈希逻辑消息，所以**没有作废任何已有摘要**。`HeaderRef` 镜像结构是**构造性的维护隐患**（新增字段漏写会静默从盘上消失），由 `header_ref_covers_every_field` 比较键集挡成测试失败。
 - **范围完整性需要三道**（整份 digest 不够用）：
   1. 逐范围校验 `range_digest`——否则改了第 500 行，取到的切片是他改过的内容却挂着原摘要；
   2. `range_digest` 与 `summary_digest` 成对绑定——摘要描述 100–200 行，那段变了摘要就在说谎；
@@ -184,7 +185,7 @@ laya 必须是**可选**的（B6 同样默认关闭）。它不可用时，短�
 
 | 阶段 | 内容 | 依赖 |
 | --- | --- | --- |
-| **A6-0** | **落盘改「一条消息一行」**（向后兼容，见 §4）；`ContextSlice` 记录从行号寻址，前置条件 | A1-1（已做） |
+| ~~A6-0~~ | ~~落盘改「一条消息一行」~~ **已做**（`conversation::encode_linewise`） | A1-1（已做） |
 | A6-1 | 切片存储：`ContextSlice { slice_id, snapshot_id, message_index, start_line, end_line, range_digest, summary, kind, derived_from?, unverified }`，append-only，复用 `ArtifactStore`；确定性摘要抽取；三道范围校验 | A6-0 |
 | A6-2 | 组装器：`assemble(forced, requested, budget) -> (AssembledContext, AssemblyReport)`，逐片记选取理由，**接缝显式标记**，结果标 `derived/authitative`（§3.7） | A6-1 |
 | A6-3 | 概要模式：降级链 `full → summary → omit-with-reason`；切片配置化存储界 | A6-2 |
