@@ -36,18 +36,29 @@ const OTHER_DIGEST: &str = "1111111111111111111111111111111111111111111111111111
 // ---------------------------------------------------------------------------
 
 /// Append one machine-readable drill result line.
+///
+/// `PANGU_DRILL_REPORT` must be an absolute path: `cargo test` runs the test
+/// binary in the package directory, so a relative path would land inside the
+/// crate instead of where the caller asked for it. `PANGU_DRILL_COMMIT` lets
+/// the caller stamp the report with the revision it validated.
 fn record_drill(drill: &str, outcome: &str, detail: &str) {
     let line = serde_json::json!({
         "schema": "pangu-f7-drill/1",
         "drill": drill,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        "commit": std::env::var("PANGU_DRILL_COMMIT").unwrap_or_else(|_| "unknown".into()),
         "outcome": outcome,
         "detail": detail,
     });
     match std::env::var_os("PANGU_DRILL_REPORT") {
         Some(path) => {
             let path = PathBuf::from(path);
+            assert!(
+                path.is_absolute(),
+                "PANGU_DRILL_REPORT must be an absolute path, got {}",
+                path.display()
+            );
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).expect("drill report directory");
             }
@@ -136,8 +147,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
+        // Nanoseconds keep two drill processes from sharing a fixture even if
+        // the OS reuses a process id, so a leftover directory from an aborted
+        // run can never be mistaken for a fresh incident.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "pangu-f7-drill-{label}-{}-{}",
+            "pangu-f7-drill-{label}-{}-{nanos}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -227,10 +245,17 @@ enum Blocked {
     /// reading. Windows refuses to rename a directory that holds a file without
     /// delete sharing, so the move-aside step fails mid-restore.
     #[cfg(windows)]
-    SharedReadHandle { _handle: fs::File, path: PathBuf },
+    SharedReadHandle {
+        _handle: fs::File,
+        label: &'static str,
+    },
     /// The directory the restore must write into is not writable.
     #[cfg(unix)]
-    ReadOnlyDirectory(PathBuf, u32),
+    ReadOnlyDirectory {
+        directory: PathBuf,
+        mode: u32,
+        label: &'static str,
+    },
     /// This platform or account cannot express the failure (for example root
     /// bypasses directory permissions). Recorded honestly, never asserted.
     Unsupported(&'static str),
@@ -255,9 +280,9 @@ impl Blocked {
             {
                 Ok(handle) => Blocked::SharedReadHandle {
                     _handle: handle,
-                    path: file.clone(),
+                    label: "old-dir/old.txt",
                 },
-                Err(error) => panic!("cannot hold {} open: {error}", file.display()),
+                Err(error) => panic!("cannot open the drill fixture file: {error}"),
             };
         }
         #[cfg(unix)]
@@ -273,7 +298,11 @@ impl Blocked {
                 .mode();
             fs::set_permissions(&directory, fs::Permissions::from_mode(previous & !0o222))
                 .expect("make directory read-only");
-            return Blocked::ReadOnlyDirectory(directory, previous);
+            return Blocked::ReadOnlyDirectory {
+                directory,
+                mode: previous,
+                label: "nested",
+            };
         }
         #[allow(unreachable_code)]
         Blocked::Unsupported("no mid-restore write failure is expressible on this platform")
@@ -284,22 +313,20 @@ impl Blocked {
             #[cfg(windows)]
             Blocked::SharedReadHandle { .. } => "directory-rename-blocked-by-open-file",
             #[cfg(unix)]
-            Blocked::ReadOnlyDirectory(_, _) => "read-only-directory",
+            Blocked::ReadOnlyDirectory { .. } => "read-only-directory",
             Blocked::Unsupported(_) => "unsupported",
         }
     }
 
-    /// What was blocked, for the drill report.
+    /// What was blocked, for the drill report. Only workspace-relative labels
+    /// are recorded: an absolute path would put the operator's home directory
+    /// into an artifact that gets archived and committed.
     fn evidence(&self) -> String {
         match self {
             #[cfg(windows)]
-            Blocked::SharedReadHandle { path, .. } => {
-                format!("open-for-read={}", path.display())
-            }
+            Blocked::SharedReadHandle { label, .. } => format!("open-for-read={label}"),
             #[cfg(unix)]
-            Blocked::ReadOnlyDirectory(directory, _) => {
-                format!("read-only-dir={}", directory.display())
-            }
+            Blocked::ReadOnlyDirectory { label, .. } => format!("read-only-dir={label}"),
             Blocked::Unsupported(reason) => (*reason).to_string(),
         }
     }
@@ -308,7 +335,10 @@ impl Blocked {
 impl Drop for Blocked {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Blocked::ReadOnlyDirectory(directory, mode) = self {
+        if let Blocked::ReadOnlyDirectory {
+            directory, mode, ..
+        } = self
+        {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(directory, fs::Permissions::from_mode(*mode));
         }
@@ -413,19 +443,25 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
     let mechanism = blocked.mechanism();
     let evidence = blocked.evidence();
     let workspace_before = tree_digest(&fixture.workspace);
-    let error = fixture
-        .store
-        .restore_checkpoint_with_expected(
-            &fixture.request,
-            &target,
-            "rollback-drill-2",
-            source
-                .workspace_digest
-                .as_deref()
-                .expect("runtime checkpoints carry a workspace digest"),
-        )
-        .expect_err("a blocked restore step must fail the operation")
-        .to_string();
+    // The failure has to land inside the restore. If the block did not take
+    // effect, say so with the runtime's own outcome instead of reporting a
+    // misleading incident.
+    let failure = fixture.store.restore_checkpoint_with_expected(
+        &fixture.request,
+        &target,
+        "rollback-drill-2",
+        source
+            .workspace_digest
+            .as_deref()
+            .expect("runtime checkpoints carry a workspace digest"),
+    );
+    let error = match failure {
+        Ok(result) => panic!(
+            "the {mechanism} block did not stop the restore (disposition {:?}); the incident was not rehearsed",
+            result.disposition
+        ),
+        Err(error) => error.to_string(),
+    };
     drop(blocked);
     assert!(
         !error.is_empty(),

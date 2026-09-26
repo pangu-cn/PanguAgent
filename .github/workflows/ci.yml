@@ -41,6 +41,7 @@ jobs:
         run: cargo test -p pangu --test operator_drills -- --nocapture
         env:
           PANGU_DRILL_REPORT: ${{ github.workspace }}/f7-drill-report.jsonl
+          PANGU_DRILL_COMMIT: ${{ github.sha }}
 
       - name: Archive F7 drill report
         if: always()
