@@ -116,6 +116,8 @@ jobs:
         shell: bash
         env:
           CARGO_TERM_COLOR: never
+          PANGU_DRILL_REPORT: ${{ github.workspace }}/f7-drill-report.jsonl
+          PANGU_DRILL_COMMIT: ${{ github.sha }}
         run: |
           set +e
           cargo test -p pangu --test operator_drills -- --nocapture 2>&1 | tee drill.log
