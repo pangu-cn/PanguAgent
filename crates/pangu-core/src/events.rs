@@ -5,7 +5,7 @@ use crate::{Error, Result, Value};
 pub const JOURNAL_FORMAT_V1: &str = "pangu-journal/v1";
 pub const JOURNAL_FORMAT_V2: &str = "pangu-journal/v2";
 
-const MAX_EVENT_MESSAGE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_EVENT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_EVENT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_REDACT_INPUT_BYTES: usize = 1024 * 1024;

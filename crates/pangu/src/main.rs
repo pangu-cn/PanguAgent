@@ -104,6 +104,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect a stable event stream. Read-only, and never an authorization.
+    Events {
+        #[command(subcommand)]
+        action: EventsCommands,
+    },
     /// Read-only operator tooling. Nothing here repairs or cleans evidence.
     Artifact {
         #[command(subcommand)]
@@ -138,6 +143,27 @@ enum ArtifactCommands {
     Inspect {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Read-only commands over the stable event stream. Nothing here writes,
+/// repairs, or re-derives a stream.
+#[derive(Clone, Debug, Subcommand)]
+enum EventsCommands {
+    /// Read a `pangu-stream/*` file (or a journal, migrated forward).
+    Read {
+        /// Path to the NDJSON stream, or to a journal file.
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Print only records of this kind.
+        #[arg(long = "kind")]
+        kind: Option<String>,
+    },
+    /// List the contract: supported versions, kinds, and their stability.
+    Contract {
         #[arg(long)]
         json: bool,
     },
@@ -197,6 +223,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Events { action }) => match action {
+            EventsCommands::Read { path, json, kind } => events_read(&path, kind, json),
+            EventsCommands::Contract { json } => events_contract(json),
+        },
         Some(Commands::Artifact { action }) => match action {
             ArtifactCommands::Inspect { root, json } => artifact_inspect(&root, json),
         },
@@ -352,6 +382,117 @@ fn doctor(args: &Cli, journal: Option<&std::path::Path>) -> Result<()> {
 /// recovery runbook requires an operator to preserve evidence and escalate
 /// instead of letting the tool guess. A non-`verified` verdict exits non-zero
 /// so CI and deployment scripts cannot mistake it for a healthy store.
+/// Read a stable event stream, migrating an older journal forward if needed.
+///
+/// Read-only and advisory. This reports what a derived projection says; it
+/// cannot verify a run, and the journal remains the audit authority.
+fn events_read(path: &std::path::Path, kind: Option<String>, json: bool) -> Result<()> {
+    let summary = pangu_core::read_stream(path)?;
+
+    // An unrecognized filter is an error, not an empty result. A typo in
+    // `--kind` that silently printed nothing reads exactly like a run that
+    // never emitted that event.
+    let filter = match kind.as_deref() {
+        None => None,
+        Some(name) => Some(
+            pangu_core::StreamKind::all()
+                .iter()
+                .find(|kind| {
+                    serde_json::to_value(kind).ok().as_ref()
+                        == Some(&serde_json::Value::String(name.to_string()))
+                })
+                .copied()
+                .ok_or_else(|| {
+                    pangu_core::Error::Config(format!(
+                        "unknown stream kind `{name}`; run `pangu events contract` for the list"
+                    ))
+                })?,
+        ),
+    };
+
+    let events: Vec<&pangu_core::StreamEvent> = summary
+        .events
+        .iter()
+        .filter(|event| filter.is_none_or(|wanted| event.kind == wanted))
+        .collect();
+
+    if json {
+        let payload = serde_json::json!({
+            "summary": summary,
+            "matched": events,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print!("{}", summary.render());
+        for event in &events {
+            println!(
+                "  [{:>3}] {:<32} {} {}",
+                event.seq,
+                serde_json::to_value(event.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                event.data.verdict.clone().unwrap_or_else(|| "-".into()),
+                event.data.message
+            );
+        }
+    }
+
+    // A truncated read is a failure of the read, not a partial success.
+    if summary.truncated {
+        return Err(anyhow::anyhow!(
+            "stream read was truncated at {} record(s); the output above is a prefix, not the whole \
+             stream",
+            summary.events.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Print the contract: which versions this build reads, and which kinds are
+/// frozen. A consumer building a long-lived integration needs this before it
+/// can decide what to depend on.
+fn events_contract(json: bool) -> Result<()> {
+    let kinds: Vec<serde_json::Value> = pangu_core::StreamKind::all()
+        .iter()
+        .map(|kind| {
+            serde_json::json!({
+                "kind": kind,
+                "stability": kind.stability(),
+            })
+        })
+        .collect();
+    let contract = serde_json::json!({
+        "current_schema": pangu_core::STREAM_SCHEMA_V1,
+        "readable_schemas": pangu_core::EventMigrator::supported_schemas(),
+        "unknown_schema_policy": "refuse; never guess a newer writer's record",
+        "kinds": kinds,
+        "derived": true,
+        "authoritative": false,
+        "note": "derived projection; the hash-chained journal remains the audit authority",
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&contract)?);
+    } else {
+        println!(
+            "event stream contract {}\n  readable schemas: {}\n  unknown schema: refuse, never guess\n  derived projection; the journal remains the audit authority\n  kinds:",
+            pangu_core::STREAM_SCHEMA_V1,
+            pangu_core::EventMigrator::supported_schemas().join(", ")
+        );
+        for kind in pangu_core::StreamKind::all() {
+            println!(
+                "    {:<32} {}",
+                serde_json::to_value(kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                kind.stability().as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn artifact_inspect(root: &std::path::Path, json: bool) -> Result<()> {
     let report = pangu_core::inspect_artifact_root(root)?;
     if json {

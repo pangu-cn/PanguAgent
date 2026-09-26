@@ -326,7 +326,12 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 ### A. 核心交互、审计和恢复
 
 - [ ] **A1 会话树与恢复**：借鉴 Pi/Hermes/DeepSeek Harness/OpenHands/Cline，支持 resume、branch、fork、compaction；每个节点可回放。
-- [ ] **A2 结构化事件兼容层**：在现有 Journal 之外提供稳定的 JSONL/NDJSON 事件流、事件版本和迁移器；借鉴 Pi JSON/RPC、ZCode 协议层、DeepSeek Harness 的 SessionEvent、OpenHands Agent Server 和 Cline headless 模式。
+- [x] **A2 结构化事件兼容层**：在现有 Journal 之外提供稳定的 JSONL/NDJSON 事件流、事件版本和迁移器；借鉴 Pi JSON/RPC、ZCode 协议层、DeepSeek Harness 的 SessionEvent、OpenHands Agent Server 和 Cline headless 模式。
+  - 已有：Journal（`pangu-journal/v1`、`/v2`），带 `prev_sha`/`sha` 哈希链与 `event_id` 回执（v2）。但这是**内部存储格式**，18 个 `Option` 字段 + `deny_unknown_fields`，外部工具要么绑死内部结构、要么把审计链当数据流读。
+  - 已完成（ADR-0003）：独立的 `pangu-stream/1` 契约——闭集 `StreamEvent`（非 `Value`）、`EventMigrator`、`StreamWriter`（`EventSink` 实现）、`read_stream`、CLI `pangu events read|contract`。
+  - 三个版本概念各管各的：Journal 磁盘格式（内部可演进）/ 事件流契约（**只增不改**，改则发 `/2`）/ 单条 kind 的冻结状态（`stable` vs `provisional`）。
+  - 安全边界：事件流**不带自己的哈希链**，天然无法自证；每条记录固定 `derived: true` / `authoritative: false`，`validate()` 拒绝声称权威的记录；未知/未来 schema 硬失败不猜；损坏行整体失败不返回前缀；脱敏与 Journal 同一套。
+  - **未包含（有意排除）**：实时推送（订阅式/gRPC/WebSocket）、写回 API、替代 Journal；F7 的 checkpoint/rollback kind 定为 `provisional` 而非 `stable`（F7 仍是实验性 opt-in，现在冻结等于对未定型行为做兼容承诺）。
 - [ ] **A3 审批与差异预览**：显示文件 diff、命令预览、网络目标摘要、预计风险和影响范围；借鉴 Pi 的交互扩展点和 Cline 的 Plan/Act、checkpoint/undo。
 - [x] **A4 `doctor`/`explain`/策略模拟**：在不执行副作用的情况下解释配置、规则命中顺序、预算和预计阻塞点；扩展 Pangu 现有能力，并参考 OpenHands backend 状态检查。
   - 已有：`pangu doctor`（配置摘要 + digest + Journal 统计）、`pangu config`、`Config::explain()`。
