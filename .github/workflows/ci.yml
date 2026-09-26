@@ -57,6 +57,37 @@ jobs:
           fi
           exit "$status"
 
+      - name: Run strict Clippy
+        shell: bash
+        run: |
+          # Same reasoning as the test step: the job log needs admin rights, so
+          # the diagnostic is re-emitted as an annotation.
+          set +e
+          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            esc() { printf '%s' "$1" | tr -d '\r' | sed -e 's/%/%25/g' -e 's/:/%3A/g'; }
+            {
+              grep -E '^(error|warning)' clippy.log | head -20 || true
+              grep -E '^ +--> ' clippy.log | head -20 || true
+            } | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=clippy::$(esc "$line")"
+            done
+            echo "::error title=clippy::exit code $status"
+          fi
+          exit "$status"
+
+      - name: Archive CI logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ matrix.os }}
+          path: |
+            all-tests.log
+            clippy.log
+          if-no-files-found: warn
+
       - name: Archive all-tests log
         if: always()
         uses: actions/upload-artifact@v4
