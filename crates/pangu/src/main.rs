@@ -76,6 +76,22 @@ enum Commands {
         #[arg(long, default_value = "cli")]
         requested_by: String,
     },
+    /// Read-only operator tooling. Nothing here repairs or cleans evidence.
+    Artifact {
+        #[command(subcommand)]
+        action: ArtifactCommands,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum ArtifactCommands {
+    /// Report the verifiable state of an Artifact store without changing it.
+    Inspect {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -112,6 +128,9 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Artifact { action }) => match action {
+            ArtifactCommands::Inspect { root, json } => artifact_inspect(&root, json),
+        },
         None if args.demo => demo(&args).await,
         None => {
             let goal = match args.goal.clone() {
@@ -149,6 +168,76 @@ fn doctor(args: &Cli, journal: Option<&std::path::Path>) -> Result<()> {
             summary.input_tokens,
             summary.output_tokens,
             summary.outcome.as_deref().unwrap_or("<incomplete>"),
+        );
+    }
+    Ok(())
+}
+
+/// Read-only Artifact inspection.
+///
+/// This deliberately has no repair, cleanup, delete or retry path: the
+/// recovery runbook requires an operator to preserve evidence and escalate
+/// instead of letting the tool guess. A non-`verified` verdict exits non-zero
+/// so CI and deployment scripts cannot mistake it for a healthy store.
+fn artifact_inspect(root: &std::path::Path, json: bool) -> Result<()> {
+    let report = pangu_core::inspect_artifact_root(root)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "artifact root: {}\ninspected at: {}\nread-only: {}\n{}",
+            report.root,
+            report.generated_at,
+            report.read_only,
+            report.summary()
+        );
+        for checkpoint in &report.checkpoints {
+            println!(
+                "  checkpoint {} state={} verified={} marker={} files={} bytes={} node={} external_effect_after={}",
+                checkpoint.checkpoint_id,
+                serde_json::to_string(&checkpoint.state)?.trim_matches('"'),
+                checkpoint.verified,
+                checkpoint.committed_marker,
+                checkpoint.file_entries,
+                checkpoint.total_bytes,
+                checkpoint
+                    .session_node
+                    .as_ref()
+                    .map(|node| format!("{} consistent={}", node.session_node_id, node.consistent))
+                    .unwrap_or_else(|| "<none>".into()),
+                checkpoint.external_effect_after
+            );
+        }
+        for operation in &report.operations {
+            println!(
+                "  operation {} checkpoint={} status={} transition_node={} error={}",
+                operation.rollback_id,
+                operation.checkpoint_id,
+                serde_json::to_string(&operation.status)?.trim_matches('"'),
+                operation
+                    .transition_session_node_id
+                    .as_deref()
+                    .unwrap_or("<none>"),
+                operation.error.as_deref().unwrap_or("<none>")
+            );
+        }
+        for backup in &report.replace_backups {
+            println!(
+                "  replace-backup evidence: {}/{}",
+                backup.scope, backup.path
+            );
+        }
+        for problem in &report.problems {
+            println!(
+                "  [{}] {}: {}",
+                problem.code, problem.subject, problem.detail
+            );
+        }
+    }
+    if report.verdict != pangu_core::InspectionVerdict::Verified {
+        bail!(
+            "artifact store is not fully verified; operator action is required: {}",
+            report.summary()
         );
     }
     Ok(())

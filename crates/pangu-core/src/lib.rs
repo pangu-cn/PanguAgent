@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod error;
 pub mod events;
 pub mod glob;
+pub mod inspect;
 pub mod journal;
 pub mod json;
 pub mod messages;
@@ -31,6 +32,11 @@ pub use events::{
     NullSink, Price, TeeSink, Usage, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
 };
 pub use glob::Glob;
+pub use inspect::{
+    inspect_artifact_root, ArtifactInspection, CheckpointInspection, InspectionProblem,
+    InspectionVerdict, OperationInspection, ReplaceBackupEvidence, SessionNodeInspection,
+    TransactionLockEvidence, ARTIFACT_INSPECTION_SCHEMA,
+};
 pub use journal::{ConsoleSink, Journal};
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
 pub use util::{approx_tokens_of_chars, hex_sha256, now_rfc3339, short_hash, truncate_middle};

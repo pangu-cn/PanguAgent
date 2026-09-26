@@ -923,6 +923,17 @@ impl ArtifactStore {
     }
 
     fn failed_path_records(&self, run_id: &str) -> Result<Vec<FailedPathRecord>> {
+        self.scan_failed_paths(Some(run_id))
+    }
+
+    /// Read every validated failed-path record across all runs. This is a
+    /// read-only ledger view for operator inspection; it never appends,
+    /// supersedes or clears a record.
+    pub fn failed_path_ledger(&self) -> Result<Vec<FailedPathRecord>> {
+        self.scan_failed_paths(None)
+    }
+
+    fn scan_failed_paths(&self, run_id: Option<&str>) -> Result<Vec<FailedPathRecord>> {
         let path = self.root.join(FAILED_PATH_LEDGER_FILE);
         if !path_exists_without_symlink(&path)? {
             return Ok(Vec::new());
@@ -942,10 +953,16 @@ impl ArtifactStore {
             }
             let record: FailedPathRecord = serde_json::from_str(line)?;
             record.validate()?;
-            if record.run_id != run_id {
-                continue;
+            if let Some(run_id) = run_id {
+                if record.run_id != run_id {
+                    continue;
+                }
             }
-            if let Some(previous) = latest.get(&record.failure_id) {
+            let key = match run_id {
+                Some(_) => record.failure_id.clone(),
+                None => format!("{}\u{1f}{}", record.run_id, record.failure_id),
+            };
+            if let Some(previous) = latest.get(&key) {
                 if !same_failed_path_identity(previous, &record) {
                     return Err(Error::Config(
                         "failed-path ledger contains conflicting immutable identities".into(),
@@ -973,7 +990,7 @@ impl ArtifactStore {
                     ));
                 }
             }
-            latest.insert(record.failure_id.clone(), record);
+            latest.insert(key, record);
         }
         Ok(latest.into_values().collect())
     }
@@ -994,6 +1011,12 @@ impl ArtifactStore {
             }
         }
         Ok(false)
+    }
+
+    /// Read every validated external-effect declaration. This is a read-only
+    /// ledger view for operator inspection; it never appends or rewrites.
+    pub fn effect_records(&self) -> Result<Vec<EffectRecord>> {
+        self.read_effect_records()
     }
 
     fn read_effect_records(&self) -> Result<Vec<EffectRecord>> {
@@ -1578,7 +1601,7 @@ fn read_file_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn read_regular_file_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_regular_file_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     reject_symlink_components(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1607,7 +1630,7 @@ fn entries_digest(entries: &[CheckpointFileEntry]) -> Result<String> {
     Ok(digest_bytes(&bytes))
 }
 
-fn digest_bytes(bytes: &[u8]) -> String {
+pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -1672,7 +1695,7 @@ fn canonicalize_existing_or_missing(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn reject_symlink_components(path: &Path) -> Result<()> {
+pub(crate) fn reject_symlink_components(path: &Path) -> Result<()> {
     let mut current = path.to_path_buf();
     loop {
         match fs::symlink_metadata(&current) {
@@ -1693,7 +1716,7 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn path_exists_without_symlink(path: &Path) -> Result<bool> {
+pub(crate) fn path_exists_without_symlink(path: &Path) -> Result<bool> {
     reject_symlink_components(path)?;
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -1702,7 +1725,7 @@ fn path_exists_without_symlink(path: &Path) -> Result<bool> {
     }
 }
 
-fn validate_id(field: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_id(field: &str, value: &str) -> Result<()> {
     if value.trim().is_empty()
         || value.len() > 256
         || value.chars().any(char::is_control)

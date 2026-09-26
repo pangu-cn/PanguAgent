@@ -4,6 +4,7 @@
 >
 > 本手册适用于 Pangu Artifact backend。checkpoint 默认关闭；Git backend 当前未实现。
 > 任何步骤都不能把模型输出、自然语言指令或手工修改的 ledger 当成可信恢复证据。
+> 第 3 节的证据收集已有只读工具（`pangu artifact inspect`），第 6 节是可重复演练；两者都只报告，不修复。
 
 ## 1. 安全边界
 
@@ -44,7 +45,24 @@ operator 在整个恢复过程中必须遵守以下规则：
 
 ### 3.2 Artifact
 
-在 Artifact root 中只读检查：
+优先使用只读检查器收集本节证据，它不会创建、修复、删除或重试任何东西：
+
+```bash
+pangu artifact inspect --root <ARTIFACT_ROOT>            # 人类可读
+pangu artifact inspect --root <ARTIFACT_ROOT> --json     # pangu-artifact-inspection/1
+```
+
+报告的 `verdict` 只有三种：
+
+- `verified`：manifest、commit marker、blob hash、session node、operation 与账本全部通过校验；
+- `operator_required`：可证明内部一致，但存在 runtime 故意不自行处理的事故条件（stale lock、`InProgress`/`Failed` operation、checkpoint 之后的外部 mutation、replacement backup、active failed-path）；
+- `unverifiable`：无法完整证明（读不到、超限、hash/绑定不一致）。此时不得对 workspace 状态做任何结论。
+
+`detail` 与 `subject` 已脱敏并限长，路径只保留相对形式；问题码自带 `unverifiable.*` / `operator.*` 前缀，报告 verdict 取最严重的一项。检查器退出码在非 `verified` 时非零。
+
+检查器看不到的两件事：CAS 漂移是**请求相关**事实（需要 boundary roots），必须由 `pangu rollback` 的 compare-and-swap 判定；lock 文件里的 `pid=` 只是线索，不证明进程存活。替换与扫描达到上限时报告会标注截断，不能把不完整扫描当成完整结论。
+
+在 Artifact root 中需要人工复核时，只读检查以下内容：
 
 - `<checkpoint_id>/manifest.json`
 - `<checkpoint_id>/blobs/`
@@ -141,26 +159,65 @@ runtime 的下一次操作仍会看到 lock 并 fail closed；本手册不授权
 
 不要删除历史 Journal、operation、effect 或 failed-path 记录来“清理状态”。需要保留它们的期限由部署者的审计策略决定。
 
-## 6. 当前实现限制
+## 6. Operator drill（可重复演练）
+
+本手册的分支可以被自动演练，避免“只有真正出事时才第一次看”。演练只证明 **fail closed 与证据存在**，不证明 Pangu 能自动恢复；恢复仍然是人的决定。
+
+```bash
+# 单个事故分支的回归测试（cargo test -p pangu --test operator_drills）
+cargo test -p pangu --test operator_drills
+
+# 产出可归档的逐平台证据；不设变量时直接打印到 stdout
+PANGU_DRILL_REPORT=evidence.jsonl cargo test -p pangu --test operator_drills -- --nocapture
+```
+
+| Drill | 对应分支 | 断言 |
+|-------|---------|------|
+| `stale-lock` | §4.1 | 遗留 lock 同时阻断读与写；lock 不被删除；不产生 operation 记录；报告为 `operator_required` |
+| `failed-operation` | §4.3 | 恢复中途失败记为 `Failed` 并带脱敏原因；同一 rollback id 不自动重试且不新增记录；workspace 回到失败前状态 |
+| `cas-drift` | §4.4 | compare-and-swap 失败后新编辑原样保留、不产生 operation 记录；store 本身仍为 `verified` |
+| `external-effect` | §4.5 | checkpoint 之后存在不可逆外部 mutation 时整次 rollback 被阻；不做任何外部补偿 |
+| `replace-backup` | §4.6 | 遗留 `.replace-backup-*` 阻止新的 Artifact 写入且本身被保留；报告为 `operator_required` |
+| `inspection-read-only` | §1 | 连续三次检查后 store 与 workspace 字节完全不变 |
+| `cli-inspect` | §3 | CLI 文本与 `--json` 两种输出都报告事故，且退出码非零 |
+
+平台差异按事实记录，不假装一致：
+
+- `failed-operation` 需要“写到一半失败”。Windows 用“待移开目录内的文件以只读共享方式打开”（目录 rename 被拒），Unix 用“目标目录不可写”；以 root 运行时 Unix 机制无效，演练会记为 `skipped` 而不是伪装通过。
+- `replace-backup` 只在 Windows 存在 hand-off。POSIX 上该文件对 runtime 无意义，演练记录 `not-applicable`，并只验证“证据被报告且未丢失”。
+- CI 在 `ubuntu-latest` 与 `windows-latest` 上都运行该套演练，并把 `f7-drill-report.jsonl` 作为 artifact 上传（见 `.github/workflows/ci.yml`）。
+
+## 7. 当前实现限制
 
 - `.rollback-operation.lock` 不会自动猜测恢复；这是故意的 fail-closed 行为。
 - Windows 原子替换使用 backup/rename hand-off，运行时中断后需要 operator 介入。
 - 不持有 Artifact lock 的并发 workspace writer 依赖最终 digest/CAS 检测；这不是 OS 或 VM 级隔离。
 - snapshot 不记录 snapshot root 目录自身的权限/元数据，只记录 root 下的子项。
 - Git backend 未实现，也不会隐式创建 commit、branch、tag、stash 或修改 index。
+- `pangu artifact inspect` 只读且有界：条目数、深度、checkpoint/operation 数量和 replacement backup 数量都有上限，截断时显式报告；它不判断 CAS 漂移，也不替代 `pangu rollback` 的前置校验。
 - checkpoint/rollback 仍是默认关闭的实验性 opt-in；本手册不是正式支持或默认激活承诺。
 
-## 7. 激活前验收清单
+## 8. 激活前验收清单
 
-在考虑把该能力从“实验性 opt-in”升级为正式激活前，部署者应保存以下证据：
+在考虑把该能力从“实验性 opt-in”升级为正式激活前，部署者应保存以下证据。已具备机器化手段和本地实测的项标为 `[x]`，仍需部署环境或人工签署的项保持 `[ ]`：
 
-- [ ] Windows、Unix 和目标部署平台分别通过 snapshot/restore、symlink、权限和 replacement 测试。
-- [ ] 实际执行 stale lock、failed operation、CAS drift 和 Windows backup 的 operator drill。
-- [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。
-- [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。
-- [ ] 配置、CLI、Journal、Artifact schema 和恢复手册版本相互匹配。
-- [ ] 默认配置仍关闭 checkpoint，Git backend 仍明确未实现。
-- [ ] Ubuntu/Windows CI 完成 `cargo check/test/clippy --workspace --all-targets --all-features`，并保存跨平台最终验收证据。
+- [ ] Windows、Unix 和目标部署平台分别通过 snapshot/restore、symlink、权限和 replacement 测试。（Windows 已由本机 `cargo test --workspace --all-targets` 与第 6 节演练覆盖；Unix/其它平台待 CI 与部署环境证据）
+- [x] stale lock、failed operation、CAS drift、Windows replacement backup 有可重复的 operator drill（第 6 节），且 replacement hand-off 与无锁并发 writer 的限制已写成本手册第 4、7 节。
+- [x] 只读证据检查有工具（`pangu artifact inspect`）并有“不修改任何字节”的独立断言。
+- [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。（依赖部署环境）
+- [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。（需部署者书面确认）
+- [x] 配置、CLI、Journal、Artifact schema、inspection schema 和恢复手册版本相互匹配，并在 ADR/ROADMAP/README 中一致标为实验性 opt-in。
+- [x] 默认配置仍关闭 checkpoint，Git backend 仍明确未实现。
+- [ ] Ubuntu/Windows CI 完成 `cargo check/test/clippy --workspace --all-targets --all-features` 并保存跨平台 drill 报告（CI 已配置 drill 步骤与 artifact 上传；等待真实 CI 运行结果，不以本机结果代替）。
 - [ ] 由 operator/发布负责人明确批准激活；未批准前继续保持实验性 opt-in。
+
+### 8.1 跨平台验收记录
+
+每次验收把实际结果写在这里，不写推测。CI drill 报告作为 artifact 归档；本机运行的结果保存在 `docs/evidence/`。
+
+| 平台 | 工具链 | 提交 | `cargo test --workspace --all-targets` | clippy `-D warnings` | operator drill（7 项） | 证据 |
+|------|--------|------|-----------------------------------|--------------------|-------------------|------|
+| Windows（本机） | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| Ubuntu（CI） | 待 CI | 待 CI | 待 CI | 待 CI | 待 CI | 等待 CI artifact |
 
 相关设计边界见 [`BOUNDARY.md`](BOUNDARY.md)、[`ARCHITECTURE.md`](ARCHITECTURE.md) 和 [`adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md)。

@@ -129,8 +129,11 @@ pangu --demo [--dry-run]
 pangu run --workspace PATH --max-turns N --max-cost-usd X "GOAL"
 pangu --checkpoint run "GOAL"
 pangu rollback --checkpoint-id ID --source-node NODE --rollback-id OP --reason "..."
+pangu artifact inspect --root PATH [--json]
 pangu run --dangerously-unattended "GOAL"
 ```
+
+`pangu artifact inspect` 是只读检查器：它不创建、不修复、不删除、不重试任何东西，只把 Artifact store 的可验证状态和事故证据（stale transaction lock、replacement backup、operation 状态、effect/failed-path 账本、commit marker 与 blob hash 一致性）报成带 `unverifiable.*` / `operator.*` 代码的报告，并在报告为 `verified` 以外时返回非零退出码。完整语义见 [`docs/CHECKPOINT_RECOVERY.md`](docs/CHECKPOINT_RECOVERY.md)。
 
 `--dangerously-unattended` 会把 approval mode 设为 `never`、使用 fail-closed 的 `Unattended` handler，并在 `RunStarted` 元数据中记录 `unattended=true`；需要人工或破坏性风险的动作会被拒绝，读-only 动作仍须通过其它闸门。它不是安全模式，只是明确放弃人工确认。
 

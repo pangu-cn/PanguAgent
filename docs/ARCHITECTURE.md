@@ -213,6 +213,17 @@ rollback 始终把动作作为 destructive capability 送入 L2/L3/L4；CLI 使�
 - 不持有 Artifact lock 的外部 workspace writer 可能改变文件，最终 digest/CAS 会拒绝不确定结果，但应用层锁不是 OS/VM 隔离；
 - replay 永不自动执行 restore，Git backend 当前明确未实现。
 
+### Operator 只读检查（`pangu-core::inspect`）
+
+`inspect_artifact_root` 把 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) §3 的证据收集步骤变成工具，但只做“读”：
+
+- 不创建目录、不取 transaction lock、不写 manifest/blob/ledger，因此对 store 和 workspace 都是字节级无操作；它复用 `ArtifactStore::verify_checkpoint`，所以 `verified` 与 restore 实际检查的是同一组不变量；
+- checkpoint 的 manifest/commit marker/blob hash、embedded 与 standalone session node 一致性、operation 账本自洽性、effect/failed-path 账本、stale `.rollback-operation.lock` 和 `.replace-backup-*` 证据全部进入报告；
+- 报告是 `pangu-artifact-inspection/1` schema，`detail`/`subject` 经边界脱敏并限长，路径只保留相对形式；问题码自带 `unverifiable.*`（无法证明）或 `operator.*`（可证明但需人工）前缀，最终 verdict 取最严重的一项；
+- 扫描有条目数、深度、checkpoint/operation 数量和 replacement backup 数量上限，达到上限时报告 `replace_backup_scan_truncated` 而不是假装完整；
+- CAS 漂移是**请求相关**的事实（需要 boundary roots），store-only 检查看不到它；漂移要由 `pangu rollback` 的 compare-and-swap 判定，不要用本报告代替；
+- 它不是 capability，不注册为工具，模型无法调用；`pangu artifact inspect` 只是 CLI 子命令。
+
 ## 不变量测试矩阵
 
 | ID | 测试/代码位置 | 断言 |
@@ -229,6 +240,7 @@ rollback 始终把动作作为 destructive capability 送入 L2/L3/L4；CLI 使�
 | I-Real-Toolkit-Execution | `crates/pangu-toolkit/tests/toolkit_integration.rs` | read/list/search/write 经过真实 Agent capability 链；越界、forbidden glob、symlink 和输出超限无副作用 |
 | I-Provider-Fail-Closed | `crates/pangu-provider/tests/openai_compatible.rs` | usage、非 2xx 脱敏、redirect 和响应体上限均 fail closed |
 | I-Child-Env-Cleaned | sandbox implementation | child env 是 allow-list 子集 |
+| I-Inspection-Read-Only | `pangu-core/src/inspect.rs`, `crates/pangu/tests/operator_drills.rs` | 连续检查不改动 store/workspace 任何一个字节；损坏、缺 marker 与 lock 不会被报成 verified |
 | I-Checkpoint-After-Verified-Action | `crates/pangu-agent/src/test_support.rs` | 只有成功 v2 `ToolFinished` 创建 checkpoint |
 | I-Checkpoint-Atomic | `crates/pangu-core/src/artifact.rs` | manifest/blob/node/marker 缺失或损坏时拒绝加载 |
 | I-Rollback-Trigger | `crates/pangu-agent/src/test_support.rs` | typed request、source/target/session/digest 绑定 |

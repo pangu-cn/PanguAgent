@@ -37,5 +37,18 @@ jobs:
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Run F7 checkpoint operator drills
+        run: cargo test -p pangu --test operator_drills -- --nocapture
+        env:
+          PANGU_DRILL_REPORT: ${{ github.workspace }}/f7-drill-report.jsonl
+
+      - name: Archive F7 drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f7-drill-report-${{ matrix.os }}
+          path: f7-drill-report.jsonl
+          if-no-files-found: warn
+
       - name: Run local demo smoke test
         run: cargo run -q -p pangu -- --demo

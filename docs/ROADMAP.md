@@ -382,8 +382,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - **L4**：`external_mutation + irreversible` 和 rollback 都必须有明确人工确认；checkpoint 只有匹配 `ask` 才进入 L4；`Never` 拒绝而不是自动放行。
 - **条件性不变量**：`I-Checkpoint-After-Verified-Action`、`I-Checkpoint-Atomic`、`I-Rollback-Trigger`、`I-Irreversible-Requires-Human`、`I-Rollback-Scope`、`I-Rollback-Idempotent`、`I-Failed-Path-Not-Repeated`、`I-No-Implicit-Git-Commit` 已实现并同步到 `BOUNDARY.md` 第 4.1 节。
 - **事件契约**：已加入 checkpoint、rollback、failed-path 事件和稳定 v2 event receipt；旧 Journal 不重写，v1 读取兼容保留。
-- **测试门**：已覆盖外部副作用、幂等、快照损坏、失败路径阻断、wall-clock budget、TeeSink receipt、真实 CLI 子进程、stale lock 和配置/事件兼容。
-- **正式激活门**：operator recovery 运行手册已补充；仍需跨平台最终验证和 Windows replace hand-off/并发 writer 限制的部署确认；在此之前不把 F7 描述为默认支持。详见 [`docs/CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
+- **测试门**：已覆盖外部副作用、幂等、快照损坏、失败路径阻断、wall-clock budget、TeeSink receipt、真实 CLI 子进程、stale lock 和配置/事件兼容；operator 事故分支（stale lock、failed operation、CAS drift、外部 mutation、Windows replacement backup、只读性、CLI 退出码）另有 `crates/pangu/tests/operator_drills.rs` 可重复演练，并按平台记录机制差异。
+- **正式激活门**：operator recovery 运行手册已补充，且证据收集与四个事故分支已有只读工具（`pangu artifact inspect`）和可重复 drill（CI 双平台运行并归档报告）；仍缺 Ubuntu CI 的真实运行结果、恢复期间的备份/审计可用性、无人工输入与并发 writer 的停止策略确认，以及 operator/发布负责人签署；在此之前不把 F7 描述为默认支持。详见 [`docs/CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
 
 ### 选择建议
 
