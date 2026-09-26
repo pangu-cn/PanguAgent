@@ -47,7 +47,9 @@ jobs:
             {
               grep -E '^test .* FAILED$' all-tests.log | head -20 || true
               grep -E '^ +--> ' all-tests.log | head -10 || true
-              grep -E 'panicked at' all-tests.log | head -10 || true
+              # The panic message sits on the line after the location and is the
+              # part that names the actual refusal, so it must not be dropped.
+              grep -A 3 'panicked at' all-tests.log | grep -vE '^--$' | head -30 || true
             } | while IFS= read -r line; do
               [ -n "$line" ] && echo "::error title=cargo test failure::$(esc "$line")"
             done
