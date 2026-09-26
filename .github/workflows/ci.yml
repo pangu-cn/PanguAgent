@@ -113,10 +113,35 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run F7 checkpoint operator drills
-        run: cargo test -p pangu --test operator_drills -- --nocapture
+        shell: bash
         env:
-          PANGU_DRILL_REPORT: ${{ github.workspace }}/f7-drill-report.jsonl
-          PANGU_DRILL_COMMIT: ${{ github.sha }}
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo test -p pangu --test operator_drills -- --nocapture 2>&1 | tee drill.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      # The acceptance record in docs/CHECKPOINT_RECOVERY.md cites these lines.
+      # Artifact downloads need authentication, so the report is also emitted
+      # as annotations: that keeps the cross-platform evidence reviewable by
+      # anyone who can read the repository, not only by the release owner.
+      - name: Publish F7 drill report
+        shell: bash
+        if: always()
+        run: |
+          # A workflow command ends at the first newline, and `%`, `:`, `,` and
+          # `"` are part of its escape grammar, so the JSON line is escaped
+          # before it becomes an annotation message.
+          esc() { tr -d '\r' | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g' -e 's/"/%22/g'; }
+          if [ -f "${{ github.workspace }}/f7-drill-report.jsonl" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=f7 drill::$(printf '%s' "$line" | esc)"
+            done < "${{ github.workspace }}/f7-drill-report.jsonl"
+          else
+            echo "::error title=f7 drill::no drill report was produced on ${{ matrix.os }}"
+          fi
 
       - name: Archive F7 drill report
         if: always()
