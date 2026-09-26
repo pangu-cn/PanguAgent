@@ -106,40 +106,49 @@ FORCED = { system 轮, goal, 被拒路径 (failed paths),
 
 同 §1 已有规矩（"不能把项目目录误认为安全沙箱；应用层限制不能宣传成 OS 级隔离"）："无限上下文"是**营销名**。README、CLI 输出、报告字段都不得出现暗示无界可验证性的措辞。
 
-### 3.5 两个存储物：上下文文件 + 摘要文件
+### 3.5 三个存储物：上下文文件、摘要文件、切片文件
 
-切片机制是 **Pangu 自己的主要功能**，不是外部能力、不是模型能力。落成两个文件：
+切片机制是 **Pangu 自己的主要功能**，不是外部能力、不是模型能力。落成三个文件：
 
 ```text
-<root>/contexts/<context_id>.json     ← 上下文文件：全量正文，一条消息一行（A6-0 布局）
-<root>/summaries/<context_id>.json    ← 摘要文件：确定性摘要索引，纯派生物
+<root>/contexts/<id>.json     ← 上下文文件：全量正文，一条消息一行（A6-0 布局）
+<root>/summaries/<id>.json    ← 摘要文件：一条消息一个摘要条目
+<root>/slices/<id>.json       ← 切片文件：映射表
 ```
 
-摘要文件**一条消息一个条目**：
+**切片文件是映射表**——把全量上下文映射成切片，每条切片带自己的位置与摘要：
 
 ```text
-SummaryEntry {
-  message_index   // 第几条消息
-  file_line       // 在上下文文件里的行号（= message_index + 2）
-  start_line      // 消息内容内的起始行（内容按 '\n' 切分）
-  end_line
-  range_digest    // 该范围字节的 digest
-  kind            // user / assistant / tool_call / tool_result / refusal …
-  summary         // 确定性抽取，不是模型产物
+SliceEntry {
+  slice_id
+  start_message / end_message   // 切片是 **span**，可跨多条消息
+  start_line / end_line         // 消息内容内的行范围
+  range_digest                  // 该范围字节的 digest
+  kind                          // turn / refusal / tool_burst / phase …
+  summary                       // 该切片的摘要
+  derived_from                  // 引用了哪些 message_index（它覆盖哪些摘要条目）
+  verbatim                      // 该 slice 是否逐字取用
+  unverified                    // 仅模型写回内容为 true
 }
 ```
 
-**切片不是第三个存储物，是第三步动作**：从摘要文件里选中若干条目 → 解析成行范围 → 到上下文文件按范围取行 → 校验 `range_digest` → **衔接**拼接。
+摘要文件的条目是 `SummaryEntry { message_index, file_line, start_line, end_line, range_digest, kind, summary }`，一条消息一个。
 
-**为什么必须两个文件而不是一个**：选择阶段要读**全部**摘要但不需要正文；拼接阶段要读**少量**正文但不需要全量索引。合成一个文件，选择阶段就得把大文件整个读进内存，拼接阶段又得把索引整个过一遍。拆开之后，选择阶段只把摘要文件读进内存（有明确上界），拼接阶段按行范围读上下文文件（不载入全量）。
+**为什么是三层而不是一个文件**：三者**访问模式不同**，合成一个就有一方被迫整体载入。
+
+| 存储物 | 谁读 | 访问方式 |
+| --- | --- | --- |
+| 摘要文件 | 粗筛 | 遍历**全部**条目，只读摘要 → 需要整体进内存，但要小且有明确上界 |
+| 切片文件 | 组装 | 只读**选中**的几条 → 不需要整体载入 |
+| 上下文文件 | 拼接 | 只读选中切片的行范围 → 按范围取，不载入全量 |
+
+**切片是 span，不是单条消息。** 单条消息作为选择单元太细——一条 256 KiB 的工具输出、一次 `finish` 回执，都不是有意义的选择粒度。切片跨消息成段（一个 turn、一段工具调用风暴、一个被拒路径），`derived_from` 记录它由哪些 `message_index` 聚合而来，这正是"映射表"可审计的含义。
+
+**三方 digest 绑定**：切片文件同时记录 `context_digest` 与 `summaries_digest`，加载时两个都要校验，对不上就报错——**不重新生成、不静默接受**。重新生成会掩盖"切片与正文对不上"，而那正是切片唯一可能说谎的地方。上下文文件不可变（A1 已保证只写一次）⇒ 三者都一次写完。
 
 **两级寻址，不能只用行号**：`message_index` 解决"哪一条消息"；`start_line/end_line` 解决"这条消息内部"——单条工具输出可达 `MAX_MESSAGE_CONTENT_BYTES = 256 KiB`，一条消息一行的话仍然切不开。内容行是**读时按 `\n` 切分**得到的，确定性，不需要再改存储格式。
 
-**摘要文件是纯派生物，绑定 `context_digest`**。它完全由上下文文件决定，所以：
-
-- 上下文文件不可变（A1 已保证只写一次）⇒ 摘要文件也一次写完；
-- 加载摘要文件时校验 `context_digest` 对得上，对不上就报错——**不重新生成、不静默接受**。重新生成会掩盖"摘要与正文对不上"这件事，而那正是切片唯一可能说谎的地方；
-- 摘要文件自身有 `summaries_digest`，改一个字就能查出来。
+**取用流程**：切片文件选中条目 → 到上下文文件按范围取行 → 校验 `range_digest` → **衔接**拼接（接缝见 §3.7）。
 
 **摘要器的质量规格**（升格为主要功能后要自己扛）：确定性、可复现、有单测、每条摘要带 `derived_from` 指向它描述的 `message_index`。它**不接触模型**。
 
@@ -202,7 +211,8 @@ laya（短决策）：短名单里哪几片真的相关
 | 阶段 | 内容 | 依赖 |
 | --- | --- | --- |
 | ~~A6-0~~ | ~~落盘改「一条消息一行」~~ **已做**（`conversation::encode_linewise`） | A1-1（已做） |
-| A6-1 | **摘要器**（Pangu 自己的确定性主要功能，有单测）+ 上下文文件 / 摘要文件两个存储物 + `SummaryEntry`；`context_digest` / `summaries_digest` 绑定；三道范围校验 | A6-0 |
+| A6-1 | **摘要器**（Pangu 自己的确定性主要功能，有单测）+ 上下文文件 / 摘要文件 + `SummaryEntry`；`context_digest` 绑定；三道范围校验 | A6-0 |
+| **A6-1b** | **切片文件（映射表）**：`SliceEntry`，切片为 span，`derived_from` 记录聚合了哪些消息；绑定 `context_digest` + `summaries_digest` | A6-1 |
 | A6-2 | 组装器：`assemble(forced, requested, budget) -> (AssembledContext, AssemblyReport)`，逐片记选取理由，**接缝显式标记**，结果标 `derived/authitative`（§3.7） | A6-1 |
 | A6-3 | 概要模式：降级链 `full → summary → omit-with-reason`；切片配置化存储界 | A6-2 |
 | A6-4 | 写回：append-only + `derived_from` + `unverified` 标注 | A6-2；**若 §3.3 实为读法 (a) 则删除** |
