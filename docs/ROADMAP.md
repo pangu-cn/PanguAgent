@@ -433,6 +433,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - **L3**：`SnapshotRequest`/`Sandbox` 校验快照和恢复只能访问已验证 roots，拒绝 symlink、越界、禁止 glob、外部路径、特殊文件和超限资源。
 - **L4**：`external_mutation + irreversible` 和 rollback 都必须有明确人工确认；checkpoint 只有匹配 `ask` 才进入 L4；`Never` 拒绝而不是自动放行。
 - **条件性不变量**：`I-Checkpoint-After-Verified-Action`、`I-Checkpoint-Atomic`、`I-Rollback-Trigger`、`I-Irreversible-Requires-Human`、`I-Rollback-Scope`、`I-Rollback-Idempotent`、`I-Failed-Path-Not-Repeated`、`I-No-Implicit-Git-Commit` 已实现并同步到 `BOUNDARY.md` 第 4.1 节。
+- **`checkpoint.exclude_roots`**：快照遍历整个工作区，而默认 `forbidden_globs` 只挡 `.git`/`.env`/secrets/私钥，**不挡构建产物**。本仓库 6.3 GB 的 `target/` 会让任何 checkpoint 撞上 `max_snapshot_bytes` 并按 `fail_run` 终止整个运行。已新增配置项让用户声明可排除目录，**默认留空**——`.gitignore` 不是安全依据（很多项目把真实产出目录写进 `.gitignore`，自动排除会让 rollback 静默丢失这些数据），哪些是可重建的由用户判断。校验拒绝越出工作区、覆盖整个工作区、或等于 artifact_root 的排除根。超限错误现在会指出**具体是哪个文件越界**并给出两个补救办法。
+  - **排除 = 快照不记录，rollback 也不回退**：未记录的目录不会进入“目标快照中缺失”的集合，所以 rollback 不会删除其中的文件。这是让排除变得安全的前提，不是副作用。
+  - **代价是旧 checkpoint 会作废**：在加排除之前拍的 checkpoint 仍含被排除路径，restore 现在会**明确失败并指出是哪个排除根挡住的**，不做部分回退（部分回退会让操作者看到“回退成功”而工作区只回退了一半）。要回退就得把该目录从 `exclude_roots` 里去掉再回退。
 - **事件契约**：已加入 checkpoint、rollback、failed-path 事件和稳定 v2 event receipt；旧 Journal 不重写，v1 读取兼容保留。
 - **测试门**：已覆盖外部副作用、幂等、快照损坏、失败路径阻断、wall-clock budget、TeeSink receipt、真实 CLI 子进程、stale lock 和配置/事件兼容；operator 事故分支（stale lock、failed operation、CAS drift、外部 mutation、Windows replacement backup、只读性、CLI 退出码）另有 `crates/pangu/tests/operator_drills.rs` 可重复演练，并按平台记录机制差异。
 - **正式激活门**：operator recovery 运行手册已补充，证据收集与四个事故分支已有只读工具（`pangu artifact inspect`）和可重复 drill，**跨平台 CI 已通过**（run 36210280753，提交 `1b0245d`，Ubuntu 与 Windows 的 drill 原始报告已转录到 `docs/evidence/`）；仍缺目标部署平台自身的验证、恢复期间的备份/审计可用性、无人工输入与并发 writer 的停止策略确认，以及 operator/发布负责人签署；在此之前不把 F7 描述为默认支持。详见 [`docs/CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。

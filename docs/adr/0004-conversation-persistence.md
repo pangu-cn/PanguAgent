@@ -186,9 +186,8 @@ ConversationSnapshot {
 - **处理方式**：`SessionTree` 如实报告缺口（`orphans()` / `ensure_complete()` / `render()` 标注 `orphan`），CLI 打 `WARNING`，`session replay` 直接拒绕。`invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden` 钉住这个行为。
 - **待决**：要么接受"运行起点不可回溯"（F7 契约不动），要么改 F7 让 `EventRef` 在事件发出时就分配 `event_id`（影响 Journal 写入路径，F7 仍为 `provisional`）。
 
-**CLI 接线时发现两个既有 bug（均非本次引入，未修）**：
-
-1. `demo()` 只应用了 `CliOverrides { unattended: true }`，**没有**应用 `--checkpoint` / `--no-checkpoint`。所以 `pangu --checkpoint --demo` 会静默不开检查点——用户要求了检查点却没得到，也没有警告。
-2. 自定义相对 `checkpoint.artifact_root`（如 `.pangu/sess-checkpoints`）会让 `--demo` 在一次成功工具动作后报 `checkpoint creation failed`，运行失败；用默认 `.pangu/checkpoints` 则正常。上一提交上可复现，确认与 A1-3 无关。
+**CLI 接线时发现的两个既有 bug（非本次引入，均已修）**：
+- ① `demo()` 只应用了 `CliOverrides { unattended: true }`，**没应用 `--checkpoint` / `--no-checkpoint`**。用户要求了却没得到，**连警告都没有**，而且两个方向都错：`pangu --checkpoint --demo` 静默不开检查点，`--config cfg(enabled=true) --no-checkpoint --demo` 静默照开。
+- ② 曾记为“自定义相对 `checkpoint.artifact_root` 会让 `--demo` 报 `checkpoint creation failed`”——**这条描述是错的，已纠正**。真实原因：快照遍历整个工作区，而默认 `forbidden_globs` 只有 `.git` / `.env` / secrets / 私钥，**不排除构建产物**，本仓库 6.3 GB 的 `target/` 必然撞上 64 MiB 上限。与 `artifact_root` 写相对还是绝对**无关**——用默认的 `.pangu/checkpoints` 一样失败。修法是新增 `checkpoint.exclude_roots`，并把超限错误改成指出具体是哪个文件越界。
 
 **本阶段未做**：`branch` / `fork`。**fork 的工作区隔离完全未解决**，见第 6 节。`SessionNode.history_digest` 依然是死字段——现在有真实的节点与对话可供它记录，赋值仍待做。

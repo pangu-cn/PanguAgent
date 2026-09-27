@@ -361,6 +361,7 @@ artifact_root = ".pangu/checkpoints"
 max_snapshot_bytes = 67108864
 max_snapshot_files = 10000
 max_snapshot_file_bytes = 4194304
+exclude_roots = []
 failure_policy = "fail_run"
 rollback_requires_approval = true
 ```
@@ -370,6 +371,12 @@ rollback_requires_approval = true
 - 老配置没有 `[checkpoint]` 时行为保持不变；
 - `artifact_root` 必须是显式 writable root 内的 canonical 路径；
 - Artifact 自身目录不进入工作区快照；
+- `exclude_roots` 是**用户声明**的排除根（构建产物、缓存），默认空列表。快照遍历整个工作区，而 `forbidden_globs` 默认只挡 `.git`/`.env`/secrets/私钥，所以没有它，仓库里的 `target/` 会让 checkpoint 直接撞上 `max_snapshot_bytes`；
+- **没有内置默认排除列表**：`.gitignore` 不是安全依据，很多项目把真实产出目录写进 `.gitignore`，自动排除会让 rollback 静默丢失这些数据。哪些是可重建的由操作者判断；
+- 排除根的校验在运行开始前完成，拒绝：越出工作区、覆盖整个工作区、等于 `artifact_root`、含 symlink 组件；
+- 排除根经 canonical 化后进入有效 `GoalContract` digest，与 roots/limits 同级；
+- **排除意味着「快照不记录，rollback 也不回退」**：未记录的目录不会进入“目标快照中缺失”的集合，restore 不会删除其中任何文件；
+- **对应代价**：加排除之前拍的 checkpoint 含被排除路径，restore **明确失败并指出是哪个排除根挡住的**，不做部分回退——部分回退会让操作者看到「回退成功」而工作区只回退了一半；
 - 所有大小、文件数和路径限制进入有效 `GoalContract` digest；
 - `backend = "git"` 当前未实现；显式设置会在 runtime 启动时失败，不能由默认值触发 commit；
 - 不允许通过模型参数改变 checkpoint 根目录、限制或 backend；

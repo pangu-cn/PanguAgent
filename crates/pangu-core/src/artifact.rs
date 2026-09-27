@@ -1608,7 +1608,18 @@ fn collect_directory(
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| Error::Other("snapshot byte count overflowed".into()))?;
             if *total_bytes > limits.max_snapshot_bytes {
-                return Err(Error::Other("snapshot exceeds total byte limit".into()));
+                // Name the file that pushed it over. Build output is the usual
+                // cause and the limit message alone does not say so: a bare
+                // "exceeds total byte limit" reads like a corrupted snapshot,
+                // and the operator has no way to learn which directory to
+                // exclude. `relative` shows them, because the path sits inside
+                // the tree that is actually responsible.
+                return Err(Error::Other(format!(
+                    "snapshot exceeds total byte limit ({} bytes) while adding `{relative}`; \
+                     add that directory to checkpoint.exclude_roots if it is build output, \
+                     or raise checkpoint.max_snapshot_bytes",
+                    limits.max_snapshot_bytes
+                )));
             }
             let size = bytes.len() as u64;
             blobs.entry(digest.clone()).or_insert(bytes);
@@ -2409,10 +2420,20 @@ fn target_path(workspace: &Path, request: &SnapshotRequest, relative: &str) -> R
             "restore path is outside snapshot roots".into(),
         ));
     }
-    if is_excluded(&target, &request.excluded_roots) {
-        return Err(Error::Config(
-            "restore path enters the artifact store".into(),
-        ));
+    // Say which root excluded it. `excluded_roots` used to be only the
+    // internal ones, so "enters the artifact store" was the whole story; now
+    // an operator can exclude `target/` and a checkpoint taken before they did
+    // will fail here. Naming the root is the difference between "this run is
+    // misconfigured" and "this checkpoint predates my exclusions".
+    if let Some(root) = request
+        .excluded_roots
+        .iter()
+        .find(|root| target == **root || target.starts_with(root))
+    {
+        return Err(Error::Config(format!(
+            "restore path is inside excluded root `{}`",
+            root.display()
+        )));
     }
     let relative = relative_path(workspace, &target)?;
     for pattern in &request.forbidden_globs {
@@ -2613,6 +2634,111 @@ mod tests {
         assert!(!workspace.join("remove.txt").exists());
         assert!(!workspace.join("new.txt").exists());
         assert!(workspace.join("old-dir").is_dir());
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    /// The property that makes `exclude_roots` safe rather than convenient.
+    /// A directory the snapshot never recorded is a directory the rollback
+    /// never enumerated, so it cannot be in the "missing from the target
+    /// snapshot" set that restore deletes. Without this, excluding `target/`
+    /// to make a snapshot fit would make rollback delete the build output.
+    #[test]
+    fn restore_leaves_an_excluded_root_untouched() {
+        let workspace = root("workspace-excluded-restore");
+        let store_root = workspace.join(".pangu/checkpoints");
+        let store = ArtifactStore::open(&store_root).unwrap();
+        fs::write(workspace.join("kept.txt"), "before").unwrap();
+        fs::create_dir_all(workspace.join("build-output")).unwrap();
+        fs::write(workspace.join("build-output/large.bin"), "regenerable").unwrap();
+        let snapshot_request = SnapshotRequest::new(
+            workspace.clone(),
+            vec![workspace.clone()],
+            vec![store_root.clone(), workspace.join("build-output")],
+            vec!["**/.git/**".into()],
+            SnapshotLimits::default(),
+        );
+        let target = store
+            .commit_snapshot(&snapshot_request, artifact(&workspace, "cp-excluded"))
+            .unwrap();
+        assert!(!target
+            .file_entries
+            .iter()
+            .any(|entry| entry.path.starts_with("build-output")));
+
+        // Everything under the excluded root changes, and one of those changes
+        // is exactly what restore would do to a recorded file: delete it.
+        fs::remove_file(workspace.join("build-output/large.bin")).unwrap();
+        fs::write(workspace.join("build-output/new.bin"), "fresh").unwrap();
+        fs::write(workspace.join("kept.txt"), "changed").unwrap();
+        let expected = store.compute_workspace_digest(&snapshot_request).unwrap();
+        let result = store
+            .restore_checkpoint_with_expected(&snapshot_request, &target, "rb-excluded", &expected)
+            .unwrap();
+
+        assert_eq!(result.disposition, RestoreDisposition::Applied);
+        assert_eq!(
+            fs::read_to_string(workspace.join("kept.txt")).unwrap(),
+            "before",
+            "recorded state is still restored"
+        );
+        assert!(
+            !workspace.join("build-output/large.bin").exists(),
+            "rollback restored a file it never recorded"
+        );
+        assert!(
+            workspace.join("build-output/new.bin").exists(),
+            "rollback deleted a file it never recorded"
+        );
+        assert!(
+            workspace.join("build-output").is_dir(),
+            "rollback removed an excluded directory"
+        );
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    /// A checkpoint taken before an exclusion existed still holds paths under
+    /// what is now excluded. Restoring it has to fail, not quietly skip those
+    /// entries — a partial restore is the worst outcome, because the operator
+    /// sees a successful rollback and a workspace that is half reverted.
+    #[test]
+    fn restore_refuses_a_checkpoint_that_predates_the_exclusion() {
+        let workspace = root("workspace-excluded-later");
+        let store_root = workspace.join(".pangu/checkpoints");
+        let store = ArtifactStore::open(&store_root).unwrap();
+        fs::create_dir_all(workspace.join("build-output")).unwrap();
+        fs::write(workspace.join("build-output/large.bin"), "old").unwrap();
+        let without_exclusion = request(&workspace, &store_root);
+        let target = store
+            .commit_snapshot(
+                &without_exclusion,
+                artifact(&workspace, "cp-before-exclude"),
+            )
+            .unwrap();
+
+        let with_exclusion = SnapshotRequest::new(
+            workspace.clone(),
+            vec![workspace.clone()],
+            vec![store_root, workspace.join("build-output")],
+            vec!["**/.git/**".into()],
+            SnapshotLimits::default(),
+        );
+        let expected = store.compute_workspace_digest(&with_exclusion).unwrap();
+        let error = store
+            .restore_checkpoint_with_expected(
+                &with_exclusion,
+                &target,
+                "rb-before-exclude",
+                &expected,
+            )
+            .expect_err("a checkpoint holding excluded paths must not restore");
+        let message = error.to_string();
+        assert!(
+            message.contains("excluded root") && message.contains("build-output"),
+            "the error must name the root that blocked it: {message}"
+        );
+        // Nothing was touched: the file the checkpoint would have restored is
+        // still there.
+        assert!(workspace.join("build-output/large.bin").exists());
         fs::remove_dir_all(workspace).ok();
     }
 

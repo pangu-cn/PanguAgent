@@ -107,6 +107,14 @@ impl GoalContract {
                 &workspace,
                 &checkpoint.artifact_root,
             )?)?;
+            checkpoint.exclude_roots = checkpoint
+                .exclude_roots
+                .iter()
+                .map(|path| {
+                    absolute_path_from(&workspace, path)
+                        .and_then(|resolved| canonicalize_with_missing(&resolved))
+                })
+                .collect::<Result<Vec<_>>>()?;
         }
         // Same treatment as the checkpoint root: only resolve it when the
         // feature is on, so a disabled section cannot fail the whole contract

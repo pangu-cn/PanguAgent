@@ -45,7 +45,7 @@ max_snapshot_files = 10000
 max_snapshot_file_bytes = 4194304
 # 用户声明的排除根（构建产物、缓存）。默认空：哪些可重建由操作者判断，
 # 不从 .gitignore 推导，因为很多项目把真实产出目录写进 .gitignore。
-exclude_roots = []
+exclude_roots = ["target"]
 failure_policy = "fail_run"
 rollback_requires_approval = true
 

@@ -53,6 +53,10 @@ pub(crate) struct CheckpointRuntime {
     policy_digest: String,
     workspace: PathBuf,
     roots: Vec<PathBuf>,
+    /// User-declared directories to leave out of the snapshot (build output,
+    /// caches). The artifact root and the store's own directory are always
+    /// excluded on top of these.
+    exclude_roots: Vec<PathBuf>,
     forbidden_globs: Vec<String>,
 }
 
@@ -81,6 +85,7 @@ impl CheckpointRuntime {
             policy_digest: contract.policy_digest.clone(),
             workspace: contract.workspace().clone(),
             roots: contract.writable_roots().to_vec(),
+            exclude_roots: contract.checkpoint.exclude_roots.clone(),
             forbidden_globs: contract.forbidden_globs.clone(),
         }))
     }
@@ -103,14 +108,33 @@ impl CheckpointRuntime {
     }
 
     pub(crate) fn request(&self) -> SnapshotRequest {
-        let internal_root = self.workspace.join(".pangu");
         SnapshotRequest::new(
             self.workspace.clone(),
             self.roots.clone(),
-            vec![internal_root, self.artifact_root.clone()],
+            self.excluded_roots(),
             self.forbidden_globs.clone(),
             self.limits,
         )
+    }
+
+    /// The internal roots are always excluded; a snapshot that recorded the
+    /// store it is being written into would try to snapshot its own output.
+    ///
+    /// `.pangu` is kept from the original implementation on purpose: it holds
+    /// the Journal, conversation snapshots and the store itself, none of which
+    /// is workspace state a rollback should be restoring. The artifact root and
+    /// the store root are still listed separately because a run is allowed to
+    /// put them outside `.pangu`.
+    fn excluded_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![
+            self.workspace.join(".pangu"),
+            self.store.root().to_path_buf(),
+            self.artifact_root.clone(),
+        ];
+        roots.extend(self.exclude_roots.iter().cloned());
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     pub(crate) fn store(&self) -> &ArtifactStore {

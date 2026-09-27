@@ -35,7 +35,11 @@ cargo run -q -p pangu -- --demo
 enabled = true
 backend = "artifact"
 artifact_root = ".pangu/checkpoints"
+# 可选：声明可排除的构建产物/缓存目录（默认空，详见 docs/adr/0001）
+exclude_roots = ["target"]
 ```
+
+> 快照遍历整个工作区，且默认**不排除构建产物**。仓库里若有巨大的 `target/`，checkpoint 会撞上 `max_snapshot_bytes` 而失败——错误信息会指出具体是哪个文件越界。排除是有代价的：被排除的目录不会被回退，只能排除真正可重建的内容。
 
 并为 `rollback` 提供显式 Policy 规则（例如 `effect = "ask"`）。运行开关是全局 `--checkpoint`（别名 `--enable-checkpoint`）；rollback 目标使用 `--checkpoint-id`（别名 `--target-checkpoint`），避免参数冲突：
 

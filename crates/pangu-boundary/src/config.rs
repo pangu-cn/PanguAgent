@@ -63,6 +63,17 @@ pub struct CheckpointSection {
     pub max_snapshot_file_bytes: u64,
     pub failure_policy: CheckpointFailurePolicy,
     pub rollback_requires_approval: bool,
+    /// Directories to leave out of the snapshot.
+    ///
+    /// Build output is the reason this exists. A snapshot walks the whole
+    /// workspace, and a Rust `target/` is routinely gigabytes, so a
+    /// checkpoint in an ordinary repo hits `max_snapshot_bytes` and fails the
+    /// run. There is deliberately no built-in default list: `.gitignore` is
+    /// not a safe basis for one, because plenty of projects gitignore real
+    /// work (data and output directories) — silently dropping those from a
+    /// snapshot would make rollback lose them. Deciding what is
+    /// regenerable is the user's call, not a default.
+    pub exclude_roots: Vec<PathBuf>,
 }
 
 /// Persisted conversation history, so an interrupted run can resume.
@@ -104,6 +115,7 @@ impl Default for CheckpointSection {
             max_snapshot_file_bytes: 4 * 1024 * 1024,
             failure_policy: CheckpointFailurePolicy::FailRun,
             rollback_requires_approval: true,
+            exclude_roots: Vec::new(),
         }
     }
 }
@@ -168,6 +180,33 @@ impl CheckpointSection {
             return Err(Error::Config(
                 "checkpoint.artifact_root must be inside a writable root".into(),
             ));
+        }
+        // An exclusion that reaches outside the workspace, or that swallows the
+        // whole workspace, would quietly turn the snapshot into something other
+        // than what it claims to be. Both are rejected here rather than at
+        // snapshot time, so the mistake is reported before a run starts.
+        for (index, exclude) in self.exclude_roots.iter().enumerate() {
+            let path = absolute_path_from(&workspace, exclude)?;
+            let resolved = canonicalize_with_missing(&path)?;
+            // Containment first, symlink check second. A `../escape` also
+            // fails the symlink-component test, and reporting that instead
+            // would send the operator looking for a symlink that is not there.
+            if !path_starts_with(&resolved, &workspace) || same_path(&resolved, &workspace) {
+                return Err(Error::Config(format!(
+                    "checkpoint.exclude_roots[{index}] must be a subdirectory of the workspace"
+                )));
+            }
+            if path_has_symlink_component_under(&workspace, &path) {
+                return Err(Error::Config(format!(
+                    "checkpoint.exclude_roots[{index}] must not contain symlink components"
+                )));
+            }
+            if same_path(&resolved, &artifact_root) {
+                return Err(Error::Config(format!(
+                    "checkpoint.exclude_roots[{index}] must not be the artifact root; it is \
+                     already excluded"
+                )));
+            }
         }
         Ok(())
     }
@@ -1078,5 +1117,79 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("max_turns"));
+    }
+
+    /// A workspace with checkpointing on, for exercising `exclude_roots`.
+    fn checkpoint_config(label: &str) -> (std::path::PathBuf, Config) {
+        let root = test_temp_root().join(format!(
+            "pangu-exclude-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.checkpoint.enabled = true;
+        config.checkpoint.artifact_root = std::path::PathBuf::from(".pangu/checkpoints");
+        (root, config)
+    }
+
+    /// Excluding the artifact root is redundant, not harmful — it is already
+    /// excluded — so rejecting it is about not letting a config read as if the
+    /// store were at risk when it is not. Worth a test because the reason is
+    /// not obvious from the rule.
+    #[test]
+    fn exclude_roots_rejects_the_artifact_root() {
+        let (root, mut config) = checkpoint_config("artifact-root");
+        config.checkpoint.exclude_roots = vec![std::path::PathBuf::from(".pangu/checkpoints")];
+        let error = config.validate().expect_err("excluding the artifact root");
+        assert!(
+            error.to_string().contains("must not be the artifact root"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A symlinked exclusion is the same class of trick as a symlinked
+    /// artifact root: the path the operator wrote and the path the snapshot
+    /// walks are not the same directory, so the exclusion can be made to mean
+    /// something other than it says.
+    #[cfg(unix)]
+    #[test]
+    fn exclude_roots_rejects_a_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+        let (root, mut config) = checkpoint_config("symlink");
+        let real = root.join("real-output");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, root.join("linked-output")).unwrap();
+        config.checkpoint.exclude_roots = vec![std::path::PathBuf::from("linked-output")];
+        let error = config.validate().expect_err("excluding through a symlink");
+        assert!(
+            error.to_string().contains("symlink components"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The exclusions are part of what a snapshot *is*, so they belong in the
+    /// contract digest alongside the roots and the limits. Two runs whose
+    /// snapshots differ must not share a digest, or a verified action could be
+    /// attributed to a contract that would have produced a different artifact.
+    #[test]
+    fn exclude_roots_change_the_contract_digest() {
+        let (root, mut config) = checkpoint_config("digest");
+        let base = crate::goal::GoalContract::from_config("without exclusions", &config).unwrap();
+        config.checkpoint.exclude_roots = vec![std::path::PathBuf::from("build-output")];
+        let excluded = crate::goal::GoalContract::from_config("with exclusions", &config).unwrap();
+        assert_ne!(base.digest(), excluded.digest());
+        // And the paths must be effective, not the raw config spelling, or the
+        // same directory written two ways would produce two digests.
+        assert!(excluded.checkpoint.exclude_roots[0].is_absolute());
+        std::fs::remove_dir_all(root).ok();
     }
 }

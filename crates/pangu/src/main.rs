@@ -839,8 +839,20 @@ async fn rollback_command(
 async fn demo(args: &Cli) -> Result<()> {
     eprintln!("WARNING: unattended demo mode; no human approval will be requested");
     let (config, files) = Config::load(args.config.as_deref())?;
+    // `--checkpoint` / `--no-checkpoint` are runtime overrides, so they have
+    // to be applied here too. Without this, `pangu --checkpoint --demo` and
+    // `pangu --config cfg-with-checkpoint-off --demo` would quietly disagree
+    // with what the operator asked for, in opposite directions, and neither
+    // would say so.
     let mut config = config.apply(&CliOverrides {
         unattended: true,
+        checkpoint_enabled: if args.checkpoint {
+            Some(true)
+        } else if args.no_checkpoint {
+            Some(false)
+        } else {
+            None
+        },
         ..Default::default()
     })?;
     // The scripted demo has no external billing. Declare its zero price
