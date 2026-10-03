@@ -17,7 +17,7 @@ use pangu_agent::{
     ToolExecutor, ToolOutput, VerifiedAction,
 };
 use pangu_boundary::{Risk, Sandbox};
-use pangu_core::{short_hash, MemoryStore, ToolCall, ToolSpec};
+use pangu_core::{short_hash, MemoryStore, SkillRegistry, ToolCall, ToolSpec};
 
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -33,6 +33,9 @@ pub struct Toolkit {
     /// `propose_memory` tool does not exist, exactly as if B3 were not
     /// compiled in.
     memory: Option<std::sync::Arc<MemoryStore>>,
+    /// B2: the skill registry. `None` = the `read_skill` tool does not
+    /// exist, exactly as if B2 were not compiled in.
+    skills: Option<std::sync::Arc<SkillRegistry>>,
 }
 
 impl Toolkit {
@@ -47,6 +50,7 @@ impl Toolkit {
         Self {
             verify_command: command,
             memory: None,
+            skills: None,
         }
     }
 
@@ -55,6 +59,13 @@ impl Toolkit {
     /// CLI actions outside any run.
     pub fn with_memory(mut self, store: std::sync::Arc<MemoryStore>) -> Self {
         self.memory = Some(store);
+        self
+    }
+
+    /// B2: attach the skill registry. The model can only read a skill's
+    /// instruction document; scripts are registered but never executed.
+    pub fn with_skills(mut self, registry: std::sync::Arc<SkillRegistry>) -> Self {
+        self.skills = Some(registry);
         self
     }
 
@@ -191,6 +202,23 @@ impl Toolkit {
                 timeout_ms: None,
             });
         }
+        // B2: read_skill reads one installed skill's instruction document.
+        // The registry lives under the `.pangu` forbidden glob; the tool's
+        // read target comes from operator-installed state, never from model
+        // output.
+        if self.skills.is_some() {
+            capabilities.push(Capability {
+                name: "read_skill".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec![".pangu/skills".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            });
+        }
         CapabilityManifest::new(capabilities)
     }
 }
@@ -297,6 +325,19 @@ impl ToolExecutor for Toolkit {
                     "additionalProperties": false,
                     "required": [],
                     "properties": {}
+                }),
+            ));
+        }
+        // B2: advertise read_skill only when the registry is attached.
+        if self.skills.is_some() {
+            specs.push(ToolSpec::new(
+                "read_skill",
+                "Read the instruction document (SKILL.md) of one installed skill by name.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name"],
+                    "properties": {"name": {"type": "string", "minLength": 1}}
                 }),
             ));
         }
@@ -473,6 +514,23 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "read_skill" => {
+                ensure_allowed_keys(&call.args, &["name"])?;
+                let registry = self
+                    .skills
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("read_skill tool is not configured"))?;
+                let name = required_string(&call.args, "name")?;
+                if name.len() > 64 {
+                    bail!("skill name is too long");
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                    EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                );
+                assessment = assessment.read(registry.dir().to_path_buf());
+                assessment.preview = format!("read_skill name={}", name);
+                Ok(assessment)
+            }
             "propose_memory" => {
                 ensure_allowed_keys(&call.args, &["content", "kind"])?;
                 let store = self
@@ -556,6 +614,13 @@ impl ToolExecutor for Toolkit {
                     .clone()
                     .ok_or_else(|| anyhow!("propose_memory tool is not configured"))?;
                 execute_propose_memory(action, &store)
+            }
+            "read_skill" => {
+                let registry = self
+                    .skills
+                    .clone()
+                    .ok_or_else(|| anyhow!("read_skill tool is not configured"))?;
+                execute_read_skill(action, &registry)
             }
             other => bail!("tool `{other}` has no executor"),
         }
@@ -988,6 +1053,22 @@ async fn execute_verify(action: &VerifiedAction) -> Result<ToolOutput> {
 /// B3: append a pending memory candidate. The output carries the id and the
 /// content digest only — the agent audits the proposal into the journal
 /// without the raw content.
+/// B2: return one skill's instruction document. The model supplies only the
+/// name; the path comes from the operator-installed registry.
+fn execute_read_skill(action: &VerifiedAction, registry: &SkillRegistry) -> Result<ToolOutput> {
+    let call = action.call();
+    let name = call
+        .args
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("read_skill name is missing"))?;
+    let doc = registry.read_doc(name)?;
+    Ok(ToolOutput {
+        content: doc,
+        evidence: Some(format!("skill:{}", name)),
+    })
+}
+
 fn execute_propose_memory(action: &VerifiedAction, store: &MemoryStore) -> Result<ToolOutput> {
     let call = action.call();
     let content = call

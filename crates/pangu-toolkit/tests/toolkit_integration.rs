@@ -11,7 +11,7 @@ use pangu_boundary::{
     ApprovalMode, Config, FallbackCandidate, GoalContract, Policy, Rule, Sandbox, ScriptedApproval,
 };
 use pangu_core::{ChatResponse, EventKind, MemSink, Message, ToolCall, ToolSpec, Usage};
-use pangu_core::{MemoryLimits, MemoryStatus, MemoryStore};
+use pangu_core::{MemoryLimits, MemoryStatus, MemoryStore, SkillLimits, SkillLock, SkillRegistry};
 use pangu_toolkit::Toolkit;
 use serde_json::json;
 
@@ -1616,5 +1616,260 @@ fn pangu_owned_storage_is_never_tool_writable() {
         outcome,
         pangu_boundary::sandbox::ResolveOutcome::Allowed(_)
     ));
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+// ---- B2: skill registry and signed packages -------------------------------
+
+/// Install a skill package into `<workspace>/.pangu/skills/` the way the CLI
+/// would: compute the lock from a source dir, copy locked files, write the
+/// lock. Returns the lock for assertions.
+fn install_skill(workspace: &Path, name: &str, description: &str, doc: &str) -> SkillLock {
+    let source = workspace.join(format!("src-{name}"));
+    std::fs::create_dir_all(&source).expect("source dir");
+    std::fs::write(
+        source.join("SKILL.toml"),
+        format!(
+            "schema = \"pangu-skill-manifest/1\"\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"{description}\"\nfiles = [\"SKILL.md\"]\nscripts = []\n"
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(source.join("SKILL.md"), doc).expect("doc");
+    let lock =
+        pangu_core::skills::compute_lock(&source, &SkillLimits::default()).expect("compute lock");
+    let target = workspace.join(".pangu").join("skills").join(name);
+    std::fs::create_dir_all(&target).expect("target");
+    for file in &lock.files {
+        let from = source.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let to = target.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        std::fs::copy(&from, &to).expect("copy");
+    }
+    std::fs::write(
+        target.join("skill.lock"),
+        serde_json::to_string_pretty(&lock).expect("lock json"),
+    )
+    .expect("write lock");
+    lock
+}
+
+fn build_skills_agent(
+    root: &Path,
+    registry: Arc<SkillRegistry>,
+    provider: Arc<dyn Provider>,
+) -> (Agent, Arc<MemSink>) {
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    config.model.input_usd_per_mtok = Some(0.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    config.skills.enabled = true;
+    let contract = GoalContract::from_config("b2 test", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let sink = Arc::new(MemSink::default());
+    let agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new().with_skills(registry.clone())),
+        approval,
+        sink.clone(),
+    )
+    .expect("agent")
+    .with_skills(registry);
+    (agent, sink)
+}
+
+#[tokio::test]
+async fn skill_index_is_injected_and_the_doc_is_readable() {
+    let root = temp_root("b2-index");
+    std::fs::write(root.join("note.txt"), "data\n").expect("seed");
+    let lock = install_skill(
+        &root,
+        "release-checklist",
+        "how to cut a release",
+        "# Release\n\n1. Run the tests. 2. Tag the commit.\n",
+    );
+    let registry = Arc::new(
+        SkillRegistry::load(
+            &root.join(".pangu").join("skills"),
+            &SkillLimits::default(),
+            None,
+        )
+        .expect("registry"),
+    );
+    assert_eq!(registry.skills().len(), 1);
+    assert_eq!(
+        registry.skills()[0].lock.package_digest,
+        lock.package_digest
+    );
+
+    let read = response_with_usage(
+        vec![ToolCall::new(
+            "read_skill",
+            json!({"name": "release-checklist"}),
+        )],
+        0,
+    );
+    let provider = Arc::new(RecordingProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(vec![read, finish_response()].into()),
+        captured: Mutex::new(Vec::new()),
+    });
+    let (agent, _sink) = build_skills_agent(&root, registry, provider.clone());
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+
+    // The system turn the model saw carried the labeled skill index.
+    let captured = provider.captured.lock().expect("captured lock");
+    let system = captured[0]
+        .iter()
+        .find(|message| matches!(message, Message::System { .. }))
+        .expect("system turn");
+    let Message::System { content } = system else {
+        panic!("expected system message")
+    };
+    assert!(content.contains("Installed skills"), "{content}");
+    assert!(content.contains("release-checklist v1.0.0 [unsigned]"));
+    assert!(content.contains("carry no permissions"));
+    // The read_skill result reached the conversation as a tool message in
+    // the turn after the call.
+    let tool_message = captured
+        .iter()
+        .flat_map(|messages| messages.iter())
+        .find(|message| matches!(message, Message::Tool { name, .. } if name == "read_skill"))
+        .expect("read_skill tool result");
+    let Message::Tool { content, .. } = tool_message else {
+        panic!("expected tool message")
+    };
+    assert!(content.contains("Tag the commit"));
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn tampered_skill_diverges_from_the_frozen_contract_and_fails_the_run() {
+    let root = temp_root("b2-tamper");
+    std::fs::write(root.join("note.txt"), "data\n").expect("seed");
+    install_skill(
+        &root,
+        "release-checklist",
+        "how to cut a release",
+        "# Release\n",
+    );
+    // The contract freezes the skill set from the intact registry...
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    config.model.input_usd_per_mtok = Some(0.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    config.skills.enabled = true;
+    let contract = GoalContract::from_config("b2 tamper", &config).expect("goal contract");
+    assert_eq!(contract.skills().skills.len(), 1);
+
+    // ...then the package is tampered with: the loaded registry is now
+    // missing the skill, and the run refuses to start rather than silently
+    // operating with a different set than the contract froze.
+    let doc = root
+        .join(".pangu")
+        .join("skills")
+        .join("release-checklist")
+        .join("SKILL.md");
+    std::fs::write(&doc, "# replaced by an attacker\n").expect("tamper");
+    let registry = Arc::new(
+        SkillRegistry::load(
+            &root.join(".pangu").join("skills"),
+            &SkillLimits::default(),
+            None,
+        )
+        .expect("registry"),
+    );
+    assert!(registry.rejected().len() == 1);
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new().with_skills(registry.clone())),
+        approval,
+        Arc::new(MemSink::default()),
+    )
+    .expect("agent")
+    .with_skills(registry);
+    let error = match agent.run().await {
+        Err(error) => error,
+        Ok(outcome) => panic!("expected a failed run, got {:?}", outcome.status),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not match GoalContract frozen skill set"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn skills_disabled_refuses_an_advertising_toolkit() {
+    let root = temp_root("b2-disabled");
+    let registry = Arc::new(
+        SkillRegistry::load(
+            &root.join(".pangu").join("skills"),
+            &SkillLimits::default(),
+            None,
+        )
+        .expect("registry"),
+    );
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.model.input_usd_per_mtok = Some(0.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    // skills stay disabled
+    let contract = GoalContract::from_config("b2 off", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let error = match Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new().with_skills(registry.clone())),
+        approval,
+        Arc::new(MemSink::default()),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a toolkit advertising read_skill must be refused when disabled"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("read_skill advertisement does not match"),
+        "{error}"
+    );
     std::fs::remove_dir_all(root).expect("cleanup");
 }

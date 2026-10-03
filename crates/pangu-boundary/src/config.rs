@@ -47,6 +47,9 @@ pub struct Config {
     /// tool, no injection, no digest change.
     #[serde(default)]
     pub memory: MemorySection,
+    /// B2: the skill registry. Disabled by default: nothing loads.
+    #[serde(default)]
+    pub skills: SkillsSection,
 }
 
 /// B3: controlled memory candidate queue configuration. Disabled by default:
@@ -72,6 +75,52 @@ impl Default for MemorySection {
             max_kind_bytes: 32,
             max_injected: 24,
             max_injected_bytes: 16_384,
+        }
+    }
+}
+
+/// B2: skill registry configuration. Disabled by default: nothing loads,
+/// nothing is advertised, nothing is injected, digests are unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillsSection {
+    pub enabled: bool,
+    /// Pinned ed25519 public key (64 hex chars). Empty = signatures are not
+    /// checked and packages load with an honest `unsigned` marker.
+    pub verify_key: String,
+    pub max_skills: usize,
+    pub max_files: usize,
+    pub max_file_bytes: usize,
+    pub max_doc_bytes: usize,
+    pub max_index_skills: usize,
+    pub max_index_bytes: usize,
+}
+
+impl Default for SkillsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            verify_key: String::new(),
+            max_skills: 64,
+            max_files: 64,
+            max_file_bytes: 262_144,
+            max_doc_bytes: 65_536,
+            max_index_skills: 48,
+            max_index_bytes: 8_192,
+        }
+    }
+}
+
+impl SkillsSection {
+    /// The runtime limits derived from this section.
+    pub fn limits(&self) -> pangu_core::SkillLimits {
+        pangu_core::SkillLimits {
+            max_skills: self.max_skills,
+            max_files: self.max_files,
+            max_file_bytes: self.max_file_bytes,
+            max_doc_bytes: self.max_doc_bytes,
+            max_index_skills: self.max_index_skills,
+            max_index_bytes: self.max_index_bytes,
         }
     }
 }
@@ -697,6 +746,47 @@ impl Config {
             }
             pangu_core::Glob::new(pattern)?;
         }
+        // B2: bounded skill registry behavior + a well-formed pinned key.
+        let skills = &self.skills;
+        if skills.enabled {
+            if skills.max_skills == 0 || skills.max_skills > 1_024 {
+                return Err(Error::Config(
+                    "skills.max_skills must be between 1 and 1024".into(),
+                ));
+            }
+            if skills.max_files == 0 || skills.max_files > 1_024 {
+                return Err(Error::Config(
+                    "skills.max_files must be between 1 and 1024".into(),
+                ));
+            }
+            if skills.max_file_bytes < 64 || skills.max_file_bytes > 16_777_216 {
+                return Err(Error::Config(
+                    "skills.max_file_bytes must be between 64 and 16777216".into(),
+                ));
+            }
+            if skills.max_doc_bytes < 64 || skills.max_doc_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "skills.max_doc_bytes must be between 64 and 1048576".into(),
+                ));
+            }
+            if skills.max_index_skills > 512 {
+                return Err(Error::Config(
+                    "skills.max_index_skills must be at most 512".into(),
+                ));
+            }
+            if skills.max_index_bytes < 256 || skills.max_index_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "skills.max_index_bytes must be between 256 and 1048576".into(),
+                ));
+            }
+            let key = skills.verify_key.trim();
+            if !key.is_empty() && (key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit())) {
+                return Err(Error::Config(
+                    "skills.verify_key must be 64 hex chars (an ed25519 public key) or empty"
+                        .into(),
+                ));
+            }
+        }
         // B3: bounded memory behavior. The bounds must themselves be bounded
         // so a misconfigured store cannot silently disable the guarantees.
         let memory = &self.memory;
@@ -1206,8 +1296,24 @@ impl Config {
             }
             None => "provider       : <unresolvable>\n".to_string(),
         };
+        let memory_line = if self.memory.enabled {
+            "memory         : enabled — proposals queue under .pangu/memory; accept/reject via `pangu memory`\n"
+                .to_string()
+        } else {
+            String::new()
+        };
+        let skills_line = if self.skills.enabled {
+            let key = if self.skills.verify_key.trim().is_empty() {
+                "no pinned key (unsigned/signed-unverified only)"
+            } else {
+                "verify_key pinned"
+            };
+            format!("skills         : enabled — registry under .pangu/skills; {key}\n")
+        } else {
+            String::new()
+        };
         format!(
-            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}\nrules:\n{}\n",
+            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{memory_line}{skills_line}\nrules:\n{}\n",
             self.boundary_digest(),
             self.workspace_abs().display(),
             self.boundary.writable_roots,
@@ -1969,6 +2075,26 @@ control"
         assert!(enabled.memory().enabled);
         assert_eq!(enabled.memory().max_pending, 7);
         assert_ne!(disabled.digest(), enabled.digest());
+    }
+
+    /// B2: skills enabled changes the digest and freezes the loaded set.
+    #[test]
+    fn skills_freeze_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        let disabled = crate::goal::GoalContract::from_config("b2 off", &base).unwrap();
+        assert!(!disabled.skills().enabled);
+
+        let mut enabled_config = base.clone();
+        enabled_config.skills.enabled = true;
+        let enabled = crate::goal::GoalContract::from_config("b2 on", &enabled_config).unwrap();
+        assert!(enabled.skills().enabled);
+        assert!(enabled.skills().skills.is_empty()); // nothing installed here
+        assert_ne!(disabled.digest(), enabled.digest());
+
+        // A malformed pinned key fails at config time.
+        enabled_config.skills.verify_key = "not-hex".into();
+        let error = enabled_config.validate().expect_err("bad verify_key");
+        assert!(error.to_string().contains("verify_key"), "{error}");
     }
 
     /// B3: the memory bounds must themselves be sane when the queue is on.

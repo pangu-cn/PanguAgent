@@ -21,6 +21,7 @@ pub mod messages;
 pub mod replay;
 pub mod repomap;
 pub mod session;
+pub mod skills;
 pub mod slice;
 pub mod stream;
 pub mod summary;
@@ -68,6 +69,11 @@ pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
 pub use repomap::{
     build as build_repomap, fingerprint as repomap_fingerprint, view as repomap_view, FileEntry,
     MapView, RepoMap, RepoMapOptions, Symbol,
+};
+pub use skills::{
+    RejectedSkill, SkillFileEntry, SkillLimits, SkillLock, SkillManifest, SkillRegistry,
+    SkillSignatureState, SKILL_DOC_FILE, SKILL_LOCK_FILE, SKILL_LOCK_SCHEMA, SKILL_MANIFEST_FILE,
+    SKILL_MANIFEST_SCHEMA,
 };
 pub use slice::{
     extend as extend_slices, slice, verify as verify_slices, ConversationSlices, SliceEntry,

@@ -23,8 +23,8 @@ use pangu_boundary::{
 use pangu_core::{
     assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event,
     EventKind, EventSink, FailureClass, JournalMeta, MemoryStore, Message, RestoreDisposition,
-    RollbackOperation, RollbackRequest, ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1,
-    JOURNAL_FORMAT_V2,
+    RollbackOperation, RollbackRequest, SkillRegistry, ToolCall, ToolSpec, Usage, Value,
+    JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
 };
 
 pub mod capability;
@@ -380,6 +380,9 @@ pub struct Agent {
     /// enables the queue; used to inject accepted, clearly-labeled memory
     /// into fresh runs.
     memory: Option<Arc<MemoryStore>>,
+    /// B2: the skill registry. Attached only when the contract enables the
+    /// registry; used to inject the skill index and to pin the readable set.
+    skills: Option<Arc<SkillRegistry>>,
 }
 
 impl Agent {
@@ -439,6 +442,14 @@ impl Agent {
                 "tool executor's propose_memory advertisement does not match GoalContract memory.enabled"
             ));
         }
+        // B2: the read_skill advertisement must match the contract the same
+        // way.
+        let skills_advertised = tools.specs().iter().any(|spec| spec.name == "read_skill");
+        if contract.skills.enabled != skills_advertised {
+            return Err(anyhow!(
+                "tool executor's read_skill advertisement does not match GoalContract skills.enabled"
+            ));
+        }
         if contract.policy_digest != policy.digest() {
             return Err(anyhow!(
                 "GoalContract and Policy do not describe the same rule set"
@@ -480,6 +491,7 @@ impl Agent {
             conversation: conversation.map(Arc::new),
             resume_from: None,
             memory: None,
+            skills: None,
         })
     }
 
@@ -488,6 +500,15 @@ impl Agent {
     /// the contract enables the queue but no store was attached.
     pub fn with_memory(mut self, store: Arc<MemoryStore>) -> Self {
         self.memory = Some(store);
+        self
+    }
+
+    /// B2: attach the skill registry. The same registry instance must back
+    /// the toolkit's `read_skill` tool; the run refuses to start if the
+    /// contract enables the registry but no registry was attached, or if the
+    /// loaded set diverges from the contract-frozen one.
+    pub fn with_skills(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.skills = Some(registry);
         self
     }
 
@@ -1348,6 +1369,68 @@ impl Agent {
         }
     }
 
+    /// B2: the run's skill registry must exist when enabled and must match
+    /// the contract-frozen skill set position by position (name, version,
+    /// package digest, signing status). Rejected packages are audible `Note`
+    /// events — a skill that fails its integrity check is never silently
+    /// skipped.
+    async fn check_skills_binding(&self) -> Result<()> {
+        if !self.contract.skills.enabled {
+            return Ok(());
+        }
+        let registry = self.skills.as_ref().ok_or_else(|| {
+            anyhow!(
+                "GoalContract enables the skill registry but no registry was attached;                  build the agent with `with_skills`"
+            )
+        })?;
+        for rejected in registry.rejected() {
+            self.emit(self.event(
+                EventKind::Note,
+                0,
+                format!(
+                    "skill `{}` rejected: {}",
+                    rejected.dir_name, rejected.reason
+                ),
+            ))
+            .await?;
+        }
+        let frozen = &self.contract.skills.skills;
+        let loaded = registry.skills();
+        if frozen.len() != loaded.len() {
+            anyhow::bail!(
+                "loaded skill set ({}) does not match GoalContract frozen skill set ({})",
+                loaded.len(),
+                frozen.len()
+            );
+        }
+        for (frozen, loaded) in frozen.iter().zip(loaded.iter()) {
+            if frozen.name != loaded.name
+                || frozen.version != loaded.version
+                || frozen.package_digest != loaded.lock.package_digest
+                || frozen.signed != loaded.signature_verified()
+            {
+                anyhow::bail!(
+                    "skill `{}` does not match the GoalContract-frozen entry (name/version/digest/signature)",
+                    loaded.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// B2: the skill index injection block for this run, or `None`.
+    fn skills_index_block(&self) -> Result<Option<String>> {
+        if !self.contract.skills.enabled {
+            return Ok(None);
+        }
+        let registry = self.skills.as_ref().ok_or_else(|| {
+            anyhow!(
+                "GoalContract enables the skill registry but no registry was attached;                  build the agent with `with_skills`"
+            )
+        })?;
+        Ok(registry.index_block())
+    }
+
     /// B3: the accepted-memory injection block for this run, or `None`. The
     /// store must exist when the contract enables the queue.
     fn memory_block(&self) -> Result<Option<String>> {
@@ -1364,6 +1447,7 @@ impl Agent {
     }
 
     async fn run_inner(&self) -> Result<Outcome> {
+        self.check_skills_binding().await?;
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut evidence = Vec::new();
@@ -1378,14 +1462,22 @@ impl Agent {
             None => {
                 let mut seeded =
                     conversation::seed_history(self.contract.system_prompt(), &self.contract.goal);
-                // B3: fresh runs get the accepted-memory block appended to the
-                // system turn, explicitly labeled untrusted. Resumed runs keep
-                // the memory block from when they were seeded — no mid-history
-                // context mutation.
+                // B3/B2: fresh runs get the accepted-memory block and the
+                // skill index appended to the system turn, both explicitly
+                // labeled. Resumed runs keep the blocks from when they were
+                // seeded — no mid-history context mutation.
+                let mut appended = String::new();
                 if let Some(block) = self.memory_block()? {
+                    appended.push_str("\n\n");
+                    appended.push_str(&block);
+                }
+                if let Some(block) = self.skills_index_block()? {
+                    appended.push_str("\n\n");
+                    appended.push_str(&block);
+                }
+                if !appended.is_empty() {
                     if let Some(pangu_core::Message::System { content }) = seeded.first_mut() {
-                        content.push_str("\n\n");
-                        content.push_str(&block);
+                        content.push_str(&appended);
                     }
                 }
                 seeded
@@ -2015,14 +2107,14 @@ impl Agent {
             hosts: assessment.hosts.clone(),
             argv: assessment.argv.clone(),
             cwd: assessment.cwd.clone(),
-            // B3: `propose_memory` writes exactly one Pangu-owned path (the
-            // store file declared in its manifest entry) whose location comes
-            // from the operator's config, never from model output. The
-            // forbidden globs exist to keep model-controlled tool paths out
-            // of Pangu-owned storage; the sanctioned writer itself is
-            // validated with the internal rule set (root containment,
-            // symlinks, limits) instead.
-            internal: call.name == "propose_memory",
+            // B3/B2: `propose_memory` writes and `read_skill` reads exactly
+            // one Pangu-owned location (declared in their manifest entries)
+            // whose path comes from the operator's config, never from model
+            // output. The forbidden globs exist to keep model-controlled tool
+            // paths out of Pangu-owned storage; the sanctioned tools
+            // themselves are validated with the internal rule set (root
+            // containment, symlinks, limits) instead.
+            internal: call.name == "propose_memory" || call.name == "read_skill",
         };
         let resources = match self.sandbox.validate_resources(&resource_request) {
             Ok(resources) => resources,

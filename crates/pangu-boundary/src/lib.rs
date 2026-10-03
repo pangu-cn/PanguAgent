@@ -19,7 +19,7 @@ pub use approval::{
 pub use budget::{Breach, Budget};
 pub use config::{
     BoundaryConfig, BoundarySection, CheckpointBackend, CheckpointFailurePolicy, CheckpointSection,
-    CliOverrides, Config, EnvSection, FallbackCandidate, MemorySection,
+    CliOverrides, Config, EnvSection, FallbackCandidate, MemorySection, SkillsSection,
 };
 pub use execution::{ExecutionProfile, ExecutionSection};
 pub use explain::{

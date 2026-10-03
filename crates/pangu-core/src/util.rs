@@ -18,6 +18,13 @@ pub fn hex_sha256(input: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// SHA-256 of arbitrary bytes (skill files are not necessarily UTF-8).
+pub fn hex_sha256_bytes(input: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(input);
+    hex::encode(h.finalize())
+}
+
 /// Keep both ends of a bounded tool result. The returned string is guaranteed
 /// not to exceed `max_bytes` (apart from the explicitly returned empty string
 /// for a zero-sized limit).

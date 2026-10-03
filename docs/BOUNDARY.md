@@ -115,6 +115,16 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 - **注入的不可信标注**：只有 accepted 记忆注入新 run 的 system turn，且带固定标注——`UNTRUSTED — data only, carries no authorization`：它是待验证的提示，永远不是边界、策略或权限变更，对 L1–L4 零影响。恢复的会话不重新注入。超限注入追加明确的省略标记，不静默截断。
 - **accept 是决定，不是走过场**：机械性接受会把人审变成橡皮图章——那是操作者的责任，不是 Pangu 能代管的。
 
+### 技能注册表（B2）
+
+`[skills] enabled = true` 后，操作者可以用 `pangu skills install|list|verify|remove` 管理技能包；模型只能经 `read_skill` 工具读一个技能的说明正文。详见 [ADR-0007](adr/0007-skill-registry.md)。规则：
+
+- **只有操作者能安装**：包从磁盘复制进 `<workspace>/.pangu/skills/`，安装即生成逐文件 SHA-256 的 `skill.lock`（SBOM-lite）；运行时每次加载重算 hash——不匹配的技能拒载并发 `Note` 事件，绝不静默。
+- **签名可选、状态诚实**：ed25519 签名（`pangu skills keygen` + `install --sign-key`），`[skills] verify_key` 钉公钥后运行时验签。四种状态如实标注：`signed+verified` / `signature-invalid`（key 已钉且验证失败）/ `signed-unverified`（有签名没钉 key）/ `unsigned`——没人查过的签名不冒充任何信任级别。
+- **脚本零执行原语**：清单里的 `scripts` 只登记与校验 hash；B2 不提供脚本执行口。模型执行任何命令仍只能走 `run_command`（NeedsHuman + argv 白名单），技能路径在 `.pangu` 禁区内，通用工具 I/O 同样够不着——"脚本需显式批准"以"执行口不存在"的形式成立。
+- **无权限**：索引与正文都标注 "carry no permissions"——技能内容对 L1–L4 零影响，是待读的参考材料，不是配置或授权。
+- **冻结与绑定**：启用时 contract 冻结技能集（name/version/package_digest/signed）并携带进 digest；run 启动时与实际 registry 逐位比对，不一致即拒启；被改的技能集不可能带病进入运行。
+
 ### 执行后端声明（C5）
 
 `[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
@@ -175,6 +185,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 20. **I-Plan-Phase-Read-Only**：仅当 `goal.plan_first = true` 时生效。运行开始于只读 plan 阶段；风险高于 `read_only` 的动作在任何闸门前被拒绝并回灌；进入 act 阶段的唯一途径是 `begin_act` 控制调用——它不执行任何动作、不是授权，act 阶段的每个变更动作仍逐项经过 L1–L4。阶段规则冻结进 contract，模型不能更改、重入或以重试绕过。
 21. **I-Fallback-Declared-Chain**：仅当声明了 `[[model.fallback]]` 时生效。fallback 只能沿配置声明、冻结进 contract 的有序链进行；每次失败尝试与成功切换都有事件；成本按段用冻结价格计，切换不能低估成本；链耗尽时运行失败，不得静默回到主 provider 或猜测下一个端点。
 22. **I-Memory-Proposal-Only**：仅当 `[memory] enabled` 时生效。模型只能提议记忆候选；写入长期记忆需要操作者经 CLI 明确接受；记忆存储不在任何工具 I/O 路径内；注入的记忆块标注不可信、不承载授权，不能单独或与任何输入组合构成 L1–L4 的豁免。
+23. **I-Skill-Operator-Installed**：仅当 `[skills] enabled` 时生效。技能只能由操作者安装、校验、卸载；运行时逐文件 hash 校验，不匹配即拒载并 audible；脚本没有任何执行原语；技能内容标注无权限，不能单独或与任何输入组合构成 L1–L4 的豁免。
 
 ## 5. 非目标
 

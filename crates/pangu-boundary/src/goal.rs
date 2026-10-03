@@ -20,6 +20,26 @@ pub struct ContractFallback {
     pub output_usd_per_mtok: f64,
 }
 
+/// B2: one loaded skill, frozen into the contract. The package digest pins
+/// exactly what content the model could read during the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContractSkill {
+    pub name: String,
+    pub version: String,
+    pub package_digest: String,
+    pub signed: bool,
+}
+
+/// B2: the frozen skill set. `enabled = false` keeps historical digests and
+/// runs unchanged; `enabled = true` with an empty list still changes the
+/// digest (the read_skill tool exists even when nothing is installed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ContractSkills {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<ContractSkill>,
+}
+
 /// B3: the controlled memory queue, frozen into the contract. The bounds ride
 /// with the contract so an injected store cannot quietly widen them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -86,6 +106,10 @@ pub struct GoalContract {
     /// `enabled = false` keeps historical digests and runs unchanged.
     #[serde(default)]
     pub memory: ContractMemory,
+    /// B2: the frozen skill set. `enabled = false` keeps historical digests
+    /// and runs unchanged.
+    #[serde(default)]
+    pub skills: ContractSkills,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
@@ -134,6 +158,7 @@ impl GoalContract {
             max_paths_per_action: 64,
             verify_command: Vec::new(),
             memory: ContractMemory::default(),
+            skills: ContractSkills::default(),
             extra_readonly_commands: Vec::new(),
             checkpoint: CheckpointSection::default(),
             conversation: ConversationSection::default(),
@@ -185,6 +210,34 @@ impl GoalContract {
                 &conversation.artifact_root,
             )?)?;
         }
+        // B2: freeze the installed skill set while the feature is on. The
+        // package digests pin exactly what the model could read this run.
+        let skills = if config.skills.enabled {
+            let registry = pangu_core::SkillRegistry::load(
+                &workspace.join(".pangu").join("skills"),
+                &config.skills.limits(),
+                if config.skills.verify_key.trim().is_empty() {
+                    None
+                } else {
+                    Some(config.skills.verify_key.trim())
+                },
+            )?;
+            ContractSkills {
+                enabled: true,
+                skills: registry
+                    .skills()
+                    .iter()
+                    .map(|skill| ContractSkill {
+                        name: skill.name.clone(),
+                        version: skill.version.clone(),
+                        package_digest: skill.lock.package_digest.clone(),
+                        signed: skill.signature_verified(),
+                    })
+                    .collect(),
+            }
+        } else {
+            ContractSkills::default()
+        };
         let contract = Self {
             goal: goal.into(),
             readable_roots,
@@ -206,6 +259,7 @@ impl GoalContract {
             max_write_bytes: config.boundary.max_write_bytes,
             max_paths_per_action: config.boundary.max_paths_per_action,
             verify_command: config.verify.command.clone(),
+            skills,
             memory: ContractMemory {
                 enabled: config.memory.enabled,
                 max_pending: config.memory.max_pending,
@@ -277,6 +331,11 @@ impl GoalContract {
     /// B3: the frozen memory-queue settings.
     pub fn memory(&self) -> &ContractMemory {
         &self.memory
+    }
+
+    /// B2: the frozen skill set.
+    pub fn skills(&self) -> &ContractSkills {
+        &self.skills
     }
 
     /// C5: the declared execution backend.
@@ -368,6 +427,16 @@ impl GoalContract {
                 object.insert(
                     "memory".into(),
                     serde_json::to_value(&self.memory).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        // B2: only an enabled skill registry changes the digest; disabled
+        // runs keep their historical digest.
+        if self.skills.enabled {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "skills".into(),
+                    serde_json::to_value(&self.skills).unwrap_or(serde_json::Value::Null),
                 );
             }
         }

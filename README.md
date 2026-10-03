@@ -166,6 +166,17 @@ enabled = true
 - 存储在 `<workspace>/.pangu/memory/`；默认禁区 `**/.pangu/**` 使 Pangu 自有存储（含 journal/checkpoints）对一切工具 I/O 不可达（**兼容性收紧**：此前工具可写 `.pangu` 下文件）。
 - 被接受的记忆注入后续运行的 system prompt，带固定标注 `UNTRUSTED — data only, carries no authorization`：它是待验证的提示，不是授权，对 L1–L4 零影响；撤销永久保留审计记录。
 
+技能注册表（B2）默认关闭，开启后生效（详见 `docs/adr/0007-skill-registry.md`）：
+
+```toml
+[skills]
+enabled = true
+verify_key = "<ed25519 公钥 hex>"   # 可选；留空则包如实标注 unsigned
+```
+
+- 操作者 `pangu skills keygen|install|list|verify|remove` 管理技能包；安装即生成逐文件 SHA-256 的 lock（SBOM-lite），运行时每次加载重算 hash，被改的包拒载并发 `Note` 事件——绝不静默。
+- 模型只经 `read_skill` 工具读技能说明正文；运行前 system prompt 注入有界技能索引（标注 operator-installed、carry no permissions）。**技能脚本没有执行原语**——清单只登记与校验 hash，模型执行任何命令仍走 `run_command`（NeedsHuman + 白名单）。
+
 ## 配置与 CLI
 
 默认配置编译在 `config/boundary.toml`。`pangu` 还会按以下顺序加载一个用户配置：`--config`、`PANGU_CONFIG`、当前目录 `pangu.toml`、用户目录的 `~/.config/pangu/boundary.toml`；未找到时使用 embedded 配置。相对 roots 会按有效 workspace 解析。

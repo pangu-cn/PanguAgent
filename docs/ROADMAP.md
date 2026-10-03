@@ -390,7 +390,12 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [x] **B1 Capability Manifest（已做，工具层）**：借鉴 Pi/ZCode/DeepSeek Harness 的 capability seam，以及 OpenHands SDK、Cline SDK/MCP。
   - `CapabilityManifest`/`Capability` 数据结构：name/version/risk/effect descriptor/reads/writes/hosts/processes/timeout_ms，`validate()` 强制一致性（unique 名字、risk×effect 与运行时 `validate_for_risk` 同规则、Workspace 不得声明 hosts/processes、NoEffect 不得声明 writes、有界）。
   - `Toolkit::manifest()` 与 `specs()` 一一对应，有测试锁定；后续插件/扩展注册的工具必须先声明进 manifest，模型无法绕过中心边界调用未声明能力。扩展侧注册入口留待 E1 统一落地。
-- [ ] **B2 技能注册表与签名包**：借鉴 Pi 的 Agent Skills、Hermes 的技能学习、DeepSeek Harness/OpenHands 的 skills/plugins 和 Cline 的 rules/skills，但默认只加载说明，脚本需显式批准。
+- [x] **B2 技能注册表与签名包（已做）**：借鉴 Pi 的 Agent Skills、Hermes 的技能学习、DeepSeek Harness/OpenHands 的 skills/plugins 和 Cline 的 rules/skills，但默认只加载说明，脚本需显式批准。设计详见 [`docs/adr/0007-skill-registry.md`](adr/0007-skill-registry.md)；W-03 对照：签名 ✓（ed25519，四态诚实标注）、锁版本 ✓（package_digest 冻结进 contract）、SBOM ✓（skill.lock 逐文件 SHA-256 + 字节数）、最小 capability ✓（read_skill 只读、无执行面）、隔离加载 ✓（.pangu 禁区 + internal 通道）。
+  - 包与注册表：操作者 `pangu skills install|list|verify|remove`；install 逐文件校验 + lock；运行时每次加载重算 hash，不匹配拒载 + `Note` audible。
+  - 签名：`pangu skills keygen`（ed25519）+ `install --sign-key`；`[skills] verify_key` 钉公钥后运行时验签；四态（signed+verified / signature-invalid / signed-unverified / unsigned）——没人查过的签名不冒充信任级别。
+  - 运行时：仅注入有界索引（name/version/签名状态/描述，标注 operator-installed、carry no permissions）；`read_skill` 读 SKILL.md 正文是模型唯一触达点；**脚本零执行原语**——"脚本需显式批准"以"执行口不存在"成立。
+  - 冻结与绑定：contract 冻结技能集并携带进 digest；with_chain 拒广告不一致；run 启动逐位比对冻结集与实际 registry，不一致拒启。
+  - **未包含（有意排除）**：脚本执行原语（若 E1 要做，须以 capability + 显式批准 + 隔离加载重新过准入，见 ADR-0007 §3）；模型安装/修改技能；在线分发/市场；向量检索。
 - [x] **B3 受控记忆候选队列（已做）**：借鉴 Hermes 的学习闭环；模型只能提出记忆，用户/策略确认后写入，保留来源和撤销能力。设计详见 [`docs/adr/0006-memory-candidate-queue.md`](adr/0006-memory-candidate-queue.md)；W-01 对照：proposal ✓（propose_memory 只入队）、来源 ✓（proposed_at/in_run + content_digest）、证据 ✓（transitions 全程审计、事件不带原文）、人工/策略确认 ✓（accept 仅 CLI）、可撤销 ✓（revoke 单向且保留记录）。
   - 生命周期三段式：模型提议（pending，惰性）→ 操作者 CLI 审阅（accept/reject）→ accepted 注入后续运行；revoke 停止注入但记录永久保留。从运行到 accept 之间没有代码路径。
   - 存储 `pangu-memory/1`：`<workspace>/.pangu/memory/candidates.json`；加载即校验（损坏硬错误，不静默重置）；原子写；fail-closed 上界（内容 4 KiB / pending 256 / 注入 24 条 16 KiB）+ 去重 + 控制字符拒绝。
@@ -489,9 +494,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B3、B4、B5、C5、F1、F2、F3、F4
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、F1、F2、F3、F4
         （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
-第二批：B2、D3、D4、F5
+第二批：D3、D4、F5
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```

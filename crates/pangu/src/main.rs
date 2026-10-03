@@ -14,8 +14,8 @@ use pangu_boundary::{
     Risk, Sandbox, StdinApproval, Unattended,
 };
 use pangu_core::{
-    ChatResponse, Journal, MemoryLimits, MemoryStore, Message, RollbackRequest, TeeSink, ToolCall,
-    Usage,
+    ChatResponse, Journal, MemoryLimits, MemoryStore, Message, RollbackRequest, SkillRegistry,
+    TeeSink, ToolCall, Usage,
 };
 use pangu_provider::OpenAiCompatibleProvider;
 use pangu_toolkit::Toolkit;
@@ -147,6 +147,45 @@ enum Commands {
         #[command(subcommand)]
         action: MemoryCommands,
     },
+    /// B2: operator lifecycle for the skill registry. The model can only
+    /// read a skill's instruction document; install/verify/remove happen
+    /// here, outside any run.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCommands,
+    },
+}
+
+/// B2: skill registry lifecycle (operator-only).
+#[derive(Clone, Debug, Subcommand)]
+enum SkillsCommands {
+    /// Generate an ed25519 signing keypair; the private key is written to
+    /// --out, the public key goes to stdout (pin it in [skills] verify_key).
+    Keygen {
+        /// File to write the private key (64 hex chars) into.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Validate a skill package and install it into the registry.
+    Install {
+        /// Path to the package directory (must contain SKILL.toml).
+        path: std::path::PathBuf,
+        /// File holding the private key (64 hex chars) to sign the lock.
+        #[arg(long)]
+        sign_key: Option<std::path::PathBuf>,
+    },
+    /// List installed skills with their signing status.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recompute hashes and verify signatures for one or all skills.
+    Verify {
+        /// Skill name; omit to verify everything.
+        name: Option<String>,
+    },
+    /// Remove an installed skill (uninstall is reversible by reinstalling).
+    Remove { name: String },
 }
 
 /// B3: memory candidate queue lifecycle (operator-only).
@@ -400,6 +439,15 @@ async fn main() -> Result<()> {
         Some(Commands::Events { action }) => match action {
             EventsCommands::Read { path, json, kind } => events_read(&path, kind, json),
             EventsCommands::Contract { json } => events_contract(json),
+        },
+        Some(Commands::Skills { action }) => match action {
+            SkillsCommands::Keygen { out } => skills_keygen(&out),
+            SkillsCommands::Install { path, sign_key } => {
+                skills_install(&args, &path, sign_key.as_deref())
+            }
+            SkillsCommands::List { json } => skills_list(&args, json),
+            SkillsCommands::Verify { name } => skills_verify(&args, name.as_deref()),
+            SkillsCommands::Remove { name } => skills_remove(&args, &name),
         },
         Some(Commands::Repo { action }) => match action {
             RepoCommands::Map { root, budget, json } => repo_map(root, budget, json),
@@ -963,6 +1011,202 @@ fn memory_decide(args: &Cli, action: &str, id: &str, by: &str, note: Option<Stri
     Ok(())
 }
 
+/// B2: generate an ed25519 signing keypair. The private key lands in the
+/// requested file; only the public key is printed.
+fn skills_keygen(out: &std::path::Path) -> Result<()> {
+    let (seed_hex, public_hex) = pangu_core::skills::keygen()?;
+    std::fs::write(
+        out,
+        format!(
+            "{seed_hex}
+"
+        ),
+    )
+    .with_context(|| format!("writing {}", out.display()))?;
+    println!("private key: {} (keep it secret)", out.display());
+    println!("public key (pin in [skills] verify_key): {public_hex}");
+    Ok(())
+}
+
+/// B2: validate a package and install it into the registry. Installation is
+/// an operator action; the model has no path to it.
+fn skills_install(
+    args: &Cli,
+    source: &std::path::Path,
+    sign_key: Option<&std::path::Path>,
+) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let workspace = config.workspace_abs();
+    let limits = config.skills.limits();
+    let lock = pangu_core::skills::compute_lock(source, &limits)?;
+    let lock = match sign_key {
+        Some(key_path) => {
+            let seed = std::fs::read_to_string(key_path)
+                .with_context(|| format!("reading {}", key_path.display()))?;
+            pangu_core::skills::sign_lock(&lock, seed.trim())?
+        }
+        None => lock,
+    };
+    let target = workspace.join(".pangu").join("skills").join(&lock.name);
+    if target.exists() {
+        bail!(
+            "skill `{}` is already installed; remove it first (pangu skills remove {})",
+            lock.name,
+            lock.name
+        );
+    }
+    std::fs::create_dir_all(&target)?;
+    // Copy every locked file; the lock itself is written last so a crash
+    // mid-copy leaves an unloadable (rejected) directory, never a verified
+    // one with missing files.
+    for file in &lock.files {
+        let from = source.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let to = target.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&from, &to).with_context(|| format!("copying {}", file.path))?;
+    }
+    std::fs::write(
+        target.join(pangu_core::skills::SKILL_LOCK_FILE),
+        serde_json::to_string_pretty(&lock)?,
+    )?;
+    let signed = if lock.signature.is_some() {
+        "signed"
+    } else {
+        "unsigned (no signing key provided)"
+    };
+    println!(
+        "installed `{}` v{} [{}] files={} digest={}",
+        lock.name,
+        lock.version,
+        signed,
+        lock.files.len(),
+        &lock.package_digest[..12],
+    );
+    Ok(())
+}
+
+/// B2: list installed skills.
+fn skills_list(args: &Cli, json: bool) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let registry = skills_registry(&config)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "skills": registry.skills().iter().map(|skill| serde_json::json!({
+                    "name": skill.name,
+                    "version": skill.version,
+                    "description": skill.description,
+                    "signed": skill.signature_verified(),
+                    "signature_state": skill.signature_state.as_str(),
+                    "package_digest": skill.lock.package_digest,
+                    "files": skill.lock.files.len(),
+                    "scripts": skill.lock.scripts,
+                })).collect::<Vec<_>>(),
+                "rejected": registry.rejected().iter().map(|rejected| serde_json::json!({
+                    "dir_name": rejected.dir_name,
+                    "reason": rejected.reason,
+                })).collect::<Vec<_>>(),
+                "derived": true,
+                "authoritative": false,
+            }))?
+        );
+        return Ok(());
+    }
+    for skill in registry.skills() {
+        let trust = skill.signature_state.as_str();
+        println!(
+            "{} v{} [{}] files={} scripts={}",
+            skill.name,
+            skill.version,
+            trust,
+            skill.lock.files.len(),
+            skill.lock.scripts.len(),
+        );
+        println!("  {}", skill.description);
+    }
+    for rejected in registry.rejected() {
+        println!("REJECTED {}: {}", rejected.dir_name, rejected.reason);
+    }
+    if registry.skills().is_empty() && registry.rejected().is_empty() {
+        println!("no skills installed");
+    }
+    Ok(())
+}
+
+/// B2: re-verify integrity (and signatures where present) of one or all
+/// skills by reloading the registry — load verification IS the check.
+fn skills_verify(args: &Cli, name: Option<&str>) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let registry = skills_registry(&config)?;
+    let mut failures = 0usize;
+    for skill in registry.skills() {
+        if let Some(wanted) = name {
+            if skill.name != wanted {
+                continue;
+            }
+        }
+        let status = match skill.signature_state {
+            pangu_core::SkillSignatureState::Verified => "verified (hashes + signature)",
+            pangu_core::SkillSignatureState::Invalid => {
+                failures += 1;
+                "FAILED (signature does not verify)"
+            }
+            pangu_core::SkillSignatureState::Unverified => {
+                "hashes ok; signature present but no verify_key pinned"
+            }
+            pangu_core::SkillSignatureState::Unsigned => "hashes ok, unsigned",
+        };
+        println!("{} v{}: {}", skill.name, skill.version, status);
+    }
+    for rejected in registry.rejected() {
+        if name
+            .map(|wanted| rejected.dir_name != wanted)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        failures += 1;
+        println!("{}: FAILED ({})", rejected.dir_name, rejected.reason);
+    }
+    if failures > 0 {
+        bail!("{failures} skill(s) failed verification");
+    }
+    Ok(())
+}
+
+/// B2: remove an installed skill. Uninstall is reversible by reinstalling;
+/// the registry directory is the only state involved.
+fn skills_remove(args: &Cli, name: &str) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let workspace = config.workspace_abs();
+    let target = workspace.join(".pangu").join("skills").join(name);
+    if !target.is_dir() {
+        bail!("skill `{name}` is not installed");
+    }
+    std::fs::remove_dir_all(&target).with_context(|| format!("removing {}", target.display()))?;
+    println!("removed {name}");
+    Ok(())
+}
+
+/// B2: load the operator-side registry handle.
+fn skills_registry(config: &Config) -> Result<SkillRegistry> {
+    let workspace = config.workspace_abs();
+    let limits = config.skills.limits();
+    let verify_key = config.skills.verify_key.trim();
+    Ok(SkillRegistry::load(
+        &workspace.join(".pangu").join("skills"),
+        &limits,
+        if verify_key.is_empty() {
+            None
+        } else {
+            Some(verify_key)
+        },
+    )?)
+}
+
 /// B4: one bounded capability probe against the effective provider endpoint.
 async fn models_probe(args: &Cli, json: bool) -> Result<()> {
     let (config, _files) = Config::load(args.config.as_deref())?;
@@ -1223,10 +1467,15 @@ async fn rollback_command(
         contract.workspace(),
         &format!("run-{}", unix_nanos()),
     )?;
+    let skills = build_skills_registry(&config, contract.workspace())?;
     let toolkit = {
         let base = Toolkit::with_verify_command(config.verify.command.clone());
         let base = match &memory {
             Some(store) => base.with_memory(store.clone()),
+            None => base,
+        };
+        let base = match &skills {
+            Some(registry) => base.with_skills(registry.clone()),
             None => base,
         };
         Arc::new(base)
@@ -1244,6 +1493,9 @@ async fn rollback_command(
     )?;
     if let Some(store) = memory {
         agent = agent.with_memory(store);
+    }
+    if let Some(registry) = skills {
+        agent = agent.with_skills(registry);
     }
     let result = agent.rollback(request).await?;
     println!(
@@ -1334,6 +1586,30 @@ fn build_memory_store(
     )?)))
 }
 
+/// B2: build the run-side skill registry when the contract enables it. The
+/// registry lives under `<workspace>/.pangu/skills/` (tool-forbidden); the
+/// contract already froze the loaded skill set, and the run compares against
+/// it at startup.
+fn build_skills_registry(
+    config: &Config,
+    workspace: &std::path::Path,
+) -> Result<Option<Arc<SkillRegistry>>> {
+    if !config.skills.enabled {
+        return Ok(None);
+    }
+    let limits = config.skills.limits();
+    let verify_key = config.skills.verify_key.trim();
+    Ok(Some(Arc::new(SkillRegistry::load(
+        &workspace.join(".pangu").join("skills"),
+        &limits,
+        if verify_key.is_empty() {
+            None
+        } else {
+            Some(verify_key)
+        },
+    )?)))
+}
+
 fn build_provider_chain(config: &Config) -> Result<ProviderChain> {
     let resolved = config.resolve_provider()?;
     let model = resolved
@@ -1411,10 +1687,18 @@ async fn execute_goal(
     // store backs the toolkit's `propose_memory` tool and the agent's
     // accepted-memory injection; the run refuses a half-attached queue.
     let memory = build_memory_store(&config, contract.workspace(), &run_label)?;
+    // B2: attach the skill registry when the contract enables it. The same
+    // registry backs the toolkit's `read_skill` tool and the agent's
+    // contract-frozen skill-set comparison.
+    let skills = build_skills_registry(&config, contract.workspace())?;
     let toolkit = {
         let base = Toolkit::with_verify_command(config.verify.command.clone());
         let base = match &memory {
             Some(store) => base.with_memory(store.clone()),
+            None => base,
+        };
+        let base = match &skills {
+            Some(registry) => base.with_skills(registry.clone()),
             None => base,
         };
         Arc::new(base)
@@ -1424,6 +1708,9 @@ async fn execute_goal(
     )?;
     if let Some(store) = memory {
         agent = agent.with_memory(store);
+    }
+    if let Some(registry) = skills {
+        agent = agent.with_skills(registry);
     }
     let outcome = agent.run().await?;
     eprintln!("journal: {}", journal_path.display());
