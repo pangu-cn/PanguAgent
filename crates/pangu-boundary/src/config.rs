@@ -311,6 +311,12 @@ pub struct ModelSection {
     /// for known models; explicit config values always win.
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// B5: fallback candidates, tried in order after the primary fails.
+    /// Every candidate is fully resolved and capability-checked at config
+    /// time; the declared chain is frozen into the contract and switches are
+    /// audited — fallback is never silent and never implicit.
+    #[serde(default)]
+    pub fallback: Vec<FallbackCandidate>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub temperature: Option<f32>,
@@ -318,6 +324,29 @@ pub struct ModelSection {
     pub input_usd_per_mtok: Option<f64>,
     pub output_usd_per_mtok: Option<f64>,
     pub request_timeout_secs: Option<u64>,
+}
+
+/// B5: one declared fallback candidate. Field semantics mirror the primary
+/// `[model]` section; registry resolution and capability checks apply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct FallbackCandidate {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub input_usd_per_mtok: Option<f64>,
+    pub output_usd_per_mtok: Option<f64>,
+}
+
+/// A fully resolved fallback candidate (config-time output).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedFallback {
+    pub model: String,
+    pub base_url: String,
+    pub api_key_env: Option<String>,
+    pub input_usd_per_mtok: f64,
+    pub output_usd_per_mtok: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -757,6 +786,12 @@ impl Config {
         // variable, tool-less models, and budgets that exceed the model's
         // context window.
         let resolved = self.resolve_provider()?;
+        // B5: when a fallback chain is declared, every candidate is fully
+        // resolved and capability-checked here, and the primary must have
+        // resolvable prices (resolve_fallbacks enforces both).
+        if !self.model.fallback.is_empty() {
+            self.resolve_fallbacks()?;
+        }
         if let Some(capabilities) = resolved.capabilities {
             if self.budget.max_input_tokens > capabilities.context_window_tokens {
                 return Err(Error::Config(format!(
@@ -841,6 +876,91 @@ impl Config {
             self.model.input_usd_per_mtok,
             self.model.output_usd_per_mtok,
         )
+    }
+
+    /// B5: fully resolve every declared fallback candidate. Fails closed at
+    /// config time unless every candidate is compatible (registry-declared,
+    /// tool-capable, context window fits the budget, prices resolvable) and
+    /// distinct from the primary and from each other.
+    pub fn resolve_fallbacks(&self) -> Result<Vec<ResolvedFallback>> {
+        // An undeclared chain means a single-provider run: nothing to check,
+        // and the primary's missing price must not fail legacy configs here.
+        if self.model.fallback.is_empty() {
+            return Ok(Vec::new());
+        }
+        let primary = self.resolve_provider()?;
+        let primary_key = (
+            primary.base_url.clone(),
+            primary.model.clone().unwrap_or_default(),
+        );
+        // Cost integrity: the primary must have resolvable prices, otherwise
+        // a switch to a priced fallback would start an unpriceable run.
+        if primary.input_usd_per_mtok.is_none() {
+            return Err(Error::Config(
+                "model.fallback requires the primary model to have resolvable prices".into(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::from([primary_key]);
+        let mut resolved_candidates = Vec::new();
+        for (index, candidate) in self.model.fallback.iter().enumerate() {
+            let resolved = crate::registry::resolve(
+                candidate.provider.as_deref(),
+                candidate.model.as_deref(),
+                None,
+                candidate.base_url.as_deref(),
+                candidate.api_key_env.as_deref(),
+                candidate.input_usd_per_mtok,
+                candidate.output_usd_per_mtok,
+            )?;
+            let model = resolved.model.clone().ok_or_else(|| {
+                Error::Config(format!("model.fallback[{index}].model is required"))
+            })?;
+            // W-10: compatibility must be provable, not assumed. A candidate
+            // outside the registry has no capability declaration, so it
+            // cannot be verified tool-capable or window-fitting.
+            let capabilities = resolved.capabilities.ok_or_else(|| {
+                Error::Config(format!(
+                    "model.fallback[{index}] model `{model}` is not in the registry; \
+                     fallback candidates must have declared capabilities"
+                ))
+            })?;
+            if !capabilities.supports_tools {
+                return Err(Error::Config(format!(
+                    "model.fallback[{index}] model `{model}` does not support tool calling"
+                )));
+            }
+            if self.budget.max_input_tokens > capabilities.context_window_tokens {
+                return Err(Error::Config(format!(
+                    "model.fallback[{index}] model `{model}` context window ({}) is smaller \
+                     than budget.max_input_tokens ({})",
+                    capabilities.context_window_tokens, self.budget.max_input_tokens,
+                )));
+            }
+            let (input, output) = match (resolved.input_usd_per_mtok, resolved.output_usd_per_mtok)
+            {
+                (Some(input), Some(output)) => (input, output),
+                _ => {
+                    return Err(Error::Config(format!(
+                        "model.fallback[{index}] model `{model}` has no resolvable prices; \
+                         the cost gate refuses unknown-cost fallbacks"
+                    )));
+                }
+            };
+            let key = (resolved.base_url.clone(), model.clone());
+            if !seen.insert(key) {
+                return Err(Error::Config(format!(
+                    "model.fallback[{index}] duplicates the primary model or an earlier candidate"
+                )));
+            }
+            resolved_candidates.push(ResolvedFallback {
+                model,
+                base_url: resolved.base_url,
+                api_key_env: resolved.api_key_env,
+                input_usd_per_mtok: input,
+                output_usd_per_mtok: output,
+            });
+        }
+        Ok(resolved_candidates)
     }
 
     pub fn workspace_abs(&self) -> PathBuf {
@@ -1523,6 +1643,114 @@ control"
             error.to_string().contains("execution.description"),
             "{error}"
         );
+    }
+
+    /// B5 helper: a config whose primary is a known registry model with a
+    /// budget that fits, plus the given fallback candidates.
+    fn config_with_fallback(
+        candidates: Vec<FallbackCandidate>,
+    ) -> std::result::Result<Config, Error> {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o-mini".into());
+        config.budget.max_input_tokens = 60_000; // fits every candidate window
+        config.model.fallback = candidates;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn candidate(provider: &str, model: &str) -> FallbackCandidate {
+        FallbackCandidate {
+            provider: Some(provider.into()),
+            model: Some(model.into()),
+            ..FallbackCandidate::default()
+        }
+    }
+
+    #[test]
+    fn fallback_chain_validates_and_resolves() {
+        let config = config_with_fallback(vec![
+            candidate("openai", "gpt-4.1-mini"),
+            candidate("deepseek", "deepseek-chat"),
+        ])
+        .unwrap();
+        let resolved = config.resolve_fallbacks().unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].model, "gpt-4.1-mini");
+        assert_eq!(resolved[0].input_usd_per_mtok, 0.40);
+        assert_eq!(resolved[1].model, "deepseek-chat");
+        assert_eq!(resolved[1].base_url, "https://api.deepseek.com/v1");
+    }
+
+    #[test]
+    fn fallback_candidates_fail_closed() {
+        // Unknown provider.
+        let error =
+            config_with_fallback(vec![candidate("nope", "x")]).expect_err("unknown provider");
+        assert!(error.to_string().contains("known providers"), "{error}");
+        // Missing model.
+        let error =
+            config_with_fallback(vec![FallbackCandidate::default()]).expect_err("model required");
+        assert!(error.to_string().contains("model is required"), "{error}");
+        // Model outside the registry: capabilities cannot be proven.
+        let error = config_with_fallback(vec![candidate("openai", "gpt-9x-future")])
+            .expect_err("registry-declared capabilities required");
+        assert!(error.to_string().contains("not in the registry"), "{error}");
+        // Tool-less model.
+        let error = config_with_fallback(vec![candidate("deepseek", "deepseek-reasoner")])
+            .expect_err("tool-less fallback");
+        assert!(
+            error.to_string().contains("does not support tool calling"),
+            "{error}"
+        );
+        // Context window smaller than the input budget (100k vs 64k).
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o-mini".into());
+        config.budget.max_input_tokens = 100_000;
+        config.model.fallback = vec![candidate("deepseek", "deepseek-chat")];
+        let error = config.validate().expect_err("context window too small");
+        assert!(error.to_string().contains("context window"), "{error}");
+        // Duplicate of the primary.
+        let error = config_with_fallback(vec![candidate("openai", "gpt-4o-mini")])
+            .expect_err("duplicate of primary");
+        assert!(error.to_string().contains("duplicates"), "{error}");
+        // Duplicate between candidates.
+        let error = config_with_fallback(vec![
+            candidate("openai", "gpt-4.1-mini"),
+            candidate("openai", "gpt-4.1-mini"),
+        ])
+        .expect_err("duplicate candidate");
+        assert!(error.to_string().contains("duplicates"), "{error}");
+    }
+
+    #[test]
+    fn fallback_requires_primary_prices() {
+        // Embedded config has no model and no prices: the primary price is
+        // unresolvable, so declaring a fallback must fail at config time.
+        let mut config = Config::embedded().unwrap();
+        config.model.fallback = vec![candidate("openai", "gpt-4.1-mini")];
+        let error = config.validate().expect_err("unpriceable primary");
+        assert!(
+            error
+                .to_string()
+                .contains("requires the primary model to have resolvable prices"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn contract_carries_the_fallback_chain() {
+        use crate::goal::GoalContract;
+        let declared = config_with_fallback(vec![candidate("openai", "gpt-4.1-mini")]).unwrap();
+        let contract = GoalContract::from_config("b5", &declared).unwrap();
+        assert_eq!(contract.fallbacks.len(), 1);
+        assert_eq!(contract.fallbacks[0].model, "gpt-4.1-mini");
+        assert_eq!(contract.fallbacks[0].input_usd_per_mtok, 0.40);
+        // The digest carries the chain.
+        let single = config_with_fallback(vec![]).unwrap();
+        let single = GoalContract::from_config("b5", &single).unwrap();
+        assert_ne!(contract.digest(), single.digest());
     }
 
     #[test]

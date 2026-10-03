@@ -141,6 +141,20 @@ model = "deepseek-chat"     # 已知模型自动获得价格与能力；未知�
 - fail-closed 前移到配置期：未知 provider、keyed provider 缺 key 变量、不支持工具调用的模型、`budget.max_input_tokens` 超出模型 context window、请求输出上限超过模型能力，均在启动时拒绝。
 - `pangu models list [--json]` 离线列出注册表；`pangu models probe [--json]` 对生效 endpoint 发一次有界 `GET /models`（操作者显式发起，非 2xx 只报状态码，不回显 body/key）。
 
+Provider fallback（B5）默认关闭，声明后生效：
+
+```toml
+[[model.fallback]]
+provider = "openai"          # 候选必须在注册表中（能力可验证）
+model = "gpt-4.1-mini"
+input_usd_per_mtok = 2.0     # 候选必须有可解析价格（显式或注册表）
+output_usd_per_mtok = 0.0
+```
+
+- 主 provider `chat` 失败时按声明顺序尝试下一个候选；每次失败尝试与成功切换都有事件（`Note` / `ProviderSwitched`），切换后的请求记录实际服务的 provider/model——**永不静默**。
+- 链冻结进 contract，注入链与 contract 不一致时 Agent 拒绝启动；成本按段累计（每段用该段价格），切换不能低估成本；链耗尽时运行失败，不回跳主 provider。
+- 候选在配置期全部校验：必须在注册表、支持工具、context window 覆盖输入预算、价格可解析、不与主模型或先前候选重复。
+
 ## 配置与 CLI
 
 默认配置编译在 `config/boundary.toml`。`pangu` 还会按以下顺序加载一个用户配置：`--config`、`PANGU_CONFIG`、当前目录 `pangu.toml`、用户目录的 `~/.config/pangu/boundary.toml`；未找到时使用 embedded 配置。相对 roots 会按有效 workspace 解析。

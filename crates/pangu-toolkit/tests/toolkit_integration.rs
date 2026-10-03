@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 use pangu_agent::{Agent, Provider};
-use pangu_boundary::{ApprovalMode, Config, GoalContract, Policy, Rule, Sandbox, ScriptedApproval};
+use pangu_boundary::{
+    ApprovalMode, Config, FallbackCandidate, GoalContract, Policy, Rule, Sandbox, ScriptedApproval,
+};
 use pangu_core::{ChatResponse, EventKind, MemSink, Message, ToolCall, ToolSpec, Usage};
 use pangu_toolkit::Toolkit;
 use serde_json::json;
@@ -997,6 +999,367 @@ async fn undeclared_execution_is_absent_from_run_started() {
     assert!(
         payload.get("execution_profile").is_none(),
         "undeclared backend must stay absent: {payload}"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+// ---- B5: provider fallback chain ------------------------------------------
+
+/// A provider that fails specific 1-based call numbers, then serves scripted
+/// responses. Used to exercise the fallback chain deterministically.
+struct FlakyProvider {
+    model: String,
+    fail_calls: Vec<usize>,
+    calls: AtomicUsize,
+    responses: Mutex<VecDeque<ChatResponse>>,
+}
+
+#[async_trait]
+impl Provider for FlakyProvider {
+    fn name(&self) -> &str {
+        "flaky"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn describe(&self) -> String {
+        format!("flaky model={}", self.model)
+    }
+
+    async fn chat(&self, _messages: Vec<Message>, _tools: Vec<ToolSpec>) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_calls.contains(&call) {
+            anyhow::bail!("simulated provider outage");
+        }
+        Ok(self
+            .responses
+            .lock()
+            .expect("responses lock")
+            .pop_front()
+            .expect("scripted response"))
+    }
+}
+
+/// A scripted provider with a configurable model name, for chain positions
+/// whose model name must match the frozen contract candidate.
+struct NamedScriptedProvider {
+    model: String,
+    responses: Mutex<VecDeque<ChatResponse>>,
+}
+
+#[async_trait]
+impl Provider for NamedScriptedProvider {
+    fn name(&self) -> &str {
+        "named-fallback"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn describe(&self) -> String {
+        format!("named fallback model={}", self.model)
+    }
+
+    async fn chat(&self, _messages: Vec<Message>, _tools: Vec<ToolSpec>) -> Result<ChatResponse> {
+        let response = self.responses.lock().expect("responses lock").pop_front();
+        match response {
+            Some(response) => Ok(response),
+            None => anyhow::bail!("script exhausted"),
+        }
+    }
+}
+
+fn response_with_usage(calls: Vec<ToolCall>, input_tokens: u64) -> ChatResponse {
+    ChatResponse {
+        messages: vec![Message::assistant_calls("", calls)],
+        usage: Usage {
+            input_tokens,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+        },
+    }
+}
+
+/// One declared fallback candidate (`gpt-4.1-mini` at 2.0/0.0 explicit) plus
+/// the matching chain: a flaky primary and the scripted fallback.
+fn build_chain_agent(
+    root: &Path,
+    primary_fail_calls: Vec<usize>,
+    fallback_responses: Vec<ChatResponse>,
+    max_cost_usd: f64,
+) -> (Agent, Arc<MemSink>) {
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.model.input_usd_per_mtok = Some(5.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    // Token budgets must sit above the scripted usage (400k) but below the
+    // fallback's declared context window, so the cost gate is the only
+    // constraint under test.
+    config.budget.max_input_tokens = 900_000;
+    config.budget.max_output_tokens = 1_000_000;
+    config.budget.max_cost_usd = max_cost_usd;
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    config.model.fallback = vec![FallbackCandidate {
+        provider: Some("openai".into()),
+        model: Some("gpt-4.1-mini".into()),
+        base_url: None,
+        api_key_env: None,
+        input_usd_per_mtok: Some(12.0),
+        output_usd_per_mtok: Some(0.0),
+    }];
+
+    let contract = GoalContract::from_config("b5 test", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let primary = Arc::new(FlakyProvider {
+        model: "primary-model".into(),
+        fail_calls: primary_fail_calls,
+        calls: AtomicUsize::new(0),
+        responses: Mutex::new(
+            vec![response_with_usage(
+                vec![ToolCall::new("read_file", json!({"path": "note.txt"}))],
+                400_000,
+            )]
+            .into(),
+        ),
+    });
+    let fallback = Arc::new(NamedScriptedProvider {
+        model: "gpt-4.1-mini".into(),
+        responses: Mutex::new(fallback_responses.into()),
+    });
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let sink = Arc::new(MemSink::default());
+    let agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![primary, fallback],
+        Arc::new(Toolkit::new()),
+        approval,
+        sink.clone(),
+    )
+    .expect("agent");
+    (agent, sink)
+}
+
+#[tokio::test]
+async fn fallback_switches_after_primary_failure_and_audits() {
+    let root = temp_root("b5-switch");
+    std::fs::write(root.join("note.txt"), "data\n").expect("seed");
+
+    // Turn 1 is served by the primary; turn 2's primary attempt fails and the
+    // fallback takes over for the rest of the run.
+    let (agent, sink) = build_chain_agent(
+        &root,
+        vec![2],
+        vec![
+            response_with_usage(
+                vec![ToolCall::new("read_file", json!({"path": "note.txt"}))],
+                0,
+            ),
+            finish_response(),
+        ],
+        3.0,
+    );
+    let outcome = agent.run().await.expect("agent run");
+
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    let snapshot = sink.snapshot();
+    let switches = snapshot
+        .iter()
+        .filter(|event| event.kind == EventKind::ProviderSwitched)
+        .count();
+    assert_eq!(switches, 1, "exactly one audited switch");
+    let notes = snapshot
+        .iter()
+        .filter(|event| event.kind == EventKind::Note)
+        .count();
+    assert!(notes >= 1, "the failed attempt must be audited");
+    // The request after the switch names the fallback model.
+    let last_request = snapshot
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::ModelRequest)
+        .expect("model request");
+    assert!(
+        last_request.message.contains("model=gpt-4.1-mini"),
+        "the fallback model serves the run: {}",
+        last_request.message
+    );
+    assert_eq!(outcome.evidence.len(), 2, "two successful reads");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn per_segment_pricing_never_under_counts_a_pricier_fallback() {
+    let root = temp_root("b5-cost");
+    std::fs::write(root.join("note.txt"), "data\n").expect("seed");
+
+    // Primary segment costs 2.0 (400k input at 5.0/MTok); the fallback
+    // segment costs 4.8 (400k at its declared 12.0). Cumulative 6.8 crosses
+    // the 5.0 budget. If the switch under-counted at the primary price
+    // (4.0 total), the run would finish instead of exhausting.
+    let (agent, _sink) = build_chain_agent(
+        &root,
+        vec![2],
+        vec![ChatResponse {
+            messages: vec![Message::assistant("")],
+            usage: Usage {
+                input_tokens: 400_000,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        }],
+        5.0,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(
+        outcome.status,
+        pangu_boundary::GoalStatus::BudgetExhausted,
+        "per-segment pricing must count the pricier fallback segment"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn exhausted_fallback_chain_fails_the_run() {
+    let root = temp_root("b5-exhausted");
+    std::fs::write(root.join("note.txt"), "data\n").expect("seed");
+
+    // Primary fails on every call; the fallback script is empty so its first
+    // chat also fails: the whole chain is exhausted and the run errors out.
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.model.input_usd_per_mtok = Some(1.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    config.model.fallback = vec![FallbackCandidate {
+        provider: Some("openai".into()),
+        model: Some("gpt-4.1-mini".into()),
+        base_url: None,
+        api_key_env: None,
+        input_usd_per_mtok: Some(2.0),
+        output_usd_per_mtok: Some(0.0),
+    }];
+    let contract = GoalContract::from_config("b5 exhausted", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let primary = Arc::new(FlakyProvider {
+        model: "primary-model".into(),
+        fail_calls: (1..=10).collect(),
+        calls: AtomicUsize::new(0),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let fallback = Arc::new(NamedScriptedProvider {
+        model: "gpt-4.1-mini".into(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![primary, fallback],
+        Arc::new(Toolkit::new()),
+        approval,
+        Arc::new(MemSink::default()),
+    )
+    .expect("agent");
+
+    let error = match agent.run().await {
+        Err(error) => error,
+        Ok(outcome) => panic!("expected a failed run, got {:?}", outcome.status),
+    };
+    assert!(
+        error.to_string().contains("all declared providers failed"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn with_chain_refuses_a_mismatched_fallback_chain() {
+    let root = temp_root("b5-binding");
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.model.input_usd_per_mtok = Some(1.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    config.model.fallback = vec![FallbackCandidate {
+        provider: Some("openai".into()),
+        model: Some("gpt-4.1-mini".into()),
+        base_url: None,
+        api_key_env: None,
+        input_usd_per_mtok: Some(2.0),
+        output_usd_per_mtok: Some(0.0),
+    }];
+    let contract = GoalContract::from_config("b5 binding", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let primary = Arc::new(FlakyProvider {
+        model: "primary-model".into(),
+        fail_calls: Vec::new(),
+        calls: AtomicUsize::new(0),
+        responses: Mutex::new(VecDeque::new()),
+    });
+
+    // Chain too short.
+    let error = match Agent::with_chain(
+        contract.clone(),
+        policy.clone(),
+        sandbox.clone(),
+        vec![primary.clone()],
+        Arc::new(Toolkit::new()),
+        approval.clone(),
+        Arc::new(MemSink::default()),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a shortened chain must be refused"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not match GoalContract fallbacks"),
+        "{error}"
+    );
+
+    // Right length, wrong model.
+    let wrong = Arc::new(NamedScriptedProvider {
+        model: "wrong-model".into(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let error = match Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![primary, wrong],
+        Arc::new(Toolkit::new()),
+        approval,
+        Arc::new(MemSink::default()),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a model mismatch must be refused"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not match GoalContract fallback model"),
+        "{error}"
     );
     std::fs::remove_dir_all(root).expect("cleanup");
 }

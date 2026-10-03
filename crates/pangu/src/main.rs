@@ -988,8 +988,8 @@ async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
         );
         return Ok(());
     }
-    let provider = build_provider(&config)?;
-    let status = execute_goal(config, files, goal, provider, false).await?;
+    let (primary, fallbacks) = build_provider_chain(&config)?;
+    let status = execute_goal(config, files, goal, primary, fallbacks, false).await?;
     if !status.is_success() {
         bail!("agent ended with status {status}");
     }
@@ -1120,6 +1120,7 @@ async fn demo(args: &Cli) -> Result<()> {
         files,
         "读取 Cargo.toml 并报告包名".into(),
         provider,
+        Vec::new(),
         true,
     )
     .await?;
@@ -1129,9 +1130,13 @@ async fn demo(args: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
-    // B4: one resolution path for endpoint, key variable, and prices. The
-    // registry only fills what the operator did not set explicitly.
+/// B5: build the declared provider chain (primary + fallbacks). Every member
+/// is resolved and validated at config time; keys are read from the
+/// environment here, so a missing fallback key fails the run loudly instead
+/// of silently dropping the candidate.
+type ProviderChain = (Arc<dyn Provider>, Vec<Arc<dyn Provider>>);
+
+fn build_provider_chain(config: &Config) -> Result<ProviderChain> {
     let resolved = config.resolve_provider()?;
     let model = resolved
         .model
@@ -1143,22 +1148,35 @@ fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
              and model.output_usd_per_mtok, or use model.provider with a known model (see `pangu models list`)"
         );
     }
-    let provider = OpenAiCompatibleProvider::from_env(
+    let primary = Arc::new(OpenAiCompatibleProvider::from_env(
         model,
         resolved.base_url,
         resolved.api_key_env.as_deref(),
         config.model.temperature,
         config.model.max_output_tokens,
         config.model.request_timeout_secs.unwrap_or(60),
-    )?;
-    Ok(Arc::new(provider))
+    )?);
+    let mut fallbacks = Vec::new();
+    for candidate in config.resolve_fallbacks()? {
+        let provider = Arc::new(OpenAiCompatibleProvider::from_env(
+            candidate.model.clone(),
+            candidate.base_url,
+            candidate.api_key_env.as_deref(),
+            config.model.temperature,
+            config.model.max_output_tokens,
+            config.model.request_timeout_secs.unwrap_or(60),
+        )?);
+        fallbacks.push(provider as Arc<dyn Provider>);
+    }
+    Ok((primary as Arc<dyn Provider>, fallbacks))
 }
 
 async fn execute_goal(
     config: Config,
     files: Vec<PathBuf>,
     goal: String,
-    provider: Arc<dyn Provider>,
+    primary: Arc<dyn Provider>,
+    fallbacks: Vec<Arc<dyn Provider>>,
     use_unattended: bool,
 ) -> Result<pangu_boundary::GoalStatus> {
     let mut contract = GoalContract::from_config(goal, &config)?;
@@ -1188,11 +1206,13 @@ async fn execute_goal(
                 Duration::from_secs(config.boundary.approval.ask_timeout_secs),
             ))
         };
-    let agent = Agent::new(
+    let mut providers: Vec<Arc<dyn Provider>> = vec![primary];
+    providers.extend(fallbacks);
+    let agent = Agent::with_chain(
         contract,
         policy,
         sandbox,
-        provider,
+        providers,
         Arc::new(Toolkit::with_verify_command(config.verify.command.clone())),
         approval,
         sink,

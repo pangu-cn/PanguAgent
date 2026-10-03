@@ -32,6 +32,10 @@ pub enum EventKind {
     /// (`begin_act` control call). Not an action and never an authorization:
     /// every act-phase mutation still passes L1-L4.
     PhaseChanged,
+    /// B5: the run switched to a declared fallback provider after the prior
+    /// provider failed. The chain is frozen in the contract; a switch is
+    /// never silent and per-segment cost accounting uses the new price.
+    ProviderSwitched,
     CheckpointCreated,
     CheckpointFailed,
     RollbackRequested,

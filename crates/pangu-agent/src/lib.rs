@@ -365,6 +365,9 @@ pub struct Agent {
     policy: Arc<Policy>,
     sandbox: Arc<Sandbox>,
     provider: Arc<dyn Provider>,
+    /// B5: declared fallback providers, in contract order. Empty = no
+    /// fallback.
+    fallbacks: Vec<Arc<dyn Provider>>,
     tools: Arc<dyn ToolExecutor>,
     approval: Arc<dyn ApprovalHandler>,
     event_sink: Arc<dyn EventSink>,
@@ -385,6 +388,30 @@ impl Agent {
         approval: Arc<dyn ApprovalHandler>,
         event_sink: Arc<dyn EventSink>,
     ) -> Result<Self> {
+        Self::with_chain(
+            contract,
+            policy,
+            sandbox,
+            vec![provider],
+            tools,
+            approval,
+            event_sink,
+        )
+    }
+
+    /// B5: build a run over a declared provider chain. `providers[0]` is the
+    /// primary; the rest are the fallbacks, in the order the contract froze
+    /// them. The chain must match the contract position by position (model
+    /// name), or the run is refused — a fallback is never injected silently.
+    pub fn with_chain(
+        contract: GoalContract,
+        policy: Arc<Policy>,
+        sandbox: Arc<Sandbox>,
+        providers: Vec<Arc<dyn Provider>>,
+        tools: Arc<dyn ToolExecutor>,
+        approval: Arc<dyn ApprovalHandler>,
+        event_sink: Arc<dyn EventSink>,
+    ) -> Result<Self> {
         contract.validate_against(&sandbox)?;
         if approval.mode() != contract.approval_mode {
             return Err(anyhow!(
@@ -401,13 +428,35 @@ impl Agent {
                 "GoalContract and Policy do not describe the same rule set"
             ));
         }
+        if providers.is_empty() {
+            return Err(anyhow!("provider chain must contain the primary provider"));
+        }
+        if providers.len() != contract.fallbacks.len() + 1 {
+            return Err(anyhow!(
+                "provider chain length ({}) does not match GoalContract fallbacks ({})",
+                providers.len(),
+                contract.fallbacks.len()
+            ));
+        }
+        for (index, candidate) in contract.fallbacks.iter().enumerate() {
+            if providers[index + 1].model() != candidate.model {
+                return Err(anyhow!(
+                    "fallback provider at position {index} does not match GoalContract \
+                     fallback model `{}`",
+                    candidate.model
+                ));
+            }
+        }
         let checkpoint = checkpoint::CheckpointRuntime::from_contract(&contract)?;
         let conversation = conversation::ConversationRuntime::from_contract(&contract)?;
+        let mut fallback_iter = providers.into_iter();
+        let provider = fallback_iter.next().expect("primary checked above");
         Ok(Self {
             contract,
             policy,
             sandbox,
             provider,
+            fallbacks: fallback_iter.collect(),
             tools,
             approval,
             event_sink,
@@ -1320,6 +1369,16 @@ impl Agent {
         .await?;
 
         let mut act_phase = !self.contract.plan_first();
+        // B5: the active position in the provider chain (0 = primary) and the
+        // accumulated spend. Cost is summed per segment: each response's usage
+        // is priced by the provider that served it, so a switch can never
+        // under-count the cost of tokens consumed on a pricier fallback.
+        let mut active_provider = 0usize;
+        let mut spent = if self.contract.price.is_some() {
+            0.0
+        } else {
+            f64::INFINITY
+        };
         // F4: the begin_act control tool exists only in plan-first runs. It is
         // agent-owned (like `finish`): it executes nothing and passes no gate,
         // it just ends the read-only phase.
@@ -1339,7 +1398,8 @@ impl Agent {
         }
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
-            let breaches = self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed());
+            let breaches =
+                self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed(), spent);
             if !breaches.is_empty() {
                 self.emit_budget(turn, &breaches).await?;
                 terminal = Some(GoalStatus::BudgetExhausted);
@@ -1405,13 +1465,14 @@ impl Agent {
 
             self.emit(self.event(EventKind::TurnStarted, turn, format!("turn {turn}")))
                 .await?;
+            let active = self.provider_for(active_provider);
             self.emit(self.event(
                 EventKind::ModelRequest,
                 turn,
                 format!(
                     "provider={} model={} messages={} tools={} (history={})",
-                    self.provider.name(),
-                    self.provider.model(),
+                    active.name(),
+                    active.model(),
                     assembled.messages.len(),
                     specs.len(),
                     history.len()
@@ -1420,10 +1481,19 @@ impl Agent {
             .await?;
 
             let response = self
-                .provider
-                .chat(assembled.messages.clone(), specs.clone())
+                .chat_with_fallback(
+                    &mut active_provider,
+                    turn,
+                    assembled.messages.clone(),
+                    specs.clone(),
+                )
                 .await?;
             let response_usage = response.usage;
+            // B5: price this segment by the provider that served it.
+            match self.active_price(active_provider) {
+                Some(price) => spent += price.cost_usd(&response_usage),
+                None => spent = f64::INFINITY,
+            }
             usage.merge(&response_usage);
             self.emit(
                 self.event(EventKind::ModelResponse, turn, "provider response received")
@@ -1431,7 +1501,8 @@ impl Agent {
             )
             .await?;
 
-            let post_response_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+            let post_response_breaches =
+                self.budget_breaches(turn, &usage, started.elapsed(), spent);
             if !post_response_breaches.is_empty() {
                 self.emit_budget(turn, &post_response_breaches).await?;
                 terminal = Some(GoalStatus::BudgetExhausted);
@@ -1482,7 +1553,7 @@ impl Agent {
             }
 
             for call in tool_calls {
-                let call_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+                let call_breaches = self.budget_breaches(turn, &usage, started.elapsed(), spent);
                 if !call_breaches.is_empty() {
                     self.emit_budget(turn, &call_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -1621,7 +1692,7 @@ impl Agent {
                 }
             }
             if terminal.is_none() {
-                let final_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+                let final_breaches = self.budget_breaches(turn, &usage, started.elapsed(), spent);
                 if !final_breaches.is_empty() {
                     self.emit_budget(turn, &final_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -2345,21 +2416,106 @@ impl Agent {
         turn: u32,
         usage: &Usage,
         elapsed: std::time::Duration,
+        spent: f64,
     ) -> Vec<pangu_boundary::Breach> {
-        let cost = self
-            .contract
-            .price
-            .map(|price| price.cost_usd(usage))
-            // An absent price is not zero cost. Treat it as an unknown,
-            // unbudgeted provider and fail closed before the next request.
-            .unwrap_or(f64::INFINITY);
+        // B5: the spend is accumulated per segment — each response's usage is
+        // priced by the provider that served it — so a fallback switch can
+        // never under-count cost. An absent primary price starts the run at
+        // INFINITY, which preserves the old fail-closed behavior.
         self.contract.budget.check(
             turn,
             usage.input_tokens.saturating_add(usage.cache_read_tokens),
             usage.output_tokens,
-            cost,
+            spent,
             elapsed,
         )
+    }
+
+    /// B5: the provider at a chain position (0 = primary).
+    fn provider_for(&self, active: usize) -> &Arc<dyn Provider> {
+        if active == 0 {
+            &self.provider
+        } else {
+            self.fallbacks
+                .get(active - 1)
+                .expect("active position within the declared chain")
+        }
+    }
+
+    /// B5: the price of the provider at a chain position, from the frozen
+    /// contract (primary) or the frozen candidate list (fallbacks).
+    fn active_price(&self, active: usize) -> Option<pangu_core::Price> {
+        if active == 0 {
+            self.contract.price
+        } else {
+            let candidate = self.contract.fallbacks.get(active - 1)?;
+            Some(pangu_core::Price {
+                input_usd_per_mtok: candidate.input_usd_per_mtok,
+                output_usd_per_mtok: candidate.output_usd_per_mtok,
+            })
+        }
+    }
+
+    fn provider_label(&self, active: usize) -> String {
+        let provider = self.provider_for(active);
+        format!("{}/{}", provider.name(), provider.model())
+    }
+
+    /// B5: run the declared chain. On a chat failure the next declared
+    /// candidate is tried; every failed attempt and every successful switch
+    /// is audited. The active position persists across turns — the run never
+    /// silently jumps back to the primary.
+    async fn chat_with_fallback(
+        &self,
+        active: &mut usize,
+        turn: u32,
+        messages: Vec<Message>,
+        specs: Vec<pangu_core::ToolSpec>,
+    ) -> Result<ChatResponse> {
+        let total = 1 + self.fallbacks.len();
+        let mut attempt = *active;
+        let mut last_error = String::from("unknown");
+        loop {
+            let provider = self.provider_for(attempt);
+            match provider.chat(messages.clone(), specs.clone()).await {
+                Ok(response) => {
+                    if attempt != *active {
+                        let from = self.provider_label(*active);
+                        let to = self.provider_label(attempt);
+                        self.emit(self.event(
+                            EventKind::ProviderSwitched,
+                            turn,
+                            format!(
+                                "provider fallback: {from} -> {to}; prior attempt failed: \
+                                     {last_error}"
+                            ),
+                        ))
+                        .await?;
+                        *active = attempt;
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let reason = redact_text(&error.to_string());
+                    self.emit(self.event(
+                        EventKind::Note,
+                        turn,
+                        format!(
+                            "provider attempt failed: {}: {reason}",
+                            self.provider_label(attempt)
+                        ),
+                    ))
+                    .await?;
+                    last_error = reason;
+                    attempt += 1;
+                    if attempt >= total {
+                        return Err(anyhow!(
+                            "all declared providers failed; last error: {last_error}"
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     async fn emit_budget(&self, turn: u32, breaches: &[pangu_boundary::Breach]) -> Result<()> {

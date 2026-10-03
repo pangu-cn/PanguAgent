@@ -135,7 +135,7 @@ FinishRequested, RunFinished, Note,
 CheckpointCreated, CheckpointFailed,
 RollbackRequested, RollbackStarted, RollbackApplied,
 RollbackSkippedAlreadyApplied, RollbackFailed, FailedPathRecorded,
-ContextAssembled, PhaseChanged
+ContextAssembled, PhaseChanged, ProviderSwitched
 ```
 
 启用 checkpoint 的运行使用 `pangu-journal/v2`；禁用时保留 v1。v2 写入时封存 `schema`、连续 `seq`、`prev_sha`、内容 `sha` 和 `evt_<sha256>` 稳定 ID。`EventSink::emit` 保持兼容，内部 receipt 路径使用 `emit_with_receipt`；TeeSink 比较多个 durable sink 的 receipt，不一致则失败。Journal replay 只校验和索引，不恢复文件、不重放副作用。
@@ -254,6 +254,7 @@ B4 的 provider 注册表（`pangu-boundary::registry`）是静态配置数据�
 | I-No-Implicit-Git-Commit | `tests/invariants.rs`, config tests | Git backend 显式失败，默认不触发 Git |
 | I-Verify-Command-Binding | `pangu-boundary/src/config.rs`, `pangu-agent/src/lib.rs` (`Agent::new`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | verify 只运行 contract 冻结的整条命令；模型参数被拒绝；失败无 evidence 且 `complete` 降级 |
 | I-Plan-Phase-Read-Only | `pangu-boundary/src/goal.rs`, `pangu-agent/src/lib.rs` (`process_tool`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | plan_first 运行中变更动作在闸门前被拒；仅 `begin_act` 切相；act 动作仍逐项审批 |
+| I-Fallback-Declared-Chain | `pangu-boundary/src/config.rs`, `pangu-agent/src/lib.rs` (`with_chain`, `chat_with_fallback`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | fallback 只沿 contract 冻结链进行；切换与失败有事件；按段计价不低估成本；链耗尽即失败 |
 
 ## 已知边界
 
@@ -263,4 +264,6 @@ B4 的 provider 注册表（`pangu-boundary::registry`）是静态配置数据�
 - Journal replay 当前提供完整性校验和摘要，不重新执行工具。
 - checkpoint/rollback 阶段二实现默认关闭、仅实验性 opt-in；Windows replace hand-off、stale lock 和无锁并发 writer 的限制见“已知恢复限制”，不构成 OS 级隔离或正式支持声明。operator 处理步骤和证据清单见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
 - 默认 `pangu run` 需要用户提供 API key 和模型输入/输出价格；`pangu --demo` 使用本地 scripted provider 并显式声明零价格来验证状态机。
+- F7 激活门未完成项（见 CHECKPOINT_RECOVERY §8）：目标部署平台验证、恢复期间备份/审计可用性、停止策略书面确认、operator/发布负责人签署。
 - C5 的执行后端声明是操作者声明，不是验证事实：Pangu 不启动/管理/验证容器或远程后端，L1–L4 在所有 profile 下相同；真正的容器/远程编排属 C4/远程 Runner 范畴。
+- B5 的 fallback 链只在配置声明、冻结进 contract 的候选间切换，每次切换有事件；无后台健康探测（那会是未受控出站请求），健康状态在尝试时判定。

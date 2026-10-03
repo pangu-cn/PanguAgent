@@ -103,6 +103,8 @@ pub enum StreamKind {
     ContextAssembled,
     /// F4: plan -> act phase transition (the `begin_act` control call).
     PhaseChanged,
+    /// B5: switch to a declared fallback provider after a failure.
+    ProviderSwitched,
 }
 
 impl StreamKind {
@@ -158,6 +160,7 @@ impl StreamKind {
             Self::FailedPathRecorded,
             Self::ContextAssembled,
             Self::PhaseChanged,
+            Self::ProviderSwitched,
         ]
     }
 
@@ -193,6 +196,7 @@ impl StreamKind {
             EventKind::FailedPathRecorded => Self::FailedPathRecorded,
             EventKind::ContextAssembled => Self::ContextAssembled,
             EventKind::PhaseChanged => Self::PhaseChanged,
+            EventKind::ProviderSwitched => Self::ProviderSwitched,
         })
     }
 }
@@ -760,6 +764,7 @@ mod tests {
                 StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
                 StreamKind::ContextAssembled => EventKind::ContextAssembled,
                 StreamKind::PhaseChanged => EventKind::PhaseChanged,
+                StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -806,6 +811,7 @@ mod tests {
                     StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
                     StreamKind::ContextAssembled => EventKind::ContextAssembled,
                     StreamKind::PhaseChanged => EventKind::PhaseChanged,
+                    StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
                 },
                 0,
                 "hello",

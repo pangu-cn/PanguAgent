@@ -94,6 +94,16 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 - 阶段规则冻结进 `GoalContract`（digest 仅在启用时携带，保持既有 digest 稳定）；模型不能更改、不能重入、不能以重试绕过。
 - `write_file` 的审批请求携带有界、脱敏的 unified diff；无法内联时明确说明原因（非 UTF-8、过大、不可读），不伪造 diff。
 
+### Provider fallback（B5）
+
+`[[model.fallback]]` 允许操作者显式声明一个有序的候选链：主 provider 的 `chat` 失败时，按声明顺序尝试下一个候选，直到链耗尽（此时运行失败，报最后一个错误）。规则：
+
+- **禁止静默与隐式**：链只能在配置中声明（默认为空 = 单 provider，行为与旧版一致）；链冻结进 contract（digest 仅在非空时携带）；每次失败尝试发 `Note` 事件，每次成功切换发 `ProviderSwitched` 事件；切换后的 `ModelRequest` 记录实际服务的 provider/model。
+- **兼容性可证明**：候选必须在注册表中（有能力声明）、支持工具调用、context window 覆盖 `budget.max_input_tokens`；无法验证兼容性的候选（不在注册表）在配置期拒绝。
+- **价格完整**：主模型与每个候选都必须有可解析价格（显式或注册表）；成本按段累计——每段 usage 按实际服务它的 provider 价格计价，切换永远不能低估成本（G4）。无价格候选在配置期拒绝。
+- **绑定检查**：`Agent::with_chain` 拒绝注入链与 contract 链不匹配（长度、逐位模型名）的构建，如同 approval mode 与 verify 命令的绑定。
+- **无健康探测**：健康状态在尝试时判定；不做后台探活（那会是未受控的出站请求）。
+
 ### 执行后端声明（C5）
 
 `[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
@@ -152,6 +162,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 ### 4.2 条件性不变量（非默认运行行为）
 
 20. **I-Plan-Phase-Read-Only**：仅当 `goal.plan_first = true` 时生效。运行开始于只读 plan 阶段；风险高于 `read_only` 的动作在任何闸门前被拒绝并回灌；进入 act 阶段的唯一途径是 `begin_act` 控制调用——它不执行任何动作、不是授权，act 阶段的每个变更动作仍逐项经过 L1–L4。阶段规则冻结进 contract，模型不能更改、重入或以重试绕过。
+21. **I-Fallback-Declared-Chain**：仅当声明了 `[[model.fallback]]` 时生效。fallback 只能沿配置声明、冻结进 contract 的有序链进行；每次失败尝试与成功切换都有事件；成本按段用冻结价格计，切换不能低估成本；链耗尽时运行失败，不得静默回到主 provider 或猜测下一个端点。
 
 ## 5. 非目标
 

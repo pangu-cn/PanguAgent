@@ -399,7 +399,13 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - CLI：`pangu models list [--json]`（离线）；`pangu models probe [--json]`（对生效 endpoint 发一次有界 `GET /models`，操作者显式发起，非 2xx 只报状态不回显 body/key，客户端纪律与 `chat` 相同）。
   - **诚实边界**：价格表会过期——`models list` 显示 as-of 日期，覆盖以显式配置为准；本地 provider（ollama）无内置价格，必须显式声明（G4 fail closed 保持）。
   - **未包含（有意排除）**：Anthropic 等专用 wire 协议；在线价格抓取；自动 fallback 到其他 provider（归 B5）。
-- [ ] **B5 Provider fallback 策略**：只有兼容性、价格、健康状态和用户策略均允许时才 fallback；禁止静默切换到更宽权限模型。
+- [x] **B5 Provider fallback 策略（已做）**：只有兼容性、价格、健康状态和用户策略均允许时才 fallback；禁止静默切换到更宽权限模型。
+  - `[[model.fallback]]` 有序候选链：主 provider `chat` 失败时按声明顺序尝试；默认空 = 单 provider，行为与旧版完全一致。
+  - 配置期全量校验（fail-closed）：候选必须在注册表（能力可验证）、支持工具调用、context window 覆盖 `budget.max_input_tokens`、价格可解析、不与主模型/先前候选重复；主模型必须有可解析价格。
+  - 冻结与绑定：链冻结进 `GoalContract.fallbacks`（digest 仅在非空时携带）；`Agent::with_chain` 拒绝注入链与 contract 不一致（长度、逐位模型名）；新构造器 `Agent::with_chain`，`Agent::new` 语义不变（单 provider）。
+  - 审计与计价：每次失败尝试发 `Note`，每次成功切换发 `ProviderSwitched`（pangu-stream/1 provisional kind，F4 先例）；成本按段累计——每段 usage 按实际服务的 provider 冻结价格计，切换不能低估成本；链耗尽时运行失败（报最后错误），不回跳主 provider。
+  - **未包含（有意排除）**：后台健康探测（未受控出站请求；健康在尝试时判定）；运行中动态增删候选（链只能来自配置，边界收紧/放宽归人）；跨 run 的失败记忆（failed-path 账本只覆盖动作，不覆盖端点）。
+  - W-10 对照：能力声明 ✓（注册表强制）、价格校验 ✓（按段计价 + 配置期拒绝无价格候选）、用户策略 ✓（链只能显式声明）、显著变更提示 ✓（切换事件 + ModelRequest 记录实际 provider）、禁止静默切换 ✓。
 - [ ] **B6 本地部署 laya（用户可选）**：支持把 laya 作为本地决策服务/模型运行，用于 triage、gate、routing 等有界判断；默认关闭，由用户在配置或安装时显式开启。laya 不得成为 Pangu 核心启动依赖，不得直接创建 `VerifiedAction`、修改 Policy/预算/审批模式或执行工具；服务默认仅绑定 loopback，模型下载、远程 endpoint 和数据出站必须分别显式配置。
 
   - **改名记录（2026-09-26）**：B6 的本地决策模型从 JEV 换为 **laya**（开源）。代码零依赖，JEV 从未进入 `Cargo.toml`，所以这是**候选集成目标的名字替换**，不是依赖变更。
@@ -476,7 +482,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B4、C5、F1、F2、F3、F4
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B4、B5、C5、F1、F2、F3、F4
         （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
 第二批：B2、B3、D3、D4、F5
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）

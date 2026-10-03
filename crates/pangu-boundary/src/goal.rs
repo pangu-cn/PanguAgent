@@ -8,6 +8,17 @@ use crate::approval::ApprovalMode;
 use crate::budget::Budget;
 use crate::config::{canonicalize_with_missing, CheckpointSection, Config, ConversationSection};
 use crate::execution::ExecutionSection;
+
+/// B5: one declared fallback candidate, frozen into the contract. The agent's
+/// per-segment cost accounting uses these prices; `Agent::with_chain` refuses
+/// an injected provider chain that does not match this list position by
+/// position (model name).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContractFallback {
+    pub model: String,
+    pub input_usd_per_mtok: f64,
+    pub output_usd_per_mtok: f64,
+}
 use crate::sandbox::{absolute_path_from, Sandbox};
 
 /// The immutable, human-supplied portion of one run. The agent builds its
@@ -40,6 +51,11 @@ pub struct GoalContract {
     /// construction; the model cannot change it.
     #[serde(default)]
     pub plan_first: bool,
+    /// B5: the declared fallback chain, frozen at contract construction.
+    /// Empty = single-provider run (no fallback). Prices here drive the
+    /// per-segment cost accounting after a switch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<ContractFallback>,
     /// C5: the declared execution backend, frozen at contract construction.
     /// A declaration, not a verified fact: Pangu does not launch, manage, or
     /// verify backends; L1-L4 apply identically in every profile.
@@ -105,6 +121,7 @@ impl GoalContract {
             require_evidence: true,
             min_successful_tool_calls: 1,
             plan_first: false,
+            fallbacks: Vec::new(),
             execution: ExecutionSection::default(),
             price: None,
             policy_digest: crate::Policy::empty().digest(),
@@ -176,6 +193,15 @@ impl GoalContract {
             require_evidence: config.goal.require_evidence,
             min_successful_tool_calls: config.goal.min_successful_tool_calls,
             plan_first: config.goal.plan_first,
+            fallbacks: config
+                .resolve_fallbacks()?
+                .into_iter()
+                .map(|candidate| ContractFallback {
+                    model: candidate.model,
+                    input_usd_per_mtok: candidate.input_usd_per_mtok,
+                    output_usd_per_mtok: candidate.output_usd_per_mtok,
+                })
+                .collect(),
             execution: config.execution.clone(),
             price,
             policy_digest: crate::Policy::new(config.rules.clone())?.digest(),
@@ -289,6 +315,17 @@ impl GoalContract {
                         "profile": self.execution.profile.as_str(),
                         "description": &self.execution.description,
                     }),
+                );
+            }
+        }
+        // B5: a declared fallback chain is part of the run's contract (its
+        // prices drive cost accounting); a single-provider run keeps its
+        // historical digest.
+        if !self.fallbacks.is_empty() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "fallbacks".into(),
+                    serde_json::to_value(&self.fallbacks).unwrap_or(serde_json::Value::Null),
                 );
             }
         }
