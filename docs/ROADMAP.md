@@ -357,8 +357,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [x] **A5 会话导出与隐私检查（已做）**：借鉴 Pi session export、SWE-agent trajectory 和 Cline history。
   - `pangu conversation export --out <path> [--strict]`：导出前重扫 secret 标记、含用户名的绝对路径、超 64KiB 大对象（典型命令输出）；Sanitize 模式掩码/截断并出报告，Strict 模式直接拒绝。
   - 输出为 JSONL 派生投影（`derived: true, authoritative: false`），只可读不可回灌；`pangu-export/1` schema。
-- [ ] **A6 无限上下文（切片、组装与写回）**：会话历史本地全量留存、不受模型上下文窗口限制；按需切片，只把当前需要的部分传上去，返回的内容再并回总上下文。详见 [`docs/adr/0005-context-assembly.md`](docs/adr/0005-context-assembly.md)。
-  - **动机（仓库里的真实痛点）**：现在不是裁剪，是终止。`crates/pangu-agent/src/lib.rs` 的三处独立检查点（`Breach::InputTokens`）一旦 `estimated_input >= max_input_tokens` 就把 `terminal` 置为 `BudgetExhausted` 并 `break`，默认阈值 200,000。长任务今天只有两种结局：塞得下，或者死。
+- [x] **A6 无限上下文（切片、组装与写回）**：会话历史本地全量留存、不受模型上下文窗口限制；按需切片，只把当前需要的部分传上去，返回的内容再并回总上下文。详见 [`docs/adr/0005-context-assembly.md`](adr/0005-context-assembly.md)。（勾选含义按本节约定为“需求已确认并写入 ADR”；A6-0~A6-5 已实现并接入运行循环，剩余项见 ADR-0005 状态行：模型请求集接线、留存上界可配置化）
+  - **动机（A6-5 接入前的基线）**：A6 之前不是裁剪，是终止。`crates/pangu-agent/src/lib.rs` 曾有三处独立检查点（`Breach::InputTokens`）一旦 `estimated_input >= max_input_tokens` 就把 `terminal` 置为 `BudgetExhausted` 并 `break`，默认阈值 200,000——长任务只有两种结局：塞得下，或者死。（现状见 ADR-0005 §1 状态注记：接入后预算基于组装窗口，超预算仍有硬终止。）
   - **与 A1 的关系(重要)**:这是 A1 路线的**分叉**,不是叠加。A1b 路线是"全量 + 显式压缩"= 有损但连续(压缩后原文没了,只留 `compacted_from_digest` 指针);A6 是"全量留存 + 按需切片"= 无损但非连续。两者不能同时是默认。A6 定为**主路线**（2026-10-03 已确认），`ConversationSnapshot::compacted()` 降级为“某个切片摘要的一种降级模式”而非会话级一次性压缩。
   - **“需要哪个”不能由模型决定**：模型能裁掉 system 轮（边界指令在哪），也能裁掉“上次这个操作被拒了”的历史然后重试——正是 `invariant_i_failed_path_not_repeated` 防的事。组装 = **不可协商强制集**（system 轮 / goal / 被拒路径 / 未完成工具调用 / 最近 N 轮）+ 模型**请求**集；模型只能*请求*，不能*排除*。每次组装把**每个切片的来源与选取理由**写进事件流。
   - **写回（2026-10-03 已确认为读法 (a)）**：写回 = 模型的正常新消息，沿用现有 history 追加路径，不引入新的存储原语。模型改写切片内容的写回（读法 (b)）才是新攻击面——模型能改本地状态、篡改未来的输入——它**移交 B3**；届时护栏必须是：只追加为新切片、原切片不可变、记 `derived_from`、显式标 `unverified`、扩展 `invariant_i_resumed_conversation_carries_no_authorization` 覆盖它（ADR-0005 §3.3）。
@@ -455,11 +455,12 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-第一批：A1、A2、A3、A4、B1、B4、C5
-代码场景可选：F1、F2、F3、F4
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、F1、F2
+        （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
+第一批剩余：B4、C5
+代码场景可选：F3、F4
 第二批：B2、B3、D3、D4、F5
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
-阶段二实现已存在但仍为实验性 opt-in：F7（Artifact/Agent/CLI、事件和测试已完成；正式激活与支持声明仍受 operator recovery、跨平台和最终验收门约束）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```
 

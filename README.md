@@ -3,10 +3,11 @@
 > 一个在显式边界内自主使用工具的 AI agent。目标 G1-G5：诚实、可审计、不越界、成本有界、可嵌入。
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/pangu-cn/PanguAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/pangu-cn/PanguAgent/actions/workflows/ci.yml)
 
 ## 快速开始
 
-仓库可以直接运行：
+需要 Rust ≥ 1.82（`Cargo.toml` 的 `rust-version`）。仓库可以直接运行：
 
 ```bash
 # 查看编译进程序的默认边界、预算和规则
@@ -104,9 +105,10 @@ ToolExecutor::execute(&VerifiedAction)
 | `write_file` | 创建或替换工作区内文件 | `reversible` | 写入大小有上限；不是自动备份工具 |
 | `http_fetch` | 有界 HTTP `GET` | `needs_human` | 仅 allow-list host；禁止重定向和私网/metadata |
 | `run_command` | 运行无 shell 的只读命令 allow-list | `needs_human` | 不提供通用 shell；仍需审批 |
+| `git_diff` | 只读查看 `git diff/status/log/show` | `read_only` | 仅白名单子命令与 flag + 相对路径；输出超限即失败；不提交、不修改 index |
 | `finish` | 提交运行状态 | 控制工具 | `complete` 需要成功证据；不是外部副作用 |
 
-`run_command` 当前只允许 `pwd`, `cat`, `ls`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `diff`, `md5sum`, `sha256sum` 及受限参数。`http_fetch` 当前只实现 GET。
+`run_command` 当前只允许 `pwd`, `cat`, `ls`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `diff`, `md5sum`, `sha256sum` 及受限参数。`git_diff` 当前只允许 `git diff|status|log|show` 与白名单 flag（"undo" 归 `pangu rollback`，见 ROADMAP F2）。`http_fetch` 当前只实现 GET。
 
 ## Provider
 
@@ -130,13 +132,15 @@ pangu doctor
 pangu config [--file PATH]
 pangu run [--dry-run] "GOAL"
 pangu --demo [--dry-run]
-pangu explain --tool NAME [--arg K=V ...] [--path P ...] [--host H ...] [--risk CLASS] [--json]
-pangu events read PATH [--kind KIND] [--json]
+pangu explain --tool NAME [--arg K=V ...] [--arg0 PROGRAM ...] [--path P ...] [--host H ...] [--risk CLASS] [--json]
+pangu events read PATH [--kind KIND] [--json]      # PATH 也可以是 Journal 文件（自动迁移 forward）
 pangu events contract [--json]
 pangu conversation list
 pangu conversation show [--json]
+pangu conversation export [--id ID] --out PATH [--strict] [--json]
 pangu session tree [--json]
 pangu session replay NODE [--full] [--json]
+pangu repo map [--root PATH] [--budget N] [--json]
 pangu run --workspace PATH --max-turns N --max-cost-usd X "GOAL"
 pangu --checkpoint run "GOAL"
 pangu rollback --checkpoint-id ID --source-node NODE --rollback-id OP --reason "..."
@@ -163,16 +167,19 @@ save_every_turn = true
 
 `pangu session tree` / `pangu session replay` 是**只读**导航：列出会话节点（roots、children、各节点的 checkpoint），或把某个节点上记录的对话重建出来。两者都不写、不删、不移动节点，`replay` **也不恢复工作区**——那是 `pangu rollback` 的职责，两者不能互相替代。账本是一份可被手工编辑的 JSON 目录，所以遍历对环和缺失 parent 都按**损坏账本**处理：报错或标注，而不是给出一个看起来完整其实残缺的答案。当前已知每次普通运行的树**恰好有一个孤儿**（运行根节点从不落盘），`session tree` 会打 `WARNING`，`session replay` 拒绝执行——详见 [`docs/adr/0004-conversation-persistence.md`](docs/adr/0004-conversation-persistence.md) §7.3。
 
+上下文组装（A6）已接入默认运行路径：每轮发给模型的不是全量 history，而是按预算组装的窗口——**不可协商的强制集**（system 轮、goal、被拒路径、未完成工具调用的配对闭包、最近 8 轮）∪ **请求集**（模型只能请求、不能排除；当前默认运行请求集为空，第二阶段选择器接缝留给 B6）。摘要是确定性抽取而非模型生成；切片绑定会话消息前缀 digest 与逐范围 digest，对不上即报错，绝不静默重生成；切片拼接处显式插入 seam 标记，每次组装发 `ContextAssembled` 事件并带降级统计（full / summary / omitted / seam 数）。降级链 `full → summary → omit-with-reason` 走完仍放不下强制集时按 `BudgetExhausted` 硬终止——不存在“永不终止的运行”。本地留存硬上界（8 MiB / 10,000 条 / 单条 256 KiB）暂未放宽。设计与非目标见 [`docs/adr/0005-context-assembly.md`](docs/adr/0005-context-assembly.md)。
+
 `--dangerously-unattended` 会把 approval mode 设为 `never`、使用 fail-closed 的 `Unattended` handler，并在 `RunStarted` 元数据中记录 `unattended=true`；需要人工或破坏性风险的动作会被拒绝，读-only 动作仍须通过其它闸门。它不是安全模式，只是明确放弃人工确认。
 
 ## 目录与依赖方向
 
 ```text
-pangu-core ← pangu-boundary ← pangu-provider
-       ↑              ↑       ↘
-       └── pangu-agent ← pangu-toolkit
-                    ↓
-                  pangu (CLI)
+第 0 层  pangu-core        消息、事件、错误、JSON/glob、Journal/replay、Artifact、组装器
+第 1 层  pangu-boundary    L1 contract、L2 policy、L3 sandbox、L4 approval、预算（依赖 core）
+第 2 层  pangu-agent       Provider/ToolExecutor 协议、VerifiedAction、运行循环（依赖 core、boundary）
+第 3 层  pangu-provider    OpenAI-compatible 适配（依赖 agent、core）
+         pangu-toolkit     内置工具（依赖 agent、boundary、core）
+第 4 层  pangu (CLI)       配置加载、Journal、demo、子命令（依赖以上全部）
 ```
 
 - `pangu-core`：消息、事件、错误、JSON/glob、Journal/replay；不决定策略。
@@ -182,7 +189,7 @@ pangu-core ← pangu-boundary ← pangu-provider
 - `pangu-provider`：实现 Agent 的 `Provider` 协议。
 - `pangu`：配置加载、Journal、demo 和 CLI。
 
-规范细节见 [`docs/BOUNDARY.md`](docs/BOUNDARY.md)，实现说明见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，未来方向与特性选择见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。Checkpoint/rollback 的已批准设计见 [`docs/adr/0001-checkpoint-rollback.md`](docs/adr/0001-checkpoint-rollback.md)；阶段二实现、测试矩阵和条件性不变量见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 与 [`docs/BOUNDARY.md`](docs/BOUNDARY.md)，operator 处理步骤见 [`docs/CHECKPOINT_RECOVERY.md`](docs/CHECKPOINT_RECOVERY.md)。由于默认关闭、operator recovery 限制和正式激活门仍存在，本文不把它描述为默认支持能力。
+规范细节见 [`docs/BOUNDARY.md`](docs/BOUNDARY.md)，实现说明见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，未来方向与特性选择见 [`docs/ROADMAP.md`](docs/ROADMAP.md)；全部文档的索引与阅读顺序见 [`docs/README.md`](docs/README.md)。Checkpoint/rollback 的已批准设计见 [`docs/adr/0001-checkpoint-rollback.md`](docs/adr/0001-checkpoint-rollback.md)；阶段二实现、测试矩阵和条件性不变量见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 与 [`docs/BOUNDARY.md`](docs/BOUNDARY.md)，operator 处理步骤见 [`docs/CHECKPOINT_RECOVERY.md`](docs/CHECKPOINT_RECOVERY.md)。由于默认关闭、operator recovery 限制和正式激活门仍存在，本文不把它描述为默认支持能力。
 
 ## 开发与验证
 
@@ -198,13 +205,13 @@ Provider 集成测试使用本地 TCP mock server，不依赖外部网络或 API
 
 添加工具时实现 `ToolExecutor::specs/assess/execute`：`assess` 只能解析和声明资源，`execute` 必须使用传入的 `VerifiedAction`，并为成功结果提供有界 evidence。不要让 provider 或外部调用者直接执行未验证的模型调用。
 
-ADR-0001 阶段二验证要求如下（checkpoint/rollback 仍为实验性 opt-in）：
+ADR-0001 阶段二的验证已随实现落地（checkpoint/rollback 仍为实验性 opt-in）：
 
-- 覆盖成功 checkpoint、typed rollback、CAS/幂等、外部 effect、failed-path、stale lock、wall-clock budget 和真实 CLI 子进程；
-- 验证 Journal v1/v2、稳定 receipt、TeeSink receipt 一致性及损坏/超限输入的 fail-closed 行为；
-- 验证 snapshot/manifest/blob/node/marker、symlink、特殊文件、权限和跨进程锁；
-- 每个条件性不变量都要有独立测试，跨平台 replace hand-off 和 operator-only recovery 不能被隐藏为自动保证；
-- 在正式激活前，文档必须区分“阶段二实现已存在”和“默认支持”。
+- 成功 checkpoint、typed rollback、CAS/幂等、外部 effect、failed-path、stale lock、wall-clock budget 和真实 CLI 子进程均有测试覆盖；
+- Journal v1/v2、稳定 receipt、TeeSink receipt 一致性及损坏/超限输入的 fail-closed 行为已验证；
+- snapshot/manifest/blob/node/marker、symlink、特殊文件、权限和跨进程锁有独立测试；
+- 每个条件性不变量都有独立测试（见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 不变量测试矩阵），跨平台 replace hand-off 和 operator-only recovery 未被隐藏为自动保证；
+- operator 演练与跨平台验收记录见 [`docs/CHECKPOINT_RECOVERY.md`](docs/CHECKPOINT_RECOVERY.md) 第 6、8 节及 [`docs/evidence/`](docs/evidence/)；正式激活前，文档持续区分“阶段二实现已存在”和“默认支持”。
 
 ## License
 

@@ -47,6 +47,7 @@ pub struct Sandbox {
     pub allow_localhost: bool,
     pub max_paths_per_action: usize,
     pub max_write_bytes: usize,
+    pub extra_readonly_commands: Vec<String>,
 }
 
 impl Sandbox {
@@ -151,6 +152,7 @@ impl Sandbox {
             allow_localhost: config.network.allow_localhost,
             max_paths_per_action: config.max_paths_per_action,
             max_write_bytes: config.max_write_bytes,
+            extra_readonly_commands: config.extra_readonly_commands.clone(),
         })
     }
 
@@ -453,7 +455,9 @@ impl Sandbox {
             // `reset`, `clean`, …) is rejected before this point.
             "git",
         ];
-        if !COMMANDS.contains(&program) {
+        if !COMMANDS.contains(&program)
+            && !self.extra_readonly_commands.iter().any(|extra| extra == program)
+        {
             return Err(Error::Config(format!(
                 "command `{program}` is not on the read-only argv allow-list"
             )));
@@ -541,6 +545,7 @@ impl Sandbox {
                 | "sha256sum"
                 | "git"
         )
+            || self.extra_readonly_commands.iter().any(|extra| extra == command)
     }
 
     pub fn sanitize_env(&self, input: &HashMap<String, String>) -> HashMap<String, String> {

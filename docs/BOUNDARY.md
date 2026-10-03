@@ -87,6 +87,17 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 
 阶段二实现和测试已经存在，但在正式激活/支持声明前，本节和第 4.1 节是条件性实验规范；部署者仍须遵守第 4.1 节的 operator recovery 限制。
 
+### 上下文组装（Context Assembly）
+
+发给模型的输入不是完整 history，而是每轮重新组装的窗口（ADR-0005，已接入默认运行路径）：
+
+- 组装 = **强制集 ∪ 请求集**。强制集（system 轮、goal、被拒路径、未完成工具调用的配对闭包、最近 N 轮）不可被模型排除；模型只能请求追加切片，“需要哪个”不是模型决定。当前默认运行的请求集为空，请求集接线与选择器接缝（A6-6）留给 B6。组装是纯内存投影，不依赖 `conversation.enabled`（默认关闭时同样工作）。
+- 摘要由确定性抽取生成（首 N 行、工具名、错误行、计数），**不是模型生成**；切片绑定会话消息前缀 digest 与逐范围 digest，读时重算校验，对不上即报错，不静默重生成、不静默接受。
+- 切片拼接处的接缝显式标记（`[pangu context seam: …]`），组装结果是派生投影（`derived: true` / `authoritative: false`）；每次组装发 `ContextAssembled` 事件，带切片来源与降级统计。
+- 组装只影响模型看到的内容，**不改变 L1–L4 的任何判定**；被拒路径在强制集里，`I-Failed-Path-Not-Repeated` 的证据链不因切片而断。
+- 降级链 `full → summary → omit-with-reason` 走完仍放不下强制集时，以 `BudgetExhausted` 硬终止（I-Budget-Terminates）；不存在“永不终止的运行”。组装器自身失败与“上下文确实超预算”是两类错误，分别上报，不互相伪装。
+- 本地留存上界（当前硬编码为 8 MiB / 10,000 条 / 单条 256 KiB）与本节组装规则相互独立；按 ADR-0005 放宽时必须改为可配置并进 `doctor` 报告，不得静默取消上界。
+
 ### 边界之外
 
 Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代码隔离。不提供通用 shell、任意删除、支付、发邮件、凭据读取或默认放行便利模式。唯一明确的人工降级开关是 CLI 的 `--dangerously-unattended`：它要求 approval mode 为 `Never`，使用 fail-closed handler，并在 `RunStarted` 写入 `unattended=true`。

@@ -34,6 +34,16 @@ pub struct Config {
     pub goal: GoalSection,
     pub rules: Vec<Rule>,
     pub unattended: bool,
+    /// F3: the lint/test command the `verify` tool runs. Empty = the tool
+    /// is not advertised, exactly as if F3 were not compiled in.
+    #[serde(default)]
+    pub verify: VerifySection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct VerifySection {
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -317,6 +327,11 @@ pub struct BoundarySection {
     pub env: EnvSection,
     pub max_write_bytes: usize,
     pub max_paths_per_action: usize,
+    /// F3: extra programs admitted to the read-only argv allow-list, for
+    /// verify commands such as `cargo`/`npm`. Each entry must be a bare
+    /// program name; declaring one does not weaken path/host checks.
+    #[serde(default)]
+    pub extra_readonly_commands: Vec<String>,
 }
 
 pub type BoundaryConfig = BoundarySection;
@@ -344,6 +359,7 @@ impl Default for BoundarySection {
             env: EnvSection::default(),
             max_write_bytes: 4_194_304,
             max_paths_per_action: 64,
+            extra_readonly_commands: Vec::new(),
         }
     }
 }

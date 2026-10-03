@@ -115,7 +115,7 @@ RollbackRequested
 `Agent::run`（`run_stream` 是同一入口的便利别名）大致执行：
 
 1. 发出 `RunStarted`，记录模型、workspace、配置来源、boundary digest 和 unattended 标记。
-2. 在每次 provider 请求前以及每个 tool call 执行前检查 turn、历史估算 token、费用和墙钟预算；provider 报告的 `cache_read_tokens` 计入输入 token 预算，`price` 缺失会以 cost breach 停止。
+2. 在每次 provider 请求前以及每个 tool call 执行前检查 turn、输入 token、费用和墙钟预算。provider 请求前先做**上下文组装**（ADR-0005）：强制集（system 轮、goal、被拒路径、未完成工具调用的配对闭包、最近 8 轮）∪ 请求集，接缝显式标记，发 `ContextAssembled` 事件并带降级统计；输入 token 估算基于组装后的窗口。强制集降级到 `summary` 后仍放不下时以 `BudgetExhausted` 终止；组装器自身失败单独报错，不并入预算事件。provider 报告的 `cache_read_tokens` 计入输入 token 预算，`price` 缺失会以 cost breach 停止。
 3. provider 返回后合并真实 `Usage`，再次检查预算；超限直接发 `BudgetExhausted`。
 4. 对每个模型工具调用执行上面的 L2-L4 链。拒绝和工具错误都作为 `Message::Tool { is_error: true }` 回灌模型。
 5. `finish(status="complete")` 只有在 `min_successful_tool_calls` 个成功 evidence 后才保持 `Complete`；否则降级为 `Failed`。
@@ -134,7 +134,8 @@ ToolStarted, ToolBlocked, ToolFinished, BudgetExhausted,
 FinishRequested, RunFinished, Note,
 CheckpointCreated, CheckpointFailed,
 RollbackRequested, RollbackStarted, RollbackApplied,
-RollbackSkippedAlreadyApplied, RollbackFailed, FailedPathRecorded
+RollbackSkippedAlreadyApplied, RollbackFailed, FailedPathRecorded,
+ContextAssembled
 ```
 
 启用 checkpoint 的运行使用 `pangu-journal/v2`；禁用时保留 v1。v2 写入时封存 `schema`、连续 `seq`、`prev_sha`、内容 `sha` 和 `evt_<sha256>` 稳定 ID。`EventSink::emit` 保持兼容，内部 receipt 路径使用 `emit_with_receipt`；TeeSink 比较多个 durable sink 的 receipt，不一致则失败。Journal replay 只校验和索引，不恢复文件、不重放副作用。
