@@ -762,7 +762,7 @@ fn repo_map(root: Option<PathBuf>, budget: u64, json: bool) -> Result<()> {
             &pangu_core::repomap_fingerprint(&map)[..16]
         );
         if !map.skipped.is_empty() {
-            println!("# skipped: {} entries)", map.skipped.len());
+            println!("# skipped: {} entries", map.skipped.len());
         }
         print!("{}", view.text);
         if view.truncated {
