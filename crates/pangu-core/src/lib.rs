@@ -4,6 +4,7 @@
 //! runtime, provider, and toolkit layers. Policy decisions belong in
 //! `pangu-boundary`; this crate does not decide whether an action is allowed.
 
+pub mod assemble;
 pub mod artifact;
 pub mod checkpoint;
 pub mod conversation;
@@ -21,6 +22,10 @@ pub mod stream;
 pub mod summary;
 pub mod util;
 
+pub use assemble::{
+    assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,
+    DegradeMode, Omission, SecondStageSelector, Seam, SelectionReason, SliceSelection,
+};
 pub use artifact::{
     ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
     RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,

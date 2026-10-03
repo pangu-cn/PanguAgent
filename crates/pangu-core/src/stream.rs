@@ -100,6 +100,7 @@ pub enum StreamKind {
     RollbackSkippedAlreadyApplied,
     RollbackFailed,
     FailedPathRecorded,
+    ContextAssembled,
 }
 
 impl StreamKind {
@@ -153,6 +154,7 @@ impl StreamKind {
             Self::RollbackSkippedAlreadyApplied,
             Self::RollbackFailed,
             Self::FailedPathRecorded,
+            Self::ContextAssembled,
         ]
     }
 
@@ -186,6 +188,7 @@ impl StreamKind {
             EventKind::RollbackSkippedAlreadyApplied => Self::RollbackSkippedAlreadyApplied,
             EventKind::RollbackFailed => Self::RollbackFailed,
             EventKind::FailedPathRecorded => Self::FailedPathRecorded,
+            EventKind::ContextAssembled => Self::ContextAssembled,
         })
     }
 }
@@ -751,6 +754,7 @@ mod tests {
                 }
                 StreamKind::RollbackFailed => EventKind::RollbackFailed,
                 StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
+                StreamKind::ContextAssembled => EventKind::ContextAssembled,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -795,6 +799,7 @@ mod tests {
                     }
                     StreamKind::RollbackFailed => EventKind::RollbackFailed,
                     StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
+                    StreamKind::ContextAssembled => EventKind::ContextAssembled,
                 },
                 0,
                 "hello",

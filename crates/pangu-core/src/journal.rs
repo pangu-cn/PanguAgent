@@ -289,6 +289,7 @@ impl ConsoleSink {
             EventKind::RollbackSkippedAlreadyApplied => "  ↷ ",
             EventKind::RollbackFailed => "  × ",
             EventKind::FailedPathRecorded => "  ! ",
+            EventKind::ContextAssembled => "◧ ctx ",
         };
         let mut output = format!("{tag} ");
         if let Some(tool) = &event.tool {

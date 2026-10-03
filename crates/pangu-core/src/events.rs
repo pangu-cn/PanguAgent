@@ -36,6 +36,7 @@ pub enum EventKind {
     RollbackSkippedAlreadyApplied,
     RollbackFailed,
     FailedPathRecorded,
+    ContextAssembled,
 }
 
 impl EventKind {
