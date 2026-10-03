@@ -925,6 +925,115 @@ impl ArtifactStore {
         Ok(directory.join(format!("{}.json", safe_id(snapshot_id)?)))
     }
 
+    /// Persist the summary index for one run.
+    ///
+    /// Unlike snapshots, this file **is** rewritten: it is a derived index,
+    /// rebuilt incrementally as the run grows (`summary::extend`), so unlike
+    /// the audit artifacts it may not be immutable. What it may not be is
+    /// *silently wrong*: every load re-verifies it against the history (see
+    /// [`crate::summary::verify`]), and a divergent history is an error, not
+    /// a regeneration trigger.
+    pub fn save_summaries(
+        &self,
+        key: &str,
+        summaries: &crate::summary::ConversationSummaries,
+    ) -> Result<()> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| Error::Other("artifact operation lock is poisoned".into()))?;
+        let _process_lock = StoreProcessLock::acquire(&self.root)?;
+        if summaries.entries.len() != summaries.message_count {
+            return Err(Error::Config(format!(
+                "summary file carries {} entries for {} messages",
+                summaries.entries.len(),
+                summaries.message_count
+            )));
+        }
+        if summaries.message_count > crate::MAX_CONVERSATION_MESSAGES {
+            return Err(Error::Config(
+                "summary file exceeds the message bound".into(),
+            ));
+        }
+        let bytes = serde_json::to_vec_pretty(summaries)?;
+        crate::conversation::validate_encoded_size(&bytes)?;
+        let path = self.summaries_path(key)?;
+        write_atomic(&path, &bytes)
+    }
+
+    /// Load a summary index. Structural validation only; binding it to a real
+    /// history is [`crate::summary::verify`]'s job.
+    pub fn load_summaries(&self, key: &str) -> Result<crate::summary::ConversationSummaries> {
+        validate_id("summary key", key)?;
+        let path = self.summaries_path(key)?;
+        let bytes = read_regular_file_bounded(&path, crate::MAX_CONVERSATION_BYTES as u64)?;
+        let summaries: crate::summary::ConversationSummaries = serde_json::from_slice(&bytes)?;
+        if summaries.entries.len() != summaries.message_count {
+            return Err(Error::Config(
+                "summary file entry count does not match its claimed message count".into(),
+            ));
+        }
+        Ok(summaries)
+    }
+
+    /// Whether a summary index exists for this key.
+    pub fn has_summaries(&self, key: &str) -> Result<bool> {
+        validate_id("summary key", key)?;
+        Ok(path_exists_without_symlink(&self.summaries_path(key)?)?)
+    }
+
+    fn summaries_path(&self, key: &str) -> Result<PathBuf> {
+        let directory = self.root.join("summaries");
+        if !path_exists_without_symlink(&directory)? {
+            fs::create_dir(&directory)?;
+        }
+        reject_symlink_components(&directory)?;
+        Ok(directory.join(format!("{}.json", safe_id(key)?)))
+    }
+
+    /// Persist the slice index for one run. Same derived-index rules as
+    /// summaries: rewritten incrementally (`slice::extend`), always
+    /// re-verifiable against the history.
+    pub fn save_slices(&self, key: &str, slices: &crate::slice::ConversationSlices) -> Result<()> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| Error::Other("artifact operation lock is poisoned".into()))?;
+        let _process_lock = StoreProcessLock::acquire(&self.root)?;
+        if slices.message_count > crate::MAX_CONVERSATION_MESSAGES {
+            return Err(Error::Config("slice file exceeds the message bound".into()));
+        }
+        let bytes = serde_json::to_vec_pretty(slices)?;
+        crate::conversation::validate_encoded_size(&bytes)?;
+        let path = self.slices_path(key)?;
+        write_atomic(&path, &bytes)
+    }
+
+    pub fn load_slices(&self, key: &str) -> Result<crate::slice::ConversationSlices> {
+        validate_id("slice key", key)?;
+        let path = self.slices_path(key)?;
+        let bytes = read_regular_file_bounded(&path, crate::MAX_CONVERSATION_BYTES as u64)?;
+        let slices: crate::slice::ConversationSlices = serde_json::from_slice(&bytes)?;
+        if slices.message_count > crate::MAX_CONVERSATION_MESSAGES {
+            return Err(Error::Config("slice file exceeds the message bound".into()));
+        }
+        Ok(slices)
+    }
+
+    pub fn has_slices(&self, key: &str) -> Result<bool> {
+        validate_id("slice key", key)?;
+        Ok(path_exists_without_symlink(&self.slices_path(key)?)?)
+    }
+
+    fn slices_path(&self, key: &str) -> Result<PathBuf> {
+        let directory = self.root.join("slices");
+        if !path_exists_without_symlink(&directory)? {
+            fs::create_dir(&directory)?;
+        }
+        reject_symlink_components(&directory)?;
+        Ok(directory.join(format!("{}.json", safe_id(key)?)))
+    }
+
     pub fn compute_workspace_digest(&self, request: &SnapshotRequest) -> Result<String> {
         request.validate()?;
         let snapshot = collect_snapshot(request)?;

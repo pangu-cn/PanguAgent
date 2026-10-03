@@ -16,7 +16,9 @@ pub mod json;
 pub mod messages;
 pub mod replay;
 pub mod session;
+pub mod slice;
 pub mod stream;
+pub mod summary;
 pub mod util;
 
 pub use artifact::{
@@ -46,10 +48,18 @@ pub use inspect::{
 };
 pub use journal::{ConsoleSink, Journal};
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
+pub use slice::{
+    extend as extend_slices, slice, verify as verify_slices, ConversationSlices, SliceEntry,
+    SliceKind, SLICE_SCHEMA_VERSION,
+};
 pub use stream::{
     read_stream, EventMigrator, Stability, StreamData, StreamEffect, StreamEvent, StreamKind,
     StreamOrigin, StreamSummary, StreamWriter, MAX_STREAM_BYTES, MAX_STREAM_LINE_BYTES,
     STREAM_SCHEMA_V1,
+};
+pub use summary::{
+    extend as extend_summaries, summarize, summarize_message, verify as verify_summaries,
+    ConversationSummaries, SummaryEntry, SummaryKind, SUMMARY_SCHEMA_VERSION,
 };
 pub use util::{
     approx_tokens_of_chars, hex_sha256, now_rfc3339, one_line, short_hash, truncate_middle,

@@ -104,6 +104,77 @@ impl ConversationRuntime {
         self.save_every_turn
     }
 
+    /// The summary index key for a run: the same redacted-run-label derivation
+    /// the snapshot ids use, so a run's summaries sit under one stable name.
+    fn summaries_key(run_id: &str) -> String {
+        pangu_core::short_hash(&pangu_core::redact_text(run_id))
+    }
+
+    /// Build or grow the run's summary index, deterministically.
+    ///
+    /// Grow-only: an existing index is extended and re-verified, never
+    /// rewritten from scratch, so a tampered index fails loudly here instead
+    /// of being laundered into a fresh one. Errors are returned, not logged.
+    pub fn save_summaries(
+        &self,
+        run_id: &str,
+        history: &[Message],
+    ) -> Result<pangu_core::ConversationSummaries> {
+        let key = Self::summaries_key(run_id);
+        let summaries = if self.store.has_summaries(&key)? {
+            let old = self.store.load_summaries(&key)?;
+            pangu_core::extend_summaries(&old, history)?
+        } else {
+            pangu_core::summarize(history)?
+        };
+        pangu_core::verify_summaries(&summaries, history)?;
+        self.store.save_summaries(&key, &summaries)?;
+        Ok(summaries)
+    }
+
+    /// Build or grow the run's slice index, deterministically. Same
+    /// grow-only, re-verify-first rule as [`Self::save_summaries`].
+    pub fn save_slices(
+        &self,
+        run_id: &str,
+        history: &[Message],
+    ) -> Result<pangu_core::ConversationSlices> {
+        let key = Self::summaries_key(run_id);
+        let slices = if self.store.has_slices(&key)? {
+            let old = self.store.load_slices(&key)?;
+            pangu_core::extend_slices(&old, history)?
+        } else {
+            pangu_core::slice(history)?
+        };
+        pangu_core::verify_slices(&slices, history)?;
+        self.store.save_slices(&key, &slices)?;
+        Ok(slices)
+    }
+
+    /// Load the run's slice index and verify it against a live history.
+    pub fn load_slices(
+        &self,
+        run_id: &str,
+        history: &[Message],
+    ) -> Result<pangu_core::ConversationSlices> {
+        let key = Self::summaries_key(run_id);
+        let slices = self.store.load_slices(&key)?;
+        pangu_core::verify_slices(&slices, history)?;
+        Ok(slices)
+    }
+
+    /// Load the run's summary index and verify it against a live history.
+    pub fn load_summaries(
+        &self,
+        run_id: &str,
+        history: &[Message],
+    ) -> Result<pangu_core::ConversationSummaries> {
+        let key = Self::summaries_key(run_id);
+        let summaries = self.store.load_summaries(&key)?;
+        pangu_core::verify_summaries(&summaries, history)?;
+        Ok(summaries)
+    }
+
     /// The stored snapshots that belong to one session node, oldest first.
     ///
     /// A node can have several: saving every turn means one snapshot per turn
@@ -233,6 +304,45 @@ mod tests {
         );
         assert!(validate_resumable(&[]).is_err());
         assert!(validate_resumable(&seed_history("sys", "goal")).is_ok());
+    }
+
+    #[test]
+    fn summaries_are_built_then_grow_without_invalidating() {
+        let root = temp_root("summaries");
+        let runtime = runtime(&root);
+        runtime.save_summaries("run-1", &history()).expect("build");
+        let mut longer = history();
+        longer.push(Message::user("and thanks"));
+        let grown = runtime.save_summaries("run-1", &longer).expect("grow");
+        assert_eq!(grown.message_count, longer.len());
+        let loaded = runtime
+            .load_summaries("run-1", &longer)
+            .expect("load + verify");
+        assert_eq!(loaded, grown);
+        // A history that diverged from the stored prefix must fail, not
+        // silently regenerate.
+        let mut diverged = longer.clone();
+        diverged[1] = Message::user("changed");
+        assert!(runtime.load_summaries("run-1", &diverged).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn slices_are_built_then_grow_without_invalidating() {
+        let root = temp_root("slices");
+        let runtime = runtime(&root);
+        let built = runtime.save_slices("run-1", &history()).expect("build");
+        assert!(!built.entries.is_empty());
+        let mut longer = history();
+        longer.push(Message::user("and again"));
+        longer.push(Message::assistant("sure"));
+        let grown = runtime.save_slices("run-1", &longer).expect("grow");
+        assert_eq!(grown.message_count, longer.len());
+        let loaded = runtime
+            .load_slices("run-1", &longer)
+            .expect("load + verify");
+        assert_eq!(loaded, grown);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
