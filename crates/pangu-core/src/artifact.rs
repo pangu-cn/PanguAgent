@@ -23,6 +23,7 @@ use crate::checkpoint::{
     FailedPathRecord, FailedPathStatus, SessionNode, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_FILES,
     MAX_SNAPSHOT_FILE_BYTES,
 };
+use crate::conversation::{ConversationSnapshot, MAX_CONVERSATION_BYTES};
 use crate::{now_rfc3339, redact_text, Error, Glob, Result};
 
 pub const ARTIFACT_STORE_SCHEMA_VERSION: u32 = 1;
@@ -30,6 +31,13 @@ pub const ROLLBACK_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_ARTIFACT_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROLLBACK_OPERATION_BYTES: usize = 256 * 1024;
 pub const MAX_SESSION_NODE_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on how many nodes a single session ledger may hold.
+///
+/// Navigation is O(n) over this directory and a corrupted or hostile store
+/// could otherwise make `pangu session tree` walk an unbounded number of
+/// files. It is far above any realistic run length.
+pub const MAX_SESSION_NODES: usize = 100_000;
 pub const MAX_CHECKPOINT_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_FAILED_PATH_LEDGER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EFFECT_LEDGER_BYTES: usize = 8 * 1024 * 1024;
@@ -737,6 +745,52 @@ impl ArtifactStore {
         Ok(node)
     }
 
+    /// Enumerate every session node in the ledger.
+    ///
+    /// This is the only way to discover the session tree: nodes are only
+    /// otherwise reachable one id at a time through
+    /// [`Self::load_session_node_by_id`]. A node that fails to parse is an
+    /// error rather than a silent omission — a tree that quietly drops a
+    /// branch would answer "what happened here" incorrectly, which is worse
+    /// than refusing to answer.
+    pub fn list_session_nodes(&self) -> Result<Vec<SessionNode>> {
+        let sessions = self.root.join("sessions");
+        if !path_exists_without_symlink(&sessions)? {
+            return Ok(Vec::new());
+        }
+        reject_symlink_components(&sessions)?;
+        let mut nodes = Vec::new();
+        for entry in std::fs::read_dir(&sessions)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            validate_id("session_node_id", id)?;
+            let path = sessions.join(format!("{id}.json"));
+            reject_symlink_components(&path)?;
+            let node: SessionNode = serde_json::from_slice(&read_regular_file_bounded(
+                &path,
+                MAX_SESSION_NODE_BYTES as u64,
+            )?)?;
+            node.validate()?;
+            if node.session_node_id != id {
+                return Err(Error::Config(
+                    "session node id does not match its ledger path".into(),
+                ));
+            }
+            nodes.push(node);
+        }
+        if nodes.len() > MAX_SESSION_NODES {
+            return Err(Error::Config(format!(
+                "session ledger holds {} nodes, over the {MAX_SESSION_NODES} limit",
+                nodes.len()
+            )));
+        }
+        nodes.sort_by(|left, right| left.session_node_id.cmp(&right.session_node_id));
+        Ok(nodes)
+    }
+
     /// Load a session node by its globally unique id. Session nodes are kept
     /// in a separate immutable ledger so a rollback can name the current
     /// source node even when the target checkpoint is older.
@@ -797,6 +851,187 @@ impl ArtifactStore {
         }
         let bytes = serialize_bounded(node, MAX_SESSION_NODE_BYTES, "session node ledger record")?;
         write_atomic(&path, &bytes)
+    }
+
+    /// Persist a conversation snapshot.
+    ///
+    /// Stored beside the checkpoints rather than in a store of its own: content
+    /// addressing, the process lock, and the symlink rejection are already
+    /// exercised here, and a second storage path would mean a second set of
+    /// integrity rules to trust. Snapshots are append-only — a `snapshot_id`
+    /// is never rewritten — so a later compaction adds a new record and
+    /// leaves the earlier one readable.
+    pub fn save_conversation(&self, conversation: &ConversationSnapshot) -> Result<()> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| Error::Other("artifact operation lock is poisoned".into()))?;
+        let _process_lock = StoreProcessLock::acquire(&self.root)?;
+        conversation.validate()?;
+        validate_id("snapshot_id", &conversation.snapshot_id)?;
+        let bytes = crate::conversation::encode_linewise(conversation)?;
+        crate::conversation::validate_encoded_size(&bytes)?;
+        let path = self.conversation_path(&conversation.snapshot_id)?;
+        if path_exists_without_symlink(&path)? {
+            // Rewriting would invalidate every compaction record that points
+            // at this digest, so an existing snapshot is immutable.
+            return Err(Error::Config(format!(
+                "conversation snapshot already exists and is immutable: {}",
+                conversation.snapshot_id
+            )));
+        }
+        write_atomic(&path, &bytes)
+    }
+
+    /// Load a conversation snapshot and verify its digest.
+    pub fn load_conversation(&self, snapshot_id: &str) -> Result<ConversationSnapshot> {
+        validate_id("snapshot_id", snapshot_id)?;
+        let path = self.conversation_path(snapshot_id)?;
+        let bytes = read_regular_file_bounded(&path, MAX_CONVERSATION_BYTES as u64)?;
+        let conversation: ConversationSnapshot = serde_json::from_slice(&bytes)?;
+        // Validate on the way out, not only on the way in: the file may have
+        // been edited since it was written, and a tampered history restored as
+        // if intact is exactly the failure this must not allow.
+        conversation.validate()?;
+        Ok(conversation)
+    }
+
+    /// Every stored snapshot id, sorted.
+    pub fn list_conversations(&self) -> Result<Vec<String>> {
+        let sessions = self.root.join("conversations");
+        if !path_exists_without_symlink(&sessions)? {
+            return Ok(Vec::new());
+        }
+        reject_symlink_components(&sessions)?;
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&sessions)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_suffix(".json") {
+                validate_id("snapshot_id", id)?;
+                ids.push(id.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn conversation_path(&self, snapshot_id: &str) -> Result<PathBuf> {
+        let directory = self.root.join("conversations");
+        if !path_exists_without_symlink(&directory)? {
+            fs::create_dir(&directory)?;
+        }
+        reject_symlink_components(&directory)?;
+        Ok(directory.join(format!("{}.json", safe_id(snapshot_id)?)))
+    }
+
+    /// Persist the summary index for one run.
+    ///
+    /// Unlike snapshots, this file **is** rewritten: it is a derived index,
+    /// rebuilt incrementally as the run grows (`summary::extend`), so unlike
+    /// the audit artifacts it may not be immutable. What it may not be is
+    /// *silently wrong*: every load re-verifies it against the history (see
+    /// [`crate::summary::verify`]), and a divergent history is an error, not
+    /// a regeneration trigger.
+    pub fn save_summaries(
+        &self,
+        key: &str,
+        summaries: &crate::summary::ConversationSummaries,
+    ) -> Result<()> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| Error::Other("artifact operation lock is poisoned".into()))?;
+        let _process_lock = StoreProcessLock::acquire(&self.root)?;
+        if summaries.entries.len() != summaries.message_count {
+            return Err(Error::Config(format!(
+                "summary file carries {} entries for {} messages",
+                summaries.entries.len(),
+                summaries.message_count
+            )));
+        }
+        if summaries.message_count > crate::MAX_CONVERSATION_MESSAGES {
+            return Err(Error::Config(
+                "summary file exceeds the message bound".into(),
+            ));
+        }
+        let bytes = serde_json::to_vec_pretty(summaries)?;
+        crate::conversation::validate_encoded_size(&bytes)?;
+        let path = self.summaries_path(key)?;
+        write_atomic(&path, &bytes)
+    }
+
+    /// Load a summary index. Structural validation only; binding it to a real
+    /// history is [`crate::summary::verify`]'s job.
+    pub fn load_summaries(&self, key: &str) -> Result<crate::summary::ConversationSummaries> {
+        validate_id("summary key", key)?;
+        let path = self.summaries_path(key)?;
+        let bytes = read_regular_file_bounded(&path, crate::MAX_CONVERSATION_BYTES as u64)?;
+        let summaries: crate::summary::ConversationSummaries = serde_json::from_slice(&bytes)?;
+        if summaries.entries.len() != summaries.message_count {
+            return Err(Error::Config(
+                "summary file entry count does not match its claimed message count".into(),
+            ));
+        }
+        Ok(summaries)
+    }
+
+    /// Whether a summary index exists for this key.
+    pub fn has_summaries(&self, key: &str) -> Result<bool> {
+        validate_id("summary key", key)?;
+        Ok(path_exists_without_symlink(&self.summaries_path(key)?)?)
+    }
+
+    fn summaries_path(&self, key: &str) -> Result<PathBuf> {
+        let directory = self.root.join("summaries");
+        if !path_exists_without_symlink(&directory)? {
+            fs::create_dir(&directory)?;
+        }
+        reject_symlink_components(&directory)?;
+        Ok(directory.join(format!("{}.json", safe_id(key)?)))
+    }
+
+    /// Persist the slice index for one run. Same derived-index rules as
+    /// summaries: rewritten incrementally (`slice::extend`), always
+    /// re-verifiable against the history.
+    pub fn save_slices(&self, key: &str, slices: &crate::slice::ConversationSlices) -> Result<()> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| Error::Other("artifact operation lock is poisoned".into()))?;
+        let _process_lock = StoreProcessLock::acquire(&self.root)?;
+        if slices.message_count > crate::MAX_CONVERSATION_MESSAGES {
+            return Err(Error::Config("slice file exceeds the message bound".into()));
+        }
+        let bytes = serde_json::to_vec_pretty(slices)?;
+        crate::conversation::validate_encoded_size(&bytes)?;
+        let path = self.slices_path(key)?;
+        write_atomic(&path, &bytes)
+    }
+
+    pub fn load_slices(&self, key: &str) -> Result<crate::slice::ConversationSlices> {
+        validate_id("slice key", key)?;
+        let path = self.slices_path(key)?;
+        let bytes = read_regular_file_bounded(&path, crate::MAX_CONVERSATION_BYTES as u64)?;
+        let slices: crate::slice::ConversationSlices = serde_json::from_slice(&bytes)?;
+        if slices.message_count > crate::MAX_CONVERSATION_MESSAGES {
+            return Err(Error::Config("slice file exceeds the message bound".into()));
+        }
+        Ok(slices)
+    }
+
+    pub fn has_slices(&self, key: &str) -> Result<bool> {
+        validate_id("slice key", key)?;
+        Ok(path_exists_without_symlink(&self.slices_path(key)?)?)
+    }
+
+    fn slices_path(&self, key: &str) -> Result<PathBuf> {
+        let directory = self.root.join("slices");
+        if !path_exists_without_symlink(&directory)? {
+            fs::create_dir(&directory)?;
+        }
+        reject_symlink_components(&directory)?;
+        Ok(directory.join(format!("{}.json", safe_id(key)?)))
     }
 
     pub fn compute_workspace_digest(&self, request: &SnapshotRequest) -> Result<String> {
@@ -1482,7 +1717,18 @@ fn collect_directory(
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| Error::Other("snapshot byte count overflowed".into()))?;
             if *total_bytes > limits.max_snapshot_bytes {
-                return Err(Error::Other("snapshot exceeds total byte limit".into()));
+                // Name the file that pushed it over. Build output is the usual
+                // cause and the limit message alone does not say so: a bare
+                // "exceeds total byte limit" reads like a corrupted snapshot,
+                // and the operator has no way to learn which directory to
+                // exclude. `relative` shows them, because the path sits inside
+                // the tree that is actually responsible.
+                return Err(Error::Other(format!(
+                    "snapshot exceeds total byte limit ({} bytes) while adding `{relative}`; \
+                     add that directory to checkpoint.exclude_roots if it is build output, \
+                     or raise checkpoint.max_snapshot_bytes",
+                    limits.max_snapshot_bytes
+                )));
             }
             let size = bytes.len() as u64;
             blobs.entry(digest.clone()).or_insert(bytes);
@@ -2283,10 +2529,20 @@ fn target_path(workspace: &Path, request: &SnapshotRequest, relative: &str) -> R
             "restore path is outside snapshot roots".into(),
         ));
     }
-    if is_excluded(&target, &request.excluded_roots) {
-        return Err(Error::Config(
-            "restore path enters the artifact store".into(),
-        ));
+    // Say which root excluded it. `excluded_roots` used to be only the
+    // internal ones, so "enters the artifact store" was the whole story; now
+    // an operator can exclude `target/` and a checkpoint taken before they did
+    // will fail here. Naming the root is the difference between "this run is
+    // misconfigured" and "this checkpoint predates my exclusions".
+    if let Some(root) = request
+        .excluded_roots
+        .iter()
+        .find(|root| target == **root || target.starts_with(root))
+    {
+        return Err(Error::Config(format!(
+            "restore path is inside excluded root `{}`",
+            root.display()
+        )));
     }
     let relative = relative_path(workspace, &target)?;
     for pattern in &request.forbidden_globs {
@@ -2487,6 +2743,111 @@ mod tests {
         assert!(!workspace.join("remove.txt").exists());
         assert!(!workspace.join("new.txt").exists());
         assert!(workspace.join("old-dir").is_dir());
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    /// The property that makes `exclude_roots` safe rather than convenient.
+    /// A directory the snapshot never recorded is a directory the rollback
+    /// never enumerated, so it cannot be in the "missing from the target
+    /// snapshot" set that restore deletes. Without this, excluding `target/`
+    /// to make a snapshot fit would make rollback delete the build output.
+    #[test]
+    fn restore_leaves_an_excluded_root_untouched() {
+        let workspace = root("workspace-excluded-restore");
+        let store_root = workspace.join(".pangu/checkpoints");
+        let store = ArtifactStore::open(&store_root).unwrap();
+        fs::write(workspace.join("kept.txt"), "before").unwrap();
+        fs::create_dir_all(workspace.join("build-output")).unwrap();
+        fs::write(workspace.join("build-output/large.bin"), "regenerable").unwrap();
+        let snapshot_request = SnapshotRequest::new(
+            workspace.clone(),
+            vec![workspace.clone()],
+            vec![store_root.clone(), workspace.join("build-output")],
+            vec!["**/.git/**".into()],
+            SnapshotLimits::default(),
+        );
+        let target = store
+            .commit_snapshot(&snapshot_request, artifact(&workspace, "cp-excluded"))
+            .unwrap();
+        assert!(!target
+            .file_entries
+            .iter()
+            .any(|entry| entry.path.starts_with("build-output")));
+
+        // Everything under the excluded root changes, and one of those changes
+        // is exactly what restore would do to a recorded file: delete it.
+        fs::remove_file(workspace.join("build-output/large.bin")).unwrap();
+        fs::write(workspace.join("build-output/new.bin"), "fresh").unwrap();
+        fs::write(workspace.join("kept.txt"), "changed").unwrap();
+        let expected = store.compute_workspace_digest(&snapshot_request).unwrap();
+        let result = store
+            .restore_checkpoint_with_expected(&snapshot_request, &target, "rb-excluded", &expected)
+            .unwrap();
+
+        assert_eq!(result.disposition, RestoreDisposition::Applied);
+        assert_eq!(
+            fs::read_to_string(workspace.join("kept.txt")).unwrap(),
+            "before",
+            "recorded state is still restored"
+        );
+        assert!(
+            !workspace.join("build-output/large.bin").exists(),
+            "rollback restored a file it never recorded"
+        );
+        assert!(
+            workspace.join("build-output/new.bin").exists(),
+            "rollback deleted a file it never recorded"
+        );
+        assert!(
+            workspace.join("build-output").is_dir(),
+            "rollback removed an excluded directory"
+        );
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    /// A checkpoint taken before an exclusion existed still holds paths under
+    /// what is now excluded. Restoring it has to fail, not quietly skip those
+    /// entries — a partial restore is the worst outcome, because the operator
+    /// sees a successful rollback and a workspace that is half reverted.
+    #[test]
+    fn restore_refuses_a_checkpoint_that_predates_the_exclusion() {
+        let workspace = root("workspace-excluded-later");
+        let store_root = workspace.join(".pangu/checkpoints");
+        let store = ArtifactStore::open(&store_root).unwrap();
+        fs::create_dir_all(workspace.join("build-output")).unwrap();
+        fs::write(workspace.join("build-output/large.bin"), "old").unwrap();
+        let without_exclusion = request(&workspace, &store_root);
+        let target = store
+            .commit_snapshot(
+                &without_exclusion,
+                artifact(&workspace, "cp-before-exclude"),
+            )
+            .unwrap();
+
+        let with_exclusion = SnapshotRequest::new(
+            workspace.clone(),
+            vec![workspace.clone()],
+            vec![store_root, workspace.join("build-output")],
+            vec!["**/.git/**".into()],
+            SnapshotLimits::default(),
+        );
+        let expected = store.compute_workspace_digest(&with_exclusion).unwrap();
+        let error = store
+            .restore_checkpoint_with_expected(
+                &with_exclusion,
+                &target,
+                "rb-before-exclude",
+                &expected,
+            )
+            .expect_err("a checkpoint holding excluded paths must not restore");
+        let message = error.to_string();
+        assert!(
+            message.contains("excluded root") && message.contains("build-output"),
+            "the error must name the root that blocked it: {message}"
+        );
+        // Nothing was touched: the file the checkpoint would have restored is
+        // still there.
+        assert!(workspace.join("build-output/large.bin").exists());
         fs::remove_dir_all(workspace).ok();
     }
 

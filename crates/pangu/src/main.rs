@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use pangu_agent::{Agent, Provider};
 use pangu_boundary::{
-    CliOverrides, Config, GoalContract, Policy, Sandbox, StdinApproval, Unattended,
+    explain_action, CliOverrides, Config, ExplainContext, ExplainRequest, GoalContract, Policy,
+    Risk, Sandbox, StdinApproval, Unattended,
 };
 use pangu_core::{ChatResponse, Journal, Message, RollbackRequest, TeeSink, ToolCall, Usage};
 use pangu_provider::OpenAiCompatibleProvider;
@@ -76,11 +77,75 @@ enum Commands {
         #[arg(long, default_value = "cli")]
         requested_by: String,
     },
+    /// Explain what the boundary would do with a hypothetical action.
+    ///
+    /// Advisory only: it executes nothing, writes nothing, and is never an
+    /// authorization. A real run re-evaluates everything.
+    Explain {
+        /// Tool name as the model would request it.
+        #[arg(long)]
+        tool: String,
+        /// Arguments as `key=value` pairs, or a single JSON object.
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Resource paths the action would touch.
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        /// Network hosts the action would reach.
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        /// Full argv for a command action.
+        #[arg(long = "arg0")]
+        argv: Vec<String>,
+        /// Risk class. Defaults to the human-risk end, matching an
+        /// unclassified tool call.
+        #[arg(long, value_enum)]
+        risk: Option<RiskArg>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Persisted conversation history. Resume continues a conversation; it
+    /// never restores the workspace, which is `pangu rollback`'s job.
+    Conversation {
+        #[command(subcommand)]
+        action: ConversationCommands,
+    },
+    /// Navigate the session tree and replay recorded conversations. Read-only.
+    Session {
+        #[command(subcommand)]
+        action: SessionCommands,
+    },
+    /// Inspect a stable event stream. Read-only, and never an authorization.
+    Events {
+        #[command(subcommand)]
+        action: EventsCommands,
+    },
     /// Read-only operator tooling. Nothing here repairs or cleans evidence.
     Artifact {
         #[command(subcommand)]
         action: ArtifactCommands,
     },
+}
+
+/// Risk classes accepted on the command line. Kept separate from the boundary
+/// enum so the CLI surface cannot grow without a deliberate change.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum RiskArg {
+    ReadOnly,
+    Reversible,
+    Destructive,
+    NeedsHuman,
+}
+
+impl From<RiskArg> for Risk {
+    fn from(value: RiskArg) -> Self {
+        match value {
+            RiskArg::ReadOnly => Self::ReadOnly,
+            RiskArg::Reversible => Self::Reversible,
+            RiskArg::Destructive => Self::Destructive,
+            RiskArg::NeedsHuman => Self::NeedsHuman,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -89,6 +154,65 @@ enum ArtifactCommands {
     Inspect {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Conversation history commands. `list` and `show` are read-only; a resume
+/// still goes through every gate.
+#[derive(Clone, Debug, Subcommand)]
+enum ConversationCommands {
+    /// List stored conversations, oldest first.
+    List,
+    /// Show one conversation's metadata without its full text.
+    Show {
+        /// Snapshot id. Defaults to the most recent.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Read-only navigation over the session node ledger (A1-3). Nothing here
+/// creates, moves, or deletes a node, and replaying a node is not a rollback.
+#[derive(Clone, Debug, Subcommand)]
+enum SessionCommands {
+    /// Show the session tree: roots, children, and each node's checkpoint.
+    Tree {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconstruct the conversation recorded at one node, without restoring the
+    /// workspace. For that, use `pangu rollback`.
+    Replay {
+        /// Session node id.
+        node: String,
+        /// Print the full message list rather than a summary.
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Read-only commands over the stable event stream. Nothing here writes,
+/// repairs, or re-derives a stream.
+#[derive(Clone, Debug, Subcommand)]
+enum EventsCommands {
+    /// Read a `pangu-stream/*` file (or a journal, migrated forward).
+    Read {
+        /// Path to the NDJSON stream, or to a journal file.
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Print only records of this kind.
+        #[arg(long = "kind")]
+        kind: Option<String>,
+    },
+    /// List the contract: supported versions, kinds, and their stability.
+    Contract {
         #[arg(long)]
         json: bool,
     },
@@ -108,6 +232,26 @@ async fn main() -> Result<()> {
     match args.command.clone() {
         Some(Commands::Doctor { journal }) => doctor(&args, journal.as_deref()),
         Some(Commands::Config { file }) => config_command(file),
+        Some(Commands::Explain {
+            tool,
+            args: arg_pairs,
+            paths,
+            hosts,
+            argv,
+            risk,
+            json,
+        }) => explain_command(
+            &args,
+            ExplainInvocation {
+                tool,
+                raw_args: arg_pairs,
+                paths,
+                hosts,
+                argv,
+                risk,
+                json,
+            },
+        ),
         Some(Commands::Run { goal, dry_run }) => {
             run_command(&args, goal, dry_run || args.dry_run).await
         }
@@ -128,6 +272,20 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Conversation { action }) => match action {
+            ConversationCommands::List => conversation_list(&args),
+            ConversationCommands::Show { id, json } => conversation_show(&args, id, json),
+        },
+        Some(Commands::Session { action }) => match action {
+            SessionCommands::Tree { json } => session_tree(&args, json),
+            SessionCommands::Replay { node, full, json } => {
+                session_replay(&args, &node, full, json)
+            }
+        },
+        Some(Commands::Events { action }) => match action {
+            EventsCommands::Read { path, json, kind } => events_read(&path, kind, json),
+            EventsCommands::Contract { json } => events_contract(json),
+        },
         Some(Commands::Artifact { action }) => match action {
             ArtifactCommands::Inspect { root, json } => artifact_inspect(&root, json),
         },
@@ -145,6 +303,110 @@ async fn main() -> Result<()> {
             run_command(&args, goal, args.dry_run).await
         }
     }
+}
+
+/// The hypothetical action, collected from the command line.
+struct ExplainInvocation {
+    tool: String,
+    raw_args: Vec<String>,
+    paths: Vec<PathBuf>,
+    hosts: Vec<String>,
+    argv: Vec<String>,
+    risk: Option<RiskArg>,
+    json: bool,
+}
+
+/// Explain what the boundary would do with a hypothetical action.
+///
+/// This is a projection, not a decision. It executes nothing, writes nothing,
+/// emits no event, and is never consulted by the evaluation path. A real run
+/// re-evaluates everything, and the real result wins if the two disagree.
+fn explain_command(args: &Cli, invocation: ExplainInvocation) -> Result<()> {
+    let ExplainInvocation {
+        tool,
+        raw_args,
+        paths,
+        hosts,
+        argv,
+        risk,
+        json,
+    } = invocation;
+
+    let (config, files) = Config::load(args.config.as_deref())?;
+    let policy = Policy::new(config.rules.clone())?;
+    let sandbox = Sandbox::from_config(&config.boundary)?;
+    let workspace = config.workspace_abs();
+
+    let request = ExplainRequest::new(tool, parse_explain_args(&raw_args)?)
+        .with_paths(paths)
+        .with_hosts(hosts)
+        .with_argv(argv)
+        .with_risk(risk.map_or(Risk::NeedsHuman, Risk::from));
+    // A path that reaches outside the configured workspace is exactly the case
+    // an operator most needs explained, so say so rather than letting an
+    // absolute path silently look in-bounds.
+    if request.paths.iter().any(|path| path.is_absolute()) {
+        eprintln!(
+            "note: absolute paths are resolved as given; the projection reports whether they \
+             fall inside the configured roots"
+        );
+    }
+
+    let context = ExplainContext {
+        policy: &policy,
+        sandbox: &sandbox,
+        workspace: &workspace,
+        approval_mode: config.boundary.approval.mode,
+        boundary_digest: &config.boundary_digest(),
+    };
+    let report = explain_action(&context, &request)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eprintln!("loaded config from {files:?}");
+        print!("{}", report.summary());
+        for trace in &report.rules {
+            println!(
+                "  rule {:<24} {:<6} {:<18} {}",
+                trace.rule_id,
+                trace.effect.as_str(),
+                trace.status.as_str(),
+                trace.detail
+            );
+        }
+        for note in &report.notes {
+            println!("  note: {note}");
+        }
+    }
+    Ok(())
+}
+
+/// Accept either a single JSON object or repeated `key=value` pairs. Anything
+/// that is neither is an error rather than a silently coerced string, because
+/// a mistyped argument would otherwise produce a confident wrong explanation.
+fn parse_explain_args(raw: &[String]) -> Result<serde_json::Value> {
+    if raw.len() == 1 && raw[0].trim_start().starts_with('{') {
+        return Ok(serde_json::from_str(&raw[0])?);
+    }
+    let mut object = serde_json::Map::new();
+    for pair in raw {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            pangu_core::Error::Config(format!(
+                "explain --arg expects `key=value` or one JSON object, got `{pair}`"
+            ))
+        })?;
+        let value = value.trim();
+        let parsed = match value {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            "null" => serde_json::Value::Null,
+            _ if value.parse::<i64>().is_ok() => serde_json::from_str(value)?,
+            _ => serde_json::Value::String(value.to_string()),
+        };
+        object.insert(key.to_string(), parsed);
+    }
+    Ok(serde_json::Value::Object(object))
 }
 
 fn doctor(args: &Cli, journal: Option<&std::path::Path>) -> Result<()> {
@@ -179,6 +441,199 @@ fn doctor(args: &Cli, journal: Option<&std::path::Path>) -> Result<()> {
 /// recovery runbook requires an operator to preserve evidence and escalate
 /// instead of letting the tool guess. A non-`verified` verdict exits non-zero
 /// so CI and deployment scripts cannot mistake it for a healthy store.
+/// Read a stable event stream, migrating an older journal forward if needed.
+///
+/// Read-only and advisory. This reports what a derived projection says; it
+/// cannot verify a run, and the journal remains the audit authority.
+fn events_read(path: &std::path::Path, kind: Option<String>, json: bool) -> Result<()> {
+    let summary = pangu_core::read_stream(path)?;
+
+    // An unrecognized filter is an error, not an empty result. A typo in
+    // `--kind` that silently printed nothing reads exactly like a run that
+    // never emitted that event.
+    let filter = match kind.as_deref() {
+        None => None,
+        Some(name) => Some(
+            pangu_core::StreamKind::all()
+                .iter()
+                .find(|kind| {
+                    serde_json::to_value(kind).ok().as_ref()
+                        == Some(&serde_json::Value::String(name.to_string()))
+                })
+                .copied()
+                .ok_or_else(|| {
+                    pangu_core::Error::Config(format!(
+                        "unknown stream kind `{name}`; run `pangu events contract` for the list"
+                    ))
+                })?,
+        ),
+    };
+
+    let events: Vec<&pangu_core::StreamEvent> = summary
+        .events
+        .iter()
+        .filter(|event| filter.is_none_or(|wanted| event.kind == wanted))
+        .collect();
+
+    if json {
+        let payload = serde_json::json!({
+            "summary": summary,
+            "matched": events,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print!("{}", summary.render());
+        for event in &events {
+            println!(
+                "  [{:>3}] {:<32} {} {}",
+                event.seq,
+                serde_json::to_value(event.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                event.data.verdict.clone().unwrap_or_else(|| "-".into()),
+                event.data.message
+            );
+        }
+    }
+
+    // A truncated read is a failure of the read, not a partial success.
+    if summary.truncated {
+        return Err(anyhow::anyhow!(
+            "stream read was truncated at {} record(s); the output above is a prefix, not the whole \
+             stream",
+            summary.events.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Print the contract: which versions this build reads, and which kinds are
+/// frozen. A consumer building a long-lived integration needs this before it
+/// can decide what to depend on.
+fn events_contract(json: bool) -> Result<()> {
+    let kinds: Vec<serde_json::Value> = pangu_core::StreamKind::all()
+        .iter()
+        .map(|kind| {
+            serde_json::json!({
+                "kind": kind,
+                "stability": kind.stability(),
+            })
+        })
+        .collect();
+    let contract = serde_json::json!({
+        "current_schema": pangu_core::STREAM_SCHEMA_V1,
+        "readable_schemas": pangu_core::EventMigrator::supported_schemas(),
+        "unknown_schema_policy": "refuse; never guess a newer writer's record",
+        "kinds": kinds,
+        "derived": true,
+        "authoritative": false,
+        "note": "derived projection; the hash-chained journal remains the audit authority",
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&contract)?);
+    } else {
+        println!(
+            "event stream contract {}\n  readable schemas: {}\n  unknown schema: refuse, never guess\n  derived projection; the journal remains the audit authority\n  kinds:",
+            pangu_core::STREAM_SCHEMA_V1,
+            pangu_core::EventMigrator::supported_schemas().join(", ")
+        );
+        for kind in pangu_core::StreamKind::all() {
+            println!(
+                "    {:<32} {}",
+                serde_json::to_value(kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                kind.stability().as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build the conversation store the agent would use, without running anything.
+///
+/// Reuses the agent's own runtime so the CLI and a real run agree on where
+/// conversations live and which of them are readable.
+fn conversation_store(
+    args: &Cli,
+) -> Result<Option<pangu_agent::conversation::ConversationRuntime>> {
+    let (mut config, _) = Config::load(args.config.as_deref())?;
+    if let Some(workspace) = &args.workspace {
+        config.boundary.workspace = workspace.clone();
+    }
+    let contract = GoalContract::from_config("conversation maintenance", &config)?;
+    Ok(pangu_agent::conversation::ConversationRuntime::from_contract(&contract)?)
+}
+
+fn conversation_list(args: &Cli) -> Result<()> {
+    let Some(store) = conversation_store(args)? else {
+        println!("conversation persistence is disabled; enable `conversation.enabled`");
+        return Ok(());
+    };
+    let ids = store.list().map_err(|e| anyhow::anyhow!(e))?;
+    if ids.is_empty() {
+        println!("no stored conversations");
+        return Ok(());
+    }
+    for id in ids {
+        let snapshot = store.load(&id).map_err(|e| anyhow::anyhow!(e))?;
+        println!(
+            "{}  turn-less  messages={}  digest={}  {}{}",
+            id,
+            snapshot.messages.len(),
+            &snapshot.history_digest[..16],
+            snapshot.created_at,
+            match &snapshot.compaction {
+                Some(record) => format!("  [compacted: -{} message(s)]", record.dropped_messages),
+                None => String::new(),
+            }
+        );
+    }
+    Ok(())
+}
+
+fn conversation_show(args: &Cli, id: Option<String>, json: bool) -> Result<()> {
+    let Some(store) = conversation_store(args)? else {
+        return Err(anyhow::anyhow!(
+            "conversation persistence is disabled; enable `conversation.enabled`"
+        ));
+    };
+    let snapshot = match id {
+        Some(id) => store.load(&id).map_err(|e| anyhow::anyhow!(e))?,
+        None => store
+            .latest()
+            .map_err(|e| anyhow::anyhow!(e))?
+            .ok_or_else(|| anyhow::anyhow!("no stored conversation to show"))?,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        println!(
+            "id: {}
+run: {}
+created: {}
+messages: {}
+digest: {}
+derived: true
+authoritative: false",
+            snapshot.snapshot_id,
+            snapshot.run_id,
+            snapshot.created_at,
+            snapshot.messages.len(),
+            snapshot.history_digest,
+        );
+        if let Some(record) = &snapshot.compaction {
+            println!(
+                "compacted from {} (dropped {}, kept {})",
+                record.compacted_from_digest, record.dropped_messages, record.kept_messages
+            );
+        }
+    }
+    Ok(())
+}
+
 fn artifact_inspect(root: &std::path::Path, json: bool) -> Result<()> {
     let report = pangu_core::inspect_artifact_root(root)?;
     if json {
@@ -384,8 +839,20 @@ async fn rollback_command(
 async fn demo(args: &Cli) -> Result<()> {
     eprintln!("WARNING: unattended demo mode; no human approval will be requested");
     let (config, files) = Config::load(args.config.as_deref())?;
+    // `--checkpoint` / `--no-checkpoint` are runtime overrides, so they have
+    // to be applied here too. Without this, `pangu --checkpoint --demo` and
+    // `pangu --config cfg-with-checkpoint-off --demo` would quietly disagree
+    // with what the operator asked for, in opposite directions, and neither
+    // would say so.
     let mut config = config.apply(&CliOverrides {
         unattended: true,
+        checkpoint_enabled: if args.checkpoint {
+            Some(true)
+        } else if args.no_checkpoint {
+            Some(false)
+        } else {
+            None
+        },
         ..Default::default()
     })?;
     // The scripted demo has no external billing. Declare its zero price
@@ -543,6 +1010,147 @@ impl Provider for DemoProvider {
             usage: Usage::default(),
         })
     }
+}
+
+/// Open the checkpoint artifact store that holds the session node ledger.
+///
+/// The ledger is written by the checkpoint subsystem, so when checkpointing is
+/// off there is no tree to show. That is reported rather than papered over with
+/// an empty listing: "no nodes" and "the feature that records nodes is off"
+/// are different facts, and an operator reading a report needs to tell them
+/// apart.
+fn session_contract(args: &Cli) -> Result<GoalContract> {
+    let (mut config, _) = Config::load(args.config.as_deref())?;
+    // The `--checkpoint` / `--no-checkpoint` flags are runtime overrides, not
+    // config-file edits. Without applying them here, `pangu --checkpoint
+    // session tree` would read the file and conclude checkpointing is off —
+    // while the run that produced the tree was started with it on.
+    config = config.apply(&CliOverrides {
+        workspace: args.workspace.clone(),
+        checkpoint_enabled: if args.checkpoint {
+            Some(true)
+        } else if args.no_checkpoint {
+            Some(false)
+        } else {
+            None
+        },
+        ..Default::default()
+    })?;
+    if !config.checkpoint.enabled {
+        bail!(
+            "the session tree is written by the checkpoint subsystem; \
+             enable `checkpoint.enabled` or pass --checkpoint"
+        );
+    }
+    Ok(GoalContract::from_config("session maintenance", &config)?)
+}
+
+fn session_tree(args: &Cli, json: bool) -> Result<()> {
+    let contract = session_contract(args)?;
+    let store = pangu_core::ArtifactStore::open(&contract.checkpoint.artifact_root)?;
+    let tree = pangu_core::session::SessionTree::load(&store)?;
+    // An incomplete tree still renders — the gaps are labelled — but it is not
+    // presented as a whole history, because a walk that stops at a missing
+    // parent looks exactly like one that reached the beginning.
+    let complete = tree.ensure_complete().is_ok();
+    if json {
+        let roots: Vec<_> = tree
+            .roots()
+            .iter()
+            .map(|node| {
+                serde_json::json!({
+                    "session_node_id": node.session_node_id,
+                    "parent_session_node_id": node.parent_session_node_id,
+                    "checkpoint_id": node.checkpoint_id,
+                    "history_digest": node.history_digest,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "schema": "pangu-session-tree/1",
+            "nodes": tree.len(),
+            "complete": complete,
+            "orphans": tree.orphans(),
+            "roots": roots,
+            "advisory": true,
+            "authoritative": false,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print!("{}", tree.render());
+        println!("nodes: {}", tree.len());
+        if !complete {
+            eprintln!(
+                "WARNING: {} node(s) name a parent that is not in the ledger;                  this tree is incomplete",
+                tree.orphans().len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn session_replay(args: &Cli, node: &str, full: bool, json: bool) -> Result<()> {
+    let contract = session_contract(args)?;
+    let store = pangu_core::ArtifactStore::open(&contract.checkpoint.artifact_root)?;
+    let tree = pangu_core::session::SessionTree::load(&store)?;
+    // Navigation is checked before the conversation is read, so a cycle is
+    // reported as a broken tree rather than as a missing conversation.
+    tree.ensure_complete()?;
+    tree.node(node)?;
+
+    let runtime = pangu_agent::conversation::ConversationRuntime::from_contract(&contract)?
+        .ok_or_else(|| {
+            anyhow!(
+                "no conversation is recorded for this workspace;                  enable `conversation.enabled` to store them"
+            )
+        })?;
+    let snapshots = runtime.at_node(node)?;
+    let Some(snapshot) = snapshots.last() else {
+        bail!(
+            "session node `{node}` has no recorded conversation;              it may predate conversation persistence, or persistence was off              for the run that created it"
+        );
+    };
+    let messages = snapshot.restore()?;
+
+    if json {
+        let payload = serde_json::json!({
+            "schema": "pangu-session-replay/1",
+            "session_node_id": node,
+            "snapshot_id": snapshot.snapshot_id,
+            "history_digest": snapshot.history_digest,
+            "message_count": messages.len(),
+            "snapshots_at_node": snapshots.len(),
+            "messages": if full { serde_json::to_value(&messages)? } else { serde_json::Value::Null },
+            "note": "a replayed conversation is model input only; it restores no                      workspace and grants no approval. Use `pangu rollback` for the                      workspace.",
+            "advisory": true,
+            "authoritative": false,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("node:     {node}");
+        println!(
+            "snapshot: {} ({} snapshot(s) at this node)",
+            snapshot.snapshot_id,
+            snapshots.len()
+        );
+        println!("digest:   {}", snapshot.history_digest);
+        println!("messages: {}", messages.len());
+        for message in &messages {
+            let preview: String = pangu_core::conversation::message_content(message)
+                .chars()
+                .take(72)
+                .collect();
+            println!(
+                "  {:9} {}",
+                message.role().as_str(),
+                preview.replace('\n', " ")
+            );
+        }
+        if !full {
+            println!("(use --full for the complete message list, or --json)");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

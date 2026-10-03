@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// How many trailing turns are always in the assembled window (§3.2 FORCED).
+const RECENT_TURNS: usize = 8;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
@@ -18,12 +21,14 @@ use pangu_boundary::{
     ValidatedResources,
 };
 use pangu_core::{
-    redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event, EventKind,
-    EventSink, FailureClass, JournalMeta, Message, RestoreDisposition, RollbackOperation,
-    RollbackRequest, ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
+    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event,
+    EventKind, EventSink, FailureClass, JournalMeta, Message, RestoreDisposition,
+    RollbackOperation, RollbackRequest, ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1,
+    JOURNAL_FORMAT_V2,
 };
 
 mod checkpoint;
+pub mod conversation;
 mod effect;
 
 pub use effect::{EffectDescriptor, EffectScope, Reversibility};
@@ -356,6 +361,10 @@ pub struct Agent {
     approval: Arc<dyn ApprovalHandler>,
     event_sink: Arc<dyn EventSink>,
     checkpoint: Option<Arc<checkpoint::CheckpointRuntime>>,
+    conversation: Option<Arc<conversation::ConversationRuntime>>,
+    /// History to continue from. Model input only: it carries no decision and
+    /// no approval, and every action in the resumed run is re-evaluated.
+    resume_from: Option<Vec<Message>>,
 }
 
 impl Agent {
@@ -380,6 +389,7 @@ impl Agent {
             ));
         }
         let checkpoint = checkpoint::CheckpointRuntime::from_contract(&contract)?;
+        let conversation = conversation::ConversationRuntime::from_contract(&contract)?;
         Ok(Self {
             contract,
             policy,
@@ -389,7 +399,52 @@ impl Agent {
             approval,
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
+            conversation: conversation.map(Arc::new),
+            resume_from: None,
         })
+    }
+
+    /// Continue from a stored conversation.
+    ///
+    /// The restored history is **model input only**. It does not carry a
+    /// decision, an effect, or any memory of an approval, and this method does
+    /// not skip a single gate: every tool call the resumed run makes is
+    /// re-evaluated through `Policy -> Sandbox -> Approval` exactly as in a
+    /// fresh run.
+    ///
+    /// The workspace is *not* restored. That is rollback's job, and doing it
+    /// here would mean a resume could silently change files without the
+    /// compare-and-swap, approval, and effect accounting that rollback goes
+    /// through. Resuming a conversation while the workspace is in a different
+    /// state is the operator's call to make, visibly, with
+    /// `pangu rollback`.
+    pub fn resume_from(mut self, conversation: &pangu_core::ConversationSnapshot) -> Result<Self> {
+        conversation.validate()?;
+        let history = conversation.restore()?;
+        conversation::validate_resumable(&history)?;
+        self.resume_from = Some(history);
+        Ok(self)
+    }
+
+    /// The conversation ids this agent could resume from, oldest first.
+    pub fn resumable_conversations(&self) -> anyhow::Result<Vec<String>> {
+        match &self.conversation {
+            Some(runtime) => runtime.list().map_err(|error| anyhow!(error)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Continue from the most recently stored conversation.
+    pub fn resume_latest(self) -> Result<Self> {
+        let Some(runtime) = &self.conversation else {
+            return Err(anyhow!(
+                "conversation persistence is disabled; enable `conversation.enabled` to resume"
+            ));
+        };
+        let Some(latest) = runtime.latest()? else {
+            return Err(anyhow!("no stored conversation to resume from"));
+        };
+        self.resume_from(&latest)
     }
 
     /// Run the agent. The event sink is the streaming audit interface; this
@@ -1189,10 +1244,16 @@ impl Agent {
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut evidence = Vec::new();
-        let mut history = vec![
-            Message::system(self.contract.system_prompt()),
-            Message::user(self.contract.goal.clone()),
-        ];
+        let mut history = match &self.resume_from {
+            // A resumed history already carries its system turn and goal.
+            // Re-seeding them would duplicate the instructions at the head and
+            // leave the model with two goals.
+            Some(history) => {
+                conversation::validate_resumable(history)?;
+                history.clone()
+            }
+            None => conversation::seed_history(self.contract.system_prompt(), &self.contract.goal),
+        };
         let mut terminal = None;
         let mut last_turn = 0;
         let mut checkpoint_state = self
@@ -1223,16 +1284,67 @@ impl Agent {
         let specs = self.tools.specs();
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
-            let estimated_input = history.iter().fold(0u64, |total, message| {
-                total.saturating_add(message.approx_tokens())
-            });
             let mut breaches =
                 self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed());
-            if estimated_input >= self.contract.budget().max_input_tokens {
-                breaches.push(pangu_boundary::Breach::InputTokens);
-            }
             if !breaches.is_empty() {
                 self.emit_budget(turn, &breaches).await?;
+                terminal = Some(GoalStatus::BudgetExhausted);
+                break;
+            }
+
+            // A6-5: the assembled window is what the model sees. The full
+            // history stays in memory (and in `history`); assembly is a pure
+            // projection (§3.9). Input-token pressure is resolved here — by
+            // degradation — not by ending the run.
+            let (assembled, assembly) = match assemble(
+                &history,
+                RECENT_TURNS,
+                &[],
+                self.contract.budget().max_input_tokens,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // "组装器组装不出来" must be distinguishable from "上下文确实
+                    // 太大": it is an assembler failure, not a budget event.
+                    self.emit(self.event(
+                        EventKind::ModelRequest,
+                        turn,
+                        format!("context assembly failed: {error}"),
+                    ))
+                    .await?;
+                    return Err(anyhow!("context assembly failed: {error}"));
+                }
+            };
+            let modes = assembly.selections.iter().fold(
+                (0usize, 0usize, 0usize),
+                |(full, summary, omitted), selection| match selection.mode {
+                    pangu_core::DegradeMode::Full => (full + 1, summary, omitted),
+                    pangu_core::DegradeMode::Summary => (full, summary + 1, omitted),
+                    pangu_core::DegradeMode::Omitted => (full, summary, omitted + 1),
+                },
+            );
+            self.emit(self.event(
+                EventKind::ContextAssembled,
+                turn,
+                format!(
+                    "messages={} tokens~{} forced_over_budget={} slices: {} full, {} summary, \
+                     {} omitted, {} seam(s)",
+                    assembled.messages.len(),
+                    assembly.estimated_tokens,
+                    assembly.forced_over_budget,
+                    modes.0,
+                    modes.1,
+                    modes.2,
+                    assembled.seams.len()
+                ),
+            ))
+            .await?;
+            if assembly.forced_over_budget {
+                // The honest tail of the chain: even every forced slice at its
+                // summary form does not fit. Terminate — but for a *budget*
+                // reason, with the report attached.
+                self.emit_budget(turn, &[pangu_boundary::Breach::InputTokens])
+                    .await?;
                 terminal = Some(GoalStatus::BudgetExhausted);
                 break;
             }
@@ -1243,16 +1355,20 @@ impl Agent {
                 EventKind::ModelRequest,
                 turn,
                 format!(
-                    "provider={} model={} messages={} tools={}",
+                    "provider={} model={} messages={} tools={} (history={})",
                     self.provider.name(),
                     self.provider.model(),
-                    history.len(),
-                    specs.len()
+                    assembled.messages.len(),
+                    specs.len(),
+                    history.len()
                 ),
             ))
             .await?;
 
-            let response = self.provider.chat(history.clone(), specs.clone()).await?;
+            let response = self
+                .provider
+                .chat(assembled.messages.clone(), specs.clone())
+                .await?;
             let response_usage = response.usage;
             usage.merge(&response_usage);
             self.emit(
@@ -1313,14 +1429,6 @@ impl Agent {
 
             for call in tool_calls {
                 let mut call_breaches = self.budget_breaches(turn, &usage, started.elapsed());
-                let estimated_input = history.iter().fold(0u64, |total, message| {
-                    total.saturating_add(message.approx_tokens())
-                });
-                if estimated_input >= self.contract.budget().max_input_tokens
-                    && !call_breaches.contains(&pangu_boundary::Breach::InputTokens)
-                {
-                    call_breaches.push(pangu_boundary::Breach::InputTokens);
-                }
                 if !call_breaches.is_empty() {
                     self.emit_budget(turn, &call_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -1423,22 +1531,40 @@ impl Agent {
             }
             if terminal.is_none() {
                 let mut final_breaches = self.budget_breaches(turn, &usage, started.elapsed());
-                let estimated_input = history.iter().fold(0u64, |total, message| {
-                    total.saturating_add(message.approx_tokens())
-                });
-                if estimated_input >= self.contract.budget().max_input_tokens
-                    && !final_breaches.contains(&pangu_boundary::Breach::InputTokens)
-                {
-                    final_breaches.push(pangu_boundary::Breach::InputTokens);
-                }
                 if !final_breaches.is_empty() {
                     self.emit_budget(turn, &final_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
                 }
             }
+            // Per-turn save, so a crash mid-run is still resumable. Gated on
+            // `save_every_turn` because it costs a write per turn.
+            if let Some(runtime) = &self.conversation {
+                if runtime.saves_every_turn() && terminal.is_none() {
+                    // Tie the snapshot to the node the run is currently at, so
+                    // `pangu session replay` can find the conversation that
+                    // belongs to a node. `None` when checkpointing is off: a
+                    // conversation may exist without a tree, but never the
+                    // reverse.
+                    let node = checkpoint_state
+                        .as_ref()
+                        .map(|state| state.session_node_id.as_str());
+                    runtime.save(&self.contract.goal, &history, node)?;
+                }
+            }
+
             if terminal.is_some() {
                 break;
             }
+        }
+
+        // Persist the conversation at the end whatever the outcome. A run that
+        // hit a budget or failed partway is exactly the one an operator wants
+        // to resume, so a save only on success would be useless.
+        if let Some(runtime) = &self.conversation {
+            let node = checkpoint_state
+                .as_ref()
+                .map(|state| state.session_node_id.as_str());
+            runtime.save(&self.contract.goal, &history, node)?;
         }
 
         let status = terminal.unwrap_or(GoalStatus::Failed);

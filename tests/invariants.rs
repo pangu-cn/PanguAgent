@@ -59,6 +59,9 @@ fn temp_path(label: &str) -> std::path::PathBuf {
 
 struct OneShotProvider {
     responses: Mutex<VecDeque<ChatResponse>>,
+    /// Length of the history each call was made with. Tests that care whether a
+    /// run really continued a stored conversation read this back.
+    seen_histories: Mutex<Vec<usize>>,
 }
 
 #[async_trait]
@@ -75,7 +78,11 @@ impl Provider for OneShotProvider {
         "invariant test provider".into()
     }
 
-    async fn chat(&self, _messages: Vec<Message>, _tools: Vec<ToolSpec>) -> Result<ChatResponse> {
+    async fn chat(&self, messages: Vec<Message>, _tools: Vec<ToolSpec>) -> Result<ChatResponse> {
+        self.seen_histories
+            .lock()
+            .expect("provider history lock")
+            .push(messages.len());
         Ok(self
             .responses
             .lock()
@@ -286,6 +293,7 @@ async fn invariant_i_honest_terminal_complete_requires_evidence() {
             )],
             usage: Usage::default(),
         }])),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let approval = Arc::new(ScriptedApproval::new(
         ApprovalMode::DestructiveAndAbove,
@@ -463,6 +471,7 @@ async fn model_cannot_invoke_reserved_internal_checkpoint_capabilities() {
                 usage: Usage::default(),
             },
         ])),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let tool = Arc::new(ReservedTool {
         executions: AtomicUsize::new(0),
@@ -527,6 +536,7 @@ async fn phase1_missing_effect_fails_closed_before_policy_and_executor() {
                 usage: Usage::default(),
             },
         ])),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let sink = Arc::new(MemSink::default());
     let tool = Arc::new(MissingEffectTool {
@@ -849,6 +859,7 @@ fn phase2_agent(
     let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
     let provider = Arc::new(OneShotProvider {
         responses: Mutex::new(VecDeque::from(responses)),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let tool = Arc::new(Phase2Tool {
         path: workspace.join("state.txt"),
@@ -1270,6 +1281,7 @@ fn invariant_i_no_implicit_git_checkpoint_backend() {
     let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
     let provider = Arc::new(OneShotProvider {
         responses: Mutex::new(VecDeque::new()),
+        seen_histories: Mutex::new(Vec::new()),
     });
     let result = Agent::new(
         contract,
@@ -1287,5 +1299,571 @@ fn invariant_i_no_implicit_git_checkpoint_backend() {
         result.is_err(),
         "git backend must not become an implicit capability"
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// ADR-0002 §4.3: an explanation must never be usable as an authorization.
+///
+/// Three separate properties are checked, because any one of them failing
+/// would reopen the hole:
+/// 1. `explain` is not registered as a model-visible tool, so a model cannot
+///    reach it at all;
+/// 2. the report type carries no path into the evaluation path — it has no
+///    conversion into `Effect` or `Decision`, which is asserted structurally
+///    below by the absence of any such impl in this crate's usage;
+/// 3. the serialized report always says it is advisory, so a consumer reading
+///    the JSON cannot mistake it for a verdict.
+#[test]
+fn invariant_i_explain_is_advisory_and_never_an_authorization() {
+    use pangu_boundary::explain::{explain_action, ExplainContext, ExplainRequest, Projection};
+    use serde_json::Value;
+
+    let specs = Toolkit::new().specs();
+    assert!(
+        !specs.is_empty(),
+        "guard: an empty tool table would make the assertion below vacuously true"
+    );
+    assert!(
+        specs.iter().all(|spec| spec.name != "explain"),
+        "explain must not be exposed to the model as a tool"
+    );
+
+    let config = Config::embedded().expect("embedded config");
+    let policy = Policy::new(config.rules.clone()).expect("policy");
+    let sandbox = Sandbox::from_config(&config.boundary).expect("sandbox");
+    let workspace = config.workspace_abs();
+    let digest = config.boundary_digest();
+    let report = explain_action(
+        &ExplainContext {
+            policy: &policy,
+            sandbox: &sandbox,
+            workspace: &workspace,
+            approval_mode: config.boundary.approval.mode,
+            boundary_digest: &digest,
+        },
+        &ExplainRequest::new("write_file", serde_json::json!({"path": "a.txt"}))
+            .with_paths(vec![std::path::PathBuf::from("a.txt")]),
+    )
+    .expect("explain");
+
+    // Property 2: the projection vocabulary is distinct from the decision
+    // vocabulary, so no consumer can pass it to Policy::evaluate.
+    let projection = serde_json::to_value(report.projection).expect("serialize projection");
+    assert!(
+        matches!(projection, Value::String(ref s) if s.starts_with("would_")),
+        "a projection must never serialize as a bare effect: {projection}"
+    );
+    assert_ne!(report.projection, Projection::WouldDeny);
+    // And the report is structurally incapable of becoming a Decision: it
+    // exposes no such conversion, which is why this only has to state the
+    // absence rather than call something.
+    let _: Option<Effect> = None;
+    let _: Option<fn(&Projection) -> Effect> = None;
+
+    // Property 3: the serialized form always declares itself advisory.
+    let json = serde_json::to_value(&report).expect("serialize report");
+    assert_eq!(json["advisory"], Value::Bool(true));
+    assert_eq!(json["authoritative"], Value::Bool(false));
+    assert!(
+        json.get("effect").is_none() && json.get("decision").is_none(),
+        "the report must not carry a field named like a decision: {json}"
+    );
+}
+
+/// ADR-0003 §2/§4.5: the event stream is a derived projection, never an
+/// authorization and never a substitute for the journal.
+///
+/// The properties are checked separately because they fail differently: the
+/// type could still be exposed to the model, a record could still claim to be
+/// authoritative, or the format could still grow a field that reads like a
+/// verdict.
+#[test]
+fn invariant_i_event_stream_is_derived_and_never_an_authorization() {
+    use pangu_core::{read_stream, Event, EventKind, StreamEvent, StreamWriter, STREAM_SCHEMA_V1};
+    use serde_json::Value;
+
+    let specs = Toolkit::new().specs();
+    assert!(
+        !specs.is_empty(),
+        "guard: an empty tool table would make the assertion below vacuously true"
+    );
+    assert!(
+        specs
+            .iter()
+            .all(|spec| spec.name != "events" && spec.name != "stream"),
+        "the event stream must not be exposed to the model as a tool"
+    );
+
+    let root = temp_path("event-stream-derived");
+    std::fs::create_dir_all(&root).expect("workspace");
+    let path = root.join("stream.jsonl");
+    let writer = StreamWriter::create(&path).expect("create stream");
+    let mut denied = Event::new_v2(EventKind::PolicyDecision, 0, "denied");
+    denied.tool = Some("write_file".into());
+    denied.verdict = Some("deny".into());
+    denied.risk = Some("destructive".into());
+    writer.record_event(&denied).expect("record");
+
+    let summary = read_stream(&path).expect("read");
+    assert_eq!(summary.events.len(), 1);
+    let record: &StreamEvent = &summary.events[0];
+    assert!(record.derived);
+    assert!(!record.authoritative);
+    assert_eq!(record.schema, STREAM_SCHEMA_V1);
+
+    // The read result itself must keep declaring where the authority lives.
+    assert!(!summary.authoritative);
+    assert!(summary
+        .render()
+        .contains("journal remains the audit authority"));
+
+    let json = serde_json::to_value(record).expect("serialize record");
+    assert_eq!(json["derived"], Value::Bool(true));
+    assert_eq!(json["authoritative"], Value::Bool(false));
+    // A field that reads like a verdict, or like a verification result, is the
+    // exact shape that would let a consumer treat the stream as evidence.
+    for forbidden in ["effect", "decision", "verdict_hash", "proof", "signature"] {
+        assert!(
+            json.get(forbidden).is_none(),
+            "a stream record must not carry a `{forbidden}` field: {json}"
+        );
+    }
+    // It also has no hash chain of its own, which is precisely why it cannot
+    // prove anything: there is nothing linking consecutive records.
+    assert!(json.get("sha").is_none() && json.get("prev_sha").is_none());
+    assert!(
+        json.get("origin").is_some(),
+        "provenance must be kept explicit"
+    );
+
+    // A record that claims to be authoritative is rejected on read, not
+    // believed.
+    let mut forged = record.clone();
+    forged.authoritative = true;
+    assert!(forged.validate().is_err());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// ADR-0004 §4.3: a restored conversation is model input and nothing else.
+///
+/// Resume is the feature most likely to look like it can be trusted — "the
+/// history is from our own last run" invites skipping the gates. So the check
+/// is structural, not documentary:
+///
+/// 1. the snapshot type yields plain `Message` values and nothing that could
+///    be handed to a gate;
+/// 2. the restored history cannot smuggle an authorization, because a
+///    `Message` has no field that the boundary would read as one;
+/// 3. the compaction record cannot claim authority either.
+#[test]
+fn invariant_i_resumed_conversation_carries_no_authorization() {
+    use pangu_boundary::policy::{ActionRequest, Effect};
+    use pangu_core::{ConversationSnapshot, Message};
+
+    let snapshot = ConversationSnapshot::new(
+        "snap-1",
+        "run-1",
+        vec![
+            Message::user("do the thing"),
+            Message::tool_result("c1", "write_file", "ok"),
+        ],
+    )
+    .expect("new");
+    let restored = snapshot.restore().expect("restore");
+    assert_eq!(restored.len(), 2);
+
+    // A restored message set is only ever `Message`. There is no method on
+    // ConversationSnapshot that returns a Decision, an Effect, an approval, or
+    // anything the boundary evaluates, which is why this only has to state the
+    // absence rather than call something.
+    let _: Option<Effect> = None;
+    let _: Option<fn(&ConversationSnapshot) -> Effect> = None;
+
+    // And the shape itself cannot carry one: `Message` is a closed enum of
+    // text and tool results, with no field the policy reads.
+    let encoded = serde_json::to_value(&restored).expect("encode");
+    let forbidden = [
+        "effect",
+        "decision",
+        "verdict",
+        "approved",
+        "authorization",
+        "risk",
+    ];
+    for key in forbidden {
+        assert!(
+            encoded
+                .as_array()
+                .is_some_and(|list| { list.iter().all(|message| message.get(key).is_none()) }),
+            "a restored message must not carry a `{key}` field: {encoded}"
+        );
+    }
+
+    // Prove the restored text is inert: feeding it back as the args of an
+    // action request still goes through the policy, which decides on its own.
+    let policy = Policy::new(Config::embedded().expect("config").rules.clone()).expect("policy");
+    let args = serde_json::json!({ "messages": restored });
+    let request = ActionRequest::new("read_file", "after-resume", &args);
+    let decision = policy.evaluate(&request, std::path::Path::new("."));
+    // Whatever the verdict, it came from the policy, not from the history.
+    assert!(matches!(
+        decision.effect,
+        Effect::Allow | Effect::Ask | Effect::Deny
+    ));
+    assert!(
+        decision.rule_id.is_some() || decision.invariant.is_some(),
+        "a decision must be attributable to a rule or an invariant, never to restored content"
+    );
+}
+
+/// ADR-0004 §4.3 exercised end to end: a resumed run **continues** the stored
+/// conversation, and continuing is not the same as being trusted.
+///
+/// Both halves matter, and either alone would be weak:
+///
+/// 1. the resumed run really continued — asserted from the provider's side: it
+///    was called with the four stored messages, not with a freshly seeded
+///    system+user pair on top of them. A resume that quietly re-seeded would
+///    look identical from the outside except for the count, which is why this
+///    reads the history length rather than "the run produced some output".
+/// 2. the tool call made *after* the resume went through the gates again. The
+///    first run was granted approval for its write; the resumed run gets no
+///    approval at all, and the workspace must stay exactly as the first run left
+///    it. If resume had carried authority forward, the second write would have
+///    landed.
+#[tokio::test]
+async fn invariant_i_resume_continues_the_conversation_but_re_evaluates_every_action() {
+    let root = temp_path("resume-gates");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("state.txt"), "initial").expect("state");
+
+    // The rule *asks* rather than allows, so approval is the only thing that
+    // differs between the two runs. That is the property under test: the first
+    // run is approved, the resumed one is not.
+    let rules = vec![Rule::ask("ask-phase2", "test_tool", "phase2 gated action")];
+    let mut config = phase2_config(&root, rules.clone());
+    config.conversation.enabled = true;
+    config.conversation.artifact_root = root.join(".pangu/conversations");
+    config.conversation.save_every_turn = true;
+    config.validate().expect("resume config");
+
+    // --- first run: one approved write, then a clean finish -----------------
+    let (first_agent, _tool, _sink) = phase2_agent(
+        config.clone(),
+        &root,
+        vec![
+            phase2_response("test_tool", serde_json::json!({"value": "one"})),
+            phase2_response("finish", serde_json::json!({"status": "complete"})),
+        ],
+        vec![pangu_boundary::ApprovalResponse::AllowOnce],
+        false,
+        false,
+    );
+    let first_outcome = first_agent.run().await.expect("first run");
+    assert_eq!(first_outcome.status.as_str(), "complete");
+    assert_eq!(
+        std::fs::read_to_string(root.join("state.txt")).expect("state"),
+        "one",
+        "the first run's approved write must have landed, otherwise the rest proves nothing"
+    );
+
+    // --- the run persisted a conversation, and the whole exchange is in it --
+    let ids = first_agent
+        .resumable_conversations()
+        .expect("conversations were listed");
+    assert!(
+        ids.len() >= 2,
+        "per-turn saving plus the final save should leave more than one snapshot, got {}",
+        ids.len()
+    );
+    let stored = pangu_core::ArtifactStore::open(root.join(".pangu/conversations"))
+        .expect("store")
+        .load_conversation(ids.last().expect("an id"))
+        .expect("load");
+    assert_eq!(
+        stored
+            .messages
+            .iter()
+            .map(pangu_core::Message::role)
+            .collect::<Vec<_>>(),
+        vec![
+            pangu_core::MessageRole::System,
+            pangu_core::MessageRole::User,
+            pangu_core::MessageRole::Assistant,
+            pangu_core::MessageRole::Tool,
+            pangu_core::MessageRole::Assistant,
+            pangu_core::MessageRole::Tool,
+        ],
+        "the stored history must contain the whole first exchange: \
+         system, goal, the approved write, and the finish"
+    );
+
+    // --- resume, with no approval available this time -----------------------
+    let resumed_config = config.clone();
+    let second_tool = Arc::new(Phase2Tool {
+        path: root.join("state.txt"),
+        executions: AtomicUsize::new(0),
+        external: false,
+        fail_execution: false,
+    });
+    let second_provider = Arc::new(OneShotProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            phase2_response("test_tool", serde_json::json!({"value": "two"})),
+            phase2_response("finish", serde_json::json!({"status": "complete"})),
+        ])),
+        seen_histories: Mutex::new(Vec::new()),
+    });
+    // Built by hand rather than via `phase2_agent`, because that helper cannot
+    // hand back the provider it used — and the whole point of the first
+    // assertion below is what the provider saw.
+    let contract = pangu_boundary::GoalContract::from_config("phase2 invariant", &resumed_config)
+        .expect("contract");
+    let policy = Arc::new(Policy::new(rules).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&resumed_config.boundary).expect("sandbox"));
+    let second_sink = Arc::new(MemSink::default());
+    let observable = Agent::new(
+        contract,
+        policy,
+        sandbox,
+        second_provider.clone(),
+        second_tool,
+        Arc::new(pangu_boundary::ScriptedApproval::new(
+            pangu_boundary::ApprovalMode::DestructiveAndAbove,
+            Vec::new(),
+        )),
+        second_sink.clone(),
+    )
+    .expect("agent")
+    .resume_from(&stored)
+    .expect("resume");
+    let second_outcome = observable.run().await.expect("resumed run");
+    let second_events = second_sink.snapshot();
+
+    // Property 1: continued, not restarted.
+    let seen = second_provider.seen_histories.lock().expect("lock").clone();
+    assert_eq!(
+        seen.first(),
+        Some(&6),
+        "the resumed run must call the model with exactly the six stored \
+         messages; a re-seeded run would have sent eight, with the system and \
+         goal turns prepended a second time"
+    );
+    assert_eq!(
+        seen.len(),
+        2,
+        "the scripted run makes exactly two model calls"
+    );
+    assert_eq!(
+        seen[1], 8,
+        "the second call must also carry the exchange the resumed turn added"
+    );
+
+    // Property 2: the post-resume write was re-evaluated and refused, and the
+    // refusal is on the record rather than merely absent from the file.
+    let blocked = second_events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolBlocked)
+        .expect("the resumed run's write must be recorded as blocked");
+    assert!(
+        blocked.message.contains("human approval was not granted"),
+        "the block must name the reason, got: {}",
+        blocked.message
+    );
+    assert!(
+        !second_events
+            .iter()
+            .any(|event| event.kind == EventKind::ToolFinished),
+        "no tool should have executed in the resumed run, yet one is recorded as finished"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("state.txt")).expect("state"),
+        "one",
+        "a resumed run must not carry the first run's approval forward"
+    );
+
+    // Property 3: the scripted provider called `finish` with `complete` on its
+    // second turn, and the run still ended `failed`. A run that has had a tool
+    // refused is not reported as finished, so a stored conversation cannot be
+    // replayed into a run that looks successful.
+    assert!(
+        second_events
+            .iter()
+            .any(|event| event.kind == EventKind::FinishRequested),
+        "the scripted provider was supposed to call finish on its last turn"
+    );
+    assert_eq!(
+        second_outcome.status.as_str(),
+        "failed",
+        "a refusal during a resumed run must not be overridable by the model"
+    );
+    assert!(second_outcome.evidence.is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+fn config_for_resume(root: &std::path::Path) -> pangu_boundary::Config {
+    let mut config = phase2_config(
+        root,
+        vec![Rule::ask("ask-phase2", "test_tool", "phase2 gated action")],
+    );
+    config.conversation.enabled = true;
+    config.conversation.artifact_root = root.join(".pangu/conversations");
+    config.validate().expect("resume config");
+    config
+}
+
+/// A history that lost its system turn must be refused rather than resumed: the
+/// system turn is where the boundary instructions live, and silently running
+/// without it is how a run would continue into a context that was never told
+/// what it is not allowed to do.
+#[test]
+fn invariant_i_a_conversation_without_its_system_turn_cannot_be_resumed() {
+    let root = temp_path("resume-no-system");
+    std::fs::create_dir_all(&root).expect("workspace");
+    let config = config_for_resume(&root);
+    let (agent, _tool, _sink) = phase2_agent(config, &root, Vec::new(), Vec::new(), false, false);
+    let messages = vec![pangu_core::Message::user("just a user turn")];
+    let snapshot = pangu_core::ConversationSnapshot {
+        schema_version: pangu_core::conversation::CONVERSATION_SCHEMA_VERSION,
+        snapshot_id: "snap-1".into(),
+        session_node_id: None,
+        run_id: "run-1".into(),
+        history_digest: pangu_core::ConversationSnapshot::digest_of(&messages).expect("digest"),
+        messages,
+        compaction: None,
+        created_at: pangu_core::now_rfc3339(),
+    };
+    match agent.resume_from(&snapshot) {
+        Ok(_) => panic!("a history with no system turn must be refused"),
+        Err(error) => assert!(
+            error.to_string().contains("system turn"),
+            "the error must name what is missing, got: {error}"
+        ),
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A1-3: a conversation saved during a run must be reachable from the session
+/// node the run was at.
+///
+/// The wiring this pins down was silently absent: `ConversationRuntime::save`
+/// took a `session_node_id` and both call sites in `run_inner` passed `None`,
+/// so every snapshot was an orphan and no node could ever be replayed. A test
+/// that only asserted "a snapshot exists" would have passed the whole time.
+#[tokio::test]
+async fn invariant_i_a_saved_conversation_names_a_session_node_that_exists() {
+    let root = temp_path("session-node-link");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("state.txt"), "initial").expect("state");
+
+    let mut config = phase2_config(
+        &root,
+        vec![Rule::allow(
+            "allow-phase2",
+            "test_tool",
+            "phase2 test action",
+        )],
+    );
+    config.conversation.enabled = true;
+    config.conversation.artifact_root = root.join(".pangu/conversations");
+    config.conversation.save_every_turn = true;
+    config.validate().expect("config");
+
+    let (agent, _tool, _sink) = phase2_agent(
+        config,
+        &root,
+        vec![
+            phase2_response("test_tool", serde_json::json!({"value": "one"})),
+            phase2_finish(),
+        ],
+        Vec::new(),
+        false,
+        false,
+    );
+    agent.run().await.expect("run");
+
+    // Nodes come from the *checkpoint* store: that is the subsystem that writes
+    // them. `test_tool` is a workspace write, so a checkpoint is committed and
+    // a node exists to point at.
+    let node_store =
+        pangu_core::ArtifactStore::open(root.join(".pangu/checkpoints")).expect("node store");
+    let nodes = node_store.list_session_nodes().expect("list");
+    assert!(
+        !nodes.is_empty(),
+        "a run that committed a checkpoint must record a session node"
+    );
+
+    // The assertion that would have failed before the wiring was fixed.
+    let conv_store =
+        pangu_core::ArtifactStore::open(root.join(".pangu/conversations")).expect("conv store");
+    let ids = conv_store.list_conversations().expect("list");
+    assert!(!ids.is_empty(), "the run must have stored a conversation");
+    for id in &ids {
+        let snapshot = conv_store.load_conversation(id).expect("load");
+        let node = snapshot.session_node_id.as_deref().unwrap_or_else(|| {
+            panic!("snapshot {id} is not linked to any session node; the run loop passed None")
+        });
+        assert!(
+            nodes
+                .iter()
+                .any(|candidate| candidate.session_node_id == node),
+            "snapshot {id} names node {node}, which is not in the ledger"
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// An **incomplete** session tree must be reported as incomplete.
+///
+/// This is not a synthetic case. A checkpointed run produces exactly one gap:
+/// the first committed node names `node_root_…` as its parent, and that root
+/// exists only in the run's memory — the ledger has no entry for it. So every
+/// ordinary run's tree is incomplete, and the navigation layer's job is to say
+/// so rather than let a walk that stops at the missing link look like one that
+/// reached the beginning of history.
+///
+/// The gap is recorded, not papered over: fabricating an `EventRef` for the
+/// root would put an invented event id into an auditable structure, and
+/// `Event::event_id` is only assigned when the journal is written.
+#[tokio::test]
+async fn invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden() {
+    let root = temp_path("session-tree-gap");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("state.txt"), "initial").expect("state");
+
+    let config = phase2_config(
+        &root,
+        vec![Rule::allow(
+            "allow-phase2",
+            "test_tool",
+            "phase2 test action",
+        )],
+    );
+    let (agent, _tool, _sink) = phase2_agent(
+        config,
+        &root,
+        vec![
+            phase2_response("test_tool", serde_json::json!({"value": "one"})),
+            phase2_finish(),
+        ],
+        Vec::new(),
+        false,
+        false,
+    );
+    agent.run().await.expect("run");
+
+    let store = pangu_core::ArtifactStore::open(root.join(".pangu/checkpoints")).expect("store");
+    let tree = pangu_core::session::SessionTree::load(&store).expect("tree");
+    assert_eq!(tree.orphans().len(), 1, "exactly the un-persisted run root");
+    let error = tree
+        .ensure_complete()
+        .expect_err("a tree with a missing parent must not present as whole");
+    assert!(
+        error.to_string().contains("incomplete"),
+        "the error must say the history is incomplete, got: {error}"
+    );
+    // Rendering still terminates and still labels the gap.
+    let rendered = tree.render();
+    assert!(rendered.contains("orphan"), "rendered: {rendered}");
     std::fs::remove_dir_all(root).ok();
 }

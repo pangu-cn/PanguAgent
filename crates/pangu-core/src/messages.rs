@@ -134,6 +134,19 @@ pub enum MessageRole {
     Tool,
 }
 
+impl MessageRole {
+    /// The same spelling serde uses, so a printed role and a serialized role
+    /// never disagree about what a conversation actually contains.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {

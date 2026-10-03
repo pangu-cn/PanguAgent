@@ -199,6 +199,8 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 - snapshot 不记录 snapshot root 目录自身的权限/元数据，只记录 root 下的子项。
 - 目录权限计入 snapshot digest，因此 Unix 上的 `chmod`（包括为恢复而调整权限）会被当作 drift 拒绝，且拒绝发生在写 operation 记录之前（见第 4.4 节）。
 - Git backend 未实现，也不会隐式创建 commit、branch、tag、stash 或修改 index。
+- 快照遍历整个工作区，`forbidden_globs` 默认只挡 `.git`/`.env`/secrets/私钥，**不挡构建产物**。仓库里若有巨大的 `target/`，checkpoint 会撞上 `max_snapshot_bytes` 并按 `failure_policy` 终止运行；错误信息会指出具体是哪个文件越界。处理办法是在 `checkpoint.exclude_roots` 里声明该目录，或调高上限。
+  - 排除是有代价的，不是免费的性能开关：被排除的目录**不会被回退**，所以只能排除真正可重建的内容。排除前拍的旧 checkpoint 会在 restore 时**明确失败并指出是哪个排除根挡住的**，不会部分回退。
 - `pangu artifact inspect` 只读且有界：条目数、深度、checkpoint/operation 数量和 replacement backup 数量都有上限，截断时显式报告；它不判断 CAS 漂移，也不替代 `pangu rollback` 的前置校验。
 - checkpoint/rollback 仍是默认关闭的实验性 opt-in；本手册不是正式支持或默认激活承诺。
 

@@ -6,7 +6,7 @@ use pangu_core::{Error, Price, Result};
 
 use crate::approval::ApprovalMode;
 use crate::budget::Budget;
-use crate::config::{canonicalize_with_missing, CheckpointSection, Config};
+use crate::config::{canonicalize_with_missing, CheckpointSection, Config, ConversationSection};
 use crate::sandbox::{absolute_path_from, Sandbox};
 
 /// The immutable, human-supplied portion of one run. The agent builds its
@@ -35,6 +35,8 @@ pub struct GoalContract {
     pub max_paths_per_action: usize,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
+    #[serde(default)]
+    pub conversation: ConversationSection,
     pub require_evidence: bool,
     pub min_successful_tool_calls: u32,
     pub price: Option<Price>,
@@ -76,6 +78,7 @@ impl GoalContract {
             max_write_bytes: 4_194_304,
             max_paths_per_action: 64,
             checkpoint: CheckpointSection::default(),
+            conversation: ConversationSection::default(),
             require_evidence: true,
             min_successful_tool_calls: 1,
             price: None,
@@ -104,6 +107,24 @@ impl GoalContract {
                 &workspace,
                 &checkpoint.artifact_root,
             )?)?;
+            checkpoint.exclude_roots = checkpoint
+                .exclude_roots
+                .iter()
+                .map(|path| {
+                    absolute_path_from(&workspace, path)
+                        .and_then(|resolved| canonicalize_with_missing(&resolved))
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+        // Same treatment as the checkpoint root: only resolve it when the
+        // feature is on, so a disabled section cannot fail the whole contract
+        // over a path nobody will read.
+        let mut conversation = config.conversation.clone();
+        if conversation.enabled {
+            conversation.artifact_root = canonicalize_with_missing(&absolute_path_from(
+                &workspace,
+                &conversation.artifact_root,
+            )?)?;
         }
         let contract = Self {
             goal: goal.into(),
@@ -126,6 +147,7 @@ impl GoalContract {
             max_write_bytes: config.boundary.max_write_bytes,
             max_paths_per_action: config.boundary.max_paths_per_action,
             checkpoint,
+            conversation,
             require_evidence: config.goal.require_evidence,
             min_successful_tool_calls: config.goal.min_successful_tool_calls,
             price,

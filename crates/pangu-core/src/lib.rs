@@ -4,8 +4,10 @@
 //! runtime, provider, and toolkit layers. Policy decisions belong in
 //! `pangu-boundary`; this crate does not decide whether an action is allowed.
 
+pub mod assemble;
 pub mod artifact;
 pub mod checkpoint;
+pub mod conversation;
 pub mod error;
 pub mod events;
 pub mod glob;
@@ -14,8 +16,16 @@ pub mod journal;
 pub mod json;
 pub mod messages;
 pub mod replay;
+pub mod session;
+pub mod slice;
+pub mod stream;
+pub mod summary;
 pub mod util;
 
+pub use assemble::{
+    assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,
+    DegradeMode, Omission, SecondStageSelector, Seam, SelectionReason, SliceSelection,
+};
 pub use artifact::{
     ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
     RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,
@@ -25,6 +35,10 @@ pub use checkpoint::{
     ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
     ExternalEffectSummary, FailedPathRecord, FailedPathStatus, FailureClass, RollbackRequest,
     SessionNode, CHECKPOINT_SCHEMA_VERSION, FAILED_PATH_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+};
+pub use conversation::{
+    redact_messages, validate_encoded_size, CompactionRecord, ConversationSnapshot,
+    MAX_CONVERSATION_BYTES, MAX_CONVERSATION_MESSAGES,
 };
 pub use error::{Error, Result};
 pub use events::{
@@ -39,7 +53,22 @@ pub use inspect::{
 };
 pub use journal::{ConsoleSink, Journal};
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
-pub use util::{approx_tokens_of_chars, hex_sha256, now_rfc3339, short_hash, truncate_middle};
+pub use slice::{
+    extend as extend_slices, slice, verify as verify_slices, ConversationSlices, SliceEntry,
+    SliceKind, SLICE_SCHEMA_VERSION,
+};
+pub use stream::{
+    read_stream, EventMigrator, Stability, StreamData, StreamEffect, StreamEvent, StreamKind,
+    StreamOrigin, StreamSummary, StreamWriter, MAX_STREAM_BYTES, MAX_STREAM_LINE_BYTES,
+    STREAM_SCHEMA_V1,
+};
+pub use summary::{
+    extend as extend_summaries, summarize, summarize_message, verify as verify_summaries,
+    ConversationSummaries, SummaryEntry, SummaryKind, SUMMARY_SCHEMA_VERSION,
+};
+pub use util::{
+    approx_tokens_of_chars, hex_sha256, now_rfc3339, one_line, short_hash, truncate_middle,
+};
 
 /// JSON values used at the provider and policy boundaries.
 pub type Value = serde_json::Value;

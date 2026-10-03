@@ -523,6 +523,15 @@ impl Policy {
         }
     }
 
+    /// Rules in declaration order, for read-only explanation.
+    ///
+    /// Exposed so `explain` can trace the real evaluation order instead of
+    /// guessing it; a shadow report built from a guessed order would describe a
+    /// different algorithm than the one that runs.
+    pub fn explainable_rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
     pub fn render(&self) -> String {
         self.rules
             .iter()

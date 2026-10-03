@@ -191,6 +191,7 @@ mod tests {
         provider_error: bool,
         price_configured: bool,
         checkpoint_enabled: bool,
+        checkpoint_exclude_roots: Vec<String>,
         checkpoint_failure_policy: CheckpointFailurePolicy,
         approval_mode: ApprovalMode,
     }
@@ -212,6 +213,7 @@ mod tests {
                 provider_error: false,
                 price_configured: true,
                 checkpoint_enabled: false,
+                checkpoint_exclude_roots: Vec::new(),
                 checkpoint_failure_policy: CheckpointFailurePolicy::FailRun,
                 approval_mode: ApprovalMode::DestructiveAndAbove,
             }
@@ -238,6 +240,11 @@ mod tests {
         config.checkpoint.failure_policy = options.checkpoint_failure_policy;
         if options.checkpoint_enabled {
             config.checkpoint.artifact_root = root.join(".pangu/checkpoints");
+            config.checkpoint.exclude_roots = options
+                .checkpoint_exclude_roots
+                .iter()
+                .map(PathBuf::from)
+                .collect();
         }
         // The in-process test provider is free; make that pricing explicit so
         // the cost gate does not treat a scripted provider as unbudgeted.
@@ -543,6 +550,106 @@ mod tests {
             Some(artifact.event_ref.event_id.as_str())
         );
         assert!(artifact.workspace_digest.is_some());
+        clean(root);
+    }
+
+    /// The reason `checkpoint.exclude_roots` exists. A snapshot walks the whole
+    /// workspace, so a repository with a multi-gigabyte `target/` cannot
+    /// checkpoint at all without being told to leave it out. This asserts the
+    /// exclusion is applied to the recorded file list, not merely accepted by
+    /// config validation.
+    #[tokio::test]
+    async fn an_excluded_root_is_absent_from_the_snapshot() {
+        let options = SetupOptions {
+            rules: vec![Rule::allow("allow-test", "test_tool", "test action")],
+            checkpoint_enabled: true,
+            checkpoint_exclude_roots: vec!["build-output".to_string()],
+            ..SetupOptions::default()
+        };
+        let (agent, _tool, sink, root) = setup(options);
+        std::fs::create_dir_all(root.join("build-output/deep/nested")).unwrap();
+        std::fs::write(
+            root.join("build-output/deep/nested/blob.bin"),
+            vec![7u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(root.join("kept.txt"), b"kept").unwrap();
+        agent.run().await.expect("run");
+
+        let created = sink
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == pangu_core::EventKind::CheckpointCreated)
+            .expect("checkpoint event");
+        let checkpoint_id = created.payload.as_ref().unwrap()["checkpoint_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let artifact = ArtifactStore::open(root.join(".pangu/checkpoints"))
+            .unwrap()
+            .load_checkpoint(&checkpoint_id)
+            .unwrap();
+        let paths: Vec<String> = artifact
+            .file_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert!(
+            paths.iter().any(|path| path.contains("kept.txt")),
+            "the exclusion removed more than it should: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.contains("build-output")),
+            "excluded root still recorded in the snapshot: {paths:?}"
+        );
+        clean(root);
+    }
+
+    /// An exclusion that swallows the whole workspace would make the snapshot
+    /// claim to be a record of the workspace while holding none of it. Reject
+    /// it at validation, before a run starts.
+    #[test]
+    fn an_exclusion_that_covers_the_whole_workspace_is_rejected() {
+        let root = test_temp_root().join("checkpoint-exclude-whole-workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.checkpoint.enabled = true;
+        config.checkpoint.artifact_root = PathBuf::from(".pangu/checkpoints");
+        config.checkpoint.exclude_roots = vec![PathBuf::from(".")];
+        let error = config
+            .validate()
+            .expect_err("excluding the workspace itself");
+        assert!(
+            error.to_string().contains("subdirectory of the workspace"),
+            "unexpected error: {error}"
+        );
+        clean(root);
+    }
+
+    /// Excluding a path outside the workspace is a way to write a rule that
+    /// silently does nothing, or that reaches into state the boundary does not
+    /// own. Either way it should not be accepted quietly.
+    #[test]
+    fn an_exclusion_outside_the_workspace_is_rejected() {
+        let root = test_temp_root().join("checkpoint-exclude-outside");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.checkpoint.enabled = true;
+        config.checkpoint.artifact_root = PathBuf::from(".pangu/checkpoints");
+        config.checkpoint.exclude_roots = vec![PathBuf::from("../elsewhere")];
+        let error = config
+            .validate()
+            .expect_err("excluding outside the workspace");
+        assert!(
+            error.to_string().contains("subdirectory of the workspace"),
+            "unexpected error: {error}"
+        );
         clean(root);
     }
 
