@@ -1,6 +1,6 @@
-# ADR-0005：无限上下文（切片、组装与写回）
+# ADR-0005：无限上下文（切片与组装）
 
-- 状态：草案（未实现）
+- 状态：草案（未实现；§3.1 与 §3.3 已于 2026-10-03 经用户确认）
 - 相关：[ADR-0001](./0001-checkpoint-rollback.md)、[ADR-0003](./0003-event-stream-contract.md)、[ADR-0004](./0004-conversation-persistence.md)
 - ROADMAP：A6
 
@@ -40,7 +40,7 @@ MAX_MESSAGE_CONTENT_BYTES     = 256 KiB
 
 ## 3. 决策
 
-### 3.1 A6 为主路线，compaction 降级（**待复核**）
+### 3.1 A6 为主路线，compaction 降级（**已确认**）
 
 A1b 路线（全量 + 显式压缩）与 A6（全量留存 + 按需切片）是同一问题的两种解法：
 
@@ -52,7 +52,7 @@ A1b 路线（全量 + 显式压缩）与 A6（全量留存 + 按需切片）是�
 
 **决策**：A6 为主路线。`ConversationSnapshot::compacted()` 降级为"某个切片摘要的一种降级模式"，不再是会话级一次性压缩。
 
-> **待复核**。这条改变了已实现并已测试的 A1 语义。用户已授权按此默认写入，但确认前不应开始实现 A6-3。
+> **已确认（2026-10-03，用户拍板）**。这条改变了已实现并已测试的 A1 语义：`compacted()` 的现有代码与测试保留，但它降级为切片摘要的一种降级模式，不再承担会话级压缩路线。实现 A6-3 时同步更新 ADR-0004 的相关表述。
 
 ### 3.2 "需要哪个"不由模型决定
 
@@ -71,23 +71,23 @@ FORCED = { system 轮, goal, 被拒路径 (failed paths),
 
 `AssemblyReport` 逐片记录：来源 `slice_id`、被选中的理由（`forced:<which>` / `requested` / `budget-降级链位置`）、估算 token。报告进事件流。
 
-### 3.3 写回是 append-only，且标 `unverified`（**待复核**）
+### 3.3 写回：本 ADR 采用读法 (a)，切片改写写回推迟到 B3（**已确认**）
 
-模型返回内容写回本地存储，等于**给了模型改本地状态的能力**。这是"模型输出不是授权"的加强版：不是授权了 `Effect`，是篡改了未来的输入。
+"返回的上下文"有两种读法，档次差很多：
 
-**决策**：
+- (a) 模型的**正常新消息**（今天已有，`finish`/tool result 就是）；
+- (b) 模型**改写后的切片内容**写回本地 store。
+
+**决策（2026-10-03，用户拍板）：按读法 (a)。** 写回就是模型的正常新消息，沿用现有 append-only 的 history 追加路径，不需要新的存储原语。**A6-4 子阶段删除。**
+
+(b) 没有消失，只是**推迟到 B3（受控记忆候选队列）一起议**：模型改写的切片内容是**候选**，不是事实，与 B3“模型只能提出，用户/策略确认后写入”是同一条原则，分开做会把同一套护栏写两遍。届时若实现 (b)，护栏必须是：
 
 - 写回只能**追加**为新切片，原切片不可变；
 - 每条写回记 `derived_from`（源 `slice_id` + 版本号）；
-- `ConversationSnapshot` 整体仍 append-only + digest 校验不变；
 - 写回内容显式标 `unverified`——它没过 `Policy` / `Sandbox`；
 - 扩展 `invariant_i_resumed_conversation_carries_no_authorization`，断言 `unverified` 切片不能单独构成"已验证"输入。
 
-> **待复核**。"返回的上下文"有两种读法，档次差很多：
-> - (a) 模型的**正常新消息**（今天已有，`finish`/tool result 就是）；
-> - (b) 模型**改写后的切片内容**写回本地 store。
->
-> (b) 才是上面这套护栏针对的场景，也是本 ADR 默认采用的解读。若实为 (a)，A6-4 整个子阶段可删，风险与工作量都低一档。
+这些要求移入 B3 的准入条件，本 ADR 不再承载。`SliceEntry.unverified` 字段保留在 schema 里（恒为 `false`），为 (b) 预留，不实现行为。
 
 ### 3.4 `无限` 的诚实边界
 
@@ -144,7 +144,11 @@ SliceEntry {
 
 **切片是 span，不是单条消息。** 单条消息作为选择单元太细——一条 256 KiB 的工具输出、一次 `finish` 回执，都不是有意义的选择粒度。切片跨消息成段（一个 turn、一段工具调用风暴、一个被拒路径），`derived_from` 记录它由哪些 `message_index` 聚合而来，这正是"映射表"可审计的含义。
 
-**三方 digest 绑定**：切片文件同时记录 `context_digest` 与 `summaries_digest`，加载时两个都要校验，对不上就报错——**不重新生成、不静默接受**。重新生成会掩盖"切片与正文对不上"，而那正是切片唯一可能说谎的地方。上下文文件不可变（A1 已保证只写一次）⇒ 三者都一次写完。
+**digest 绑定语义：绑定"会话前缀"，不是"某个快照版本"（2026-10-03 已确认）。** 勘察后发现原文的写法不成立：`ConversationRuntime::save` 每次保存都生成**新的 snapshot_id**（时间戳+序号），`save_every_turn = true` 时上下文文件每轮换一份，若切片绑定单份文件的 `context_digest`，绑定**每轮失效**。
+
+修正后的绑定：history 在运行内严格 append-only、行号只增不减，所以切片/摘要绑定的是**会话的消息前缀**——记录 `prefix_digest`（前 `message_count` 条逻辑消息的 `digest_of`）与 `message_count`，而非整份文件的 digest。加载时按前缀重算校验，对不上就报错——**不重新生成、不静默接受**。新追加的消息在 `message_count` 之后，不使既有切片失效；追加后需要新的摘要/切片时增量生成。摘要文件同样记 `prefix_digest` + `message_count`，与切片文件成对绑定。重新生成会掩盖"切片与正文对不上"，而那正是切片唯一可能说谎的地方。
+
+落盘形态：`contexts/<id>.json` 沿用 A1 的快照文件（每次保存一份，不可变）；摘要/切片文件按会话 id（共享同一消息前缀的快照链）存放，加载时对**当时最新**快照重算前缀校验。
 
 **两级寻址，不能只用行号**：`message_index` 解决"哪一条消息"；`start_line/end_line` 解决"这条消息内部"——单条工具输出可达 `MAX_MESSAGE_CONTENT_BYTES = 256 KiB`，一条消息一行的话仍然切不开。内容行是**读时按 `\n` 切分**得到的，确定性，不需要再改存储格式。
 
@@ -188,6 +192,22 @@ laya（短决策）：短名单里哪几片真的相关
 - 组装结果整体标 `derived: true` / `authoritative: false`（与 A2 事件流同一套纪律）；
 - 不标接缝的话 `invariant_i_failed_path_not_repeated` 的证据链会断——被拒路径虽在强制集里，但周围被拼成一段看似正常的对话时，模型看到的就是"这里没发生过什么"。
 
+### 3.8 配对完整性（勘察新发现的硬约束）
+
+**问题**：OpenAI function-calling wire format 要求每条带 `tool_calls` 的 assistant 消息之后必须紧跟对应的 `Tool{call_id}` 结果消息。切片按 span 裁剪时，若保留了 assistant 的调用却裁掉了它的结果（或反过来），provider 直接返回 400——组装结果不只是"不连贯"，而是**协议非法**。
+
+**决策（配对不变量）**：组装器必须保证每个 `tool_calls[i]` 与其 `Tool{call_id}` **同进同出**：
+
+- 选中某切片时，若其含带 `tool_calls` 的 assistant 消息，必须同时包含对应的全部 `Tool` 结果消息（可能跨出原 span，需扩展选取范围并在 `AssemblyReport` 记为 `forced:pairing`）；
+- 反之，孤立的 `Tool` 结果消息（其 assistant 调用未被选中）不得单独进入组装结果；
+- 强制集里的"未完成的工具调用"是唯一允许的**有调用无结果**形态，且必须与真实 history 中的形态一致，不能由组装器伪造配对。
+
+这条必须有独立不变量测试（构造跨切片边界的 tool burst，断言配对完整），否则 A6-2 不能验收。
+
+### 3.9 组装器必须能纯内存工作
+
+`conversation.enabled` 默认关闭。组装器不得依赖持久化：对当前内存 history 做与 `encode_linewise` 等价的逻辑编码即可计算前缀/范围 digest，摘要与切片的持久化只是跨运行复用的优化。**A6 不得隐式依赖一个默认关闭的功能。**
+
 ## 4. 现状勘察（实现前必须知道的）
 
 - `crates/` 内**无任何**检索、嵌入或语义相似度能力。唯一的 `summary` 是 CLI 里的运行统计（`main.rs:385` `replay::Summary`），与语义摘要无关。
@@ -204,20 +224,20 @@ laya（短决策）：短名单里哪几片真的相关
 - **范围完整性需要三道**（整份 digest 不够用）：
   1. 逐范围校验 `range_digest`——否则改了第 500 行，取到的切片是他改过的内容却挂着原摘要；
   2. `range_digest` 与 `summary_digest` 成对绑定——摘要描述 100–200 行，那段变了摘要就在说谎；
-  3. 范围记录里带源文件整份 digest，取用时先对整份——"不可变"是第一道防线，但不该是唯一一道。
+  3. 范围记录里带会话前缀 digest（`prefix_digest` + `message_count`，见 §3.5），取用时先对前缀——"不可变"是第一道防线，但不该是唯一一道。
 
 ## 5. 子阶段
 
 | 阶段 | 内容 | 依赖 |
 | --- | --- | --- |
 | ~~A6-0~~ | ~~落盘改「一条消息一行」~~ **已做**（`conversation::encode_linewise`） | A1-1（已做） |
-| A6-1 | **摘要器**（Pangu 自己的确定性主要功能，有单测）+ 上下文文件 / 摘要文件 + `SummaryEntry`；`context_digest` 绑定；三道范围校验 | A6-0 |
-| **A6-1b** | **切片文件（映射表）**：`SliceEntry`，切片为 span，`derived_from` 记录聚合了哪些消息；绑定 `context_digest` + `summaries_digest` | A6-1 |
-| A6-2 | 组装器：`assemble(forced, requested, budget) -> (AssembledContext, AssemblyReport)`，逐片记选取理由，**接缝显式标记**，结果标 `derived/authitative`（§3.7） | A6-1 |
-| A6-3 | 概要模式：降级链 `full → summary → omit-with-reason`；切片配置化存储界 | A6-2 |
-| A6-4 | 写回：append-only + `derived_from` + `unverified` 标注 | A6-2；**若 §3.3 实为读法 (a) 则删除** |
-| A6-5 | 接入运行循环：替代 `Breach::InputTokens` 的终止路径，**保留终止作兜底** | A6-3 / A6-4 |
-| A6-6 | laya 接入为 A6-2 最末端的**短决策**（纯增强，**删掉不损失任何能力**；默认关闭） | A6-2 + **B6**（未实现） |
+| ~~A6-1~~ | ~~**摘要器**~~ **已做**（`pangu-core::summary`：确定性抽取 + `SummaryEntry` + `prefix_digest`/`message_count` 绑定、三道校验、增量 `extend`；store 落 `summaries/<run_hash>.json`，上下文文件沿用 A1 的 `conversations/` 布局而非新建 `contexts/` 目录） | A6-0 |
+| ~~A6-1b~~ | ~~**切片文件（映射表）**~~ **已做**（`pangu-core::slice`：`SliceEntry`、`derived_from`、前缀绑定、§3.8 配对校验、增量 `extend`；落 `slices/<run_hash>.json`） | A6-1 |
+| ~~A6-2~~ | ~~组装器~~ **已做**（`pangu-core::assemble`：FORCED∪requested、`close_pairing` 配对闭包、接缝 System 标记 + `AssemblyReport`、`forced_over_budget` 兜底信号、纯内存） | A6-1 |
+| ~~A6-3~~ | ~~概要模式：降级链 `full → summary → omit-with-reason`~~ **已做**（`degrade` 逐 slice 分配模式；forced-core 不得低于 Summary，recent/requested 可 Omitted 并入报告与接缝标记；存储界沿用 `conversation.enabled`，随 A6-5 接入） | A6-2 |
+| ~~A6-4~~ | ~~写回~~ **已删除**（§3.3 已确认为读法 (a)；切片改写写回推迟到 B3） | — |
+| ~~A6-5~~ | ~~接入运行循环：替代 `Breach::InputTokens` 的终止路径，**保留终止作兜底**~~ **已做**（每轮 `assemble` 出窗口送 `provider.chat`；组装失败与 `forced_over_budget` 分两条硬终止；`ContextAssembled` 事件进 Journal/A2 provisional 槽） | A6-3 |
+| A6-6 | laya 接入为 A6-2 最末端的**短决策**（纯增强，**删掉不损失任何能力**；默认关闭）。**接缝已做**：`assemble_with(.., selector: Option<&dyn SecondStageSelector>)` + `CandidateSlice` 候选集 + `second_stage` 报告字段（`none`/`selector`/`fallback`）；laya 实现待 B6 | A6-2 + **B6**（未实现） |
 
 A6-5 的关键约束：新组装器**不能**成为"永不终止"的来源。三层降级用尽后必须终止，且终止原因要能区分"上下文确实太大"与"组装器组装不出来"。
 
@@ -225,8 +245,8 @@ A6-5 的关键约束：新组装器**不能**成为"永不终止"的来源。三
 
 - **A1**：A6 分叉 A1b 路线（§3.1）。A1-3/6 的 tree 导航不是 A6 的前提——切片单位用 **turn**（一次 user/assistant/tool 交换）即可起步，tree 节点是更优雅的**后续**单位，届时 `SessionNode.history_digest` 死字段可能顺带打通。
 - **F1 Repo Map**：F1 已经在做"生成可解释的、显示来源/时效/token budget 的上下文"，本质是"代码库这一类内容的切片"。**F1 应消费 A6 的组装接口**，不要两套"选什么进 prompt"的逻辑并行——那是最容易分叉的地方。
-- **B3 受控记忆候选队列**：B3 的原则是"模型只能提出，用户/策略确认后写入"。同一原则延伸到 A6 的写回路径：模型改写的切片内容是**候选**，不是事实。
-- **A5 会话导出**：A5 扫 secret 时需要覆盖切片 store 与写回内容。
+- **B3 受控记忆候选队列**：B3 的原则是"模型只能提出，用户/策略确认后写入"。§3.3 已确认 A6 采用读法 (a)，模型改写切片内容的写回**移交 B3 作为准入条件**——届时按候选处理，护栏清单见 §3.3。
+- **A5 会话导出**：A5 扫 secret 时需要覆盖切片 store。
 - **A2 事件流**：`AssemblyReport` 与切片选取理由应作为新 kind 进入 `pangu-stream/1`（只增不改）。
 - **B6 本地 laya**：laya 在 A6 里只有**一个位置**——A6-2 的第二级相关性判断（A6-6）。B6 已有的约束直接适用且**不放宽**：不得成为核心启动依赖、不得直接创建 `VerifiedAction`、不得改 Policy/预算/审批模式、失败必须确定性 fallback 或 fail closed、请求与失败原因进脱敏事件流。**摘要不经过 laya**（§3.6），因为摘要是确定性抽取。
 
@@ -238,7 +258,8 @@ A6-5 的关键约束：新组装器**不能**成为"永不终止"的来源。三
 - 让运行永不终止（见 §3.4）。
 - 把摘要做成模型生成的抽象式摘要（§3.6）——会引入"污染的摘要一路传播"这一整类问题，而这个设计不需要它。
 - 让模型（laya 或任何模型）决定强制集、写回或终止（§3.2/§3.3/§3.6）。
+- 模型改写后的切片内容写回本地 store（§3.3 读法 (b)）——移交 B3，本 ADR 不实现。
 
 ## 8. 实现状态
 
-未实现。本文件是草案；§3.1 与 §3.3 标注为**待复核**，确认前不应开始实现。
+未实现。本文件是草案。§3.1（A6 为主路线）、§3.3（读法 (a)，A6-4 删除）、§3.5（前缀绑定语义）已于 2026-10-03 经用户确认；§3.8 配对不变量与 §3.9 纯内存工作是勘察后新增的硬约束。**A6-0、A6-1、A6-1b、A6-2、A6-3、A6-5 已做；A6-6 接缝已做（laya provider 待 B6）**（摘要器在 `pangu-core::summary`，切片器在 `pangu-core::slice`，摘要/切片文件分别落在 `summaries/` 与 `slices/`，上下文文件仍为 `conversations/`；§3.5 的 `contexts/` 目录本次未照搬——A1 已有布局即上下文文件，未新建第二棵树）。A6-6 本体（laya provider）**推迟**，待 B6 落地后实现 `SecondStageSelector` 即可，组装端不用再改。

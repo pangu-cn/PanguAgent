@@ -16,7 +16,7 @@ ROADMAP 把 A1 写成"支持 resume、branch、fork、compaction；每个节点�
 
 **Journal 也不足以重建对话。** `ModelRequest` 只写 `messages=2 tools=7` 这样的计数，`ModelResponse` 只写 `"provider response received"`，都不带消息内容，也没有 `payload`。历史无法从 Journal 回放。
 
-**附带发现：`history_digest` 是死字段。** `SessionNode` 声明并校验它（`pangu-core/src/checkpoint.rs`），但全仓库没有任何一处赋非 `None` 的值。它现在不承载任何信息，本 ADR 开始给它真正的含义。
+**附带发现：`history_digest` 是死字段。** `SessionNode` 声明并校验它（`pangu-core/src/checkpoint.rs`），但全仓库没有任何一处赋非 `None` 的值。本文曾写“本 ADR 开始给它真正的含义”——**这句是错的**：真正被赋值的是 `ConversationSnapshot.history_digest`，那是一个新结构上的新字段；`SessionNode.history_digest` 截至本文**依然没有任何非 `None` 赋值**，仍是死字段（现状见 §7 实现状态末尾）。
 
 ## 2. 决策
 
@@ -42,7 +42,8 @@ ID：A1 会话持久化与恢复
 
 影响面：新增 ConversationSnapshot 概念（pangu-core）+ Artifact store 存取方法
       + agent 侧 save/restore 钩子 + CLI；门禁路径零改动（resume 后仍走完整
-      Policy → Sandbox → Approval）；历史 digest 开始被真正赋值；
+      Policy → Sandbox → Approval）；`ConversationSnapshot.history_digest` 开始
+      被真正赋值（`SessionNode.history_digest` 仍为死字段，见 §1 附带发现）；
 
 数据/隐私：对话内容经 redact_text/redact_value 脱敏后存储；单条与总体积有界；
       不存凭据原值；导出时受 A5 的隐私检查约束；
@@ -138,6 +139,8 @@ ConversationSnapshot {
 | "恢复不携带授权"（表示层） | 完成 | `invariant_i_resumed_conversation_carries_no_authorization`：断言恢复值只有 `Message`、消息形状无 `effect`/`decision`/`approved` 等字段、把恢复文本喂回 `Policy::evaluate` 时判定仍来自规则或不变量而非历史内容 |
 
 
+> **路线变更（2026-10-03，随 A6-3 落地）**：本 ADR 的"显式压缩 + 出处"不再是会话级主路线。`compacted()` API 与其测试保留，但语义降级为"某个切片摘要的一种降级模式"（ADR-0005 §3.1/§3.3 已确认）；重启路线由 ADR-0005 的切片组装取代。
+
 **实现中发现并修正的一个真 API 缺陷**：`compacted()` 最初沿用原 `snapshot_id`，而 store 的不可变检查会直接拒绝——等于**压缩产物永远存不下来**，而这正是压缩存在的理由。已改为必须显式传入新的 `snapshot_id`（复用同一个 id 时直接报错），并在文档里说明原因：改写会毁掉新记录声称所来自的那份历史。
 
 ### 7.2 第二阶段：接入 agent 运行循环
@@ -188,6 +191,6 @@ ConversationSnapshot {
 
 **CLI 接线时发现的两个既有 bug（非本次引入，均已修）**：
 - ① `demo()` 只应用了 `CliOverrides { unattended: true }`，**没应用 `--checkpoint` / `--no-checkpoint`**。用户要求了却没得到，**连警告都没有**，而且两个方向都错：`pangu --checkpoint --demo` 静默不开检查点，`--config cfg(enabled=true) --no-checkpoint --demo` 静默照开。
-- ② 曾记为“自定义相对 `checkpoint.artifact_root` 会让 `--demo` 报 `checkpoint creation failed`”——**这条描述是错的，已纠正**。真实原因：快照遍历整个工作区，而默认 `forbidden_globs` 只有 `.git` / `.env` / secrets / 私钥，**不排除构建产物**，本仓库 6.3 GB 的 `target/` 必然撞上 64 MiB 上限。与 `artifact_root` 写相对还是绝对**无关**——用默认的 `.pangu/checkpoints` 一样失败。修法是新增 `checkpoint.exclude_roots`，并把超限错误改成指出具体是哪个文件越界。
+- ② 曾记为“自定义相对 `checkpoint.artifact_root` 会让 `--demo` 报 `checkpoint creation failed`”——**这条描述是错的，已纠正**。真实原因：快照遍历整个工作区，而默认 `forbidden_globs` 只有 `.git` / `.env` / secrets / 私钥，**不排除构建产物**，本仓库动辄数 GB 的 `target/` 必然撞上 64 MiB 上限。与 `artifact_root` 写相对还是绝对**无关**——用默认的 `.pangu/checkpoints` 一样失败。修法是新增 `checkpoint.exclude_roots`，并把超限错误改成指出具体是哪个文件越界。
 
 **本阶段未做**：`branch` / `fork`。**fork 的工作区隔离完全未解决**，见第 6 节。`SessionNode.history_digest` 依然是死字段——现在有真实的节点与对话可供它记录，赋值仍待做。
