@@ -17,7 +17,7 @@ use pangu_agent::{
     ToolExecutor, ToolOutput, VerifiedAction,
 };
 use pangu_boundary::{Risk, Sandbox};
-use pangu_core::{short_hash, ToolCall, ToolSpec};
+use pangu_core::{short_hash, MemoryStore, ToolCall, ToolSpec};
 
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -29,6 +29,10 @@ pub struct Toolkit {
     /// tool is not advertised and every call to it is rejected, exactly as if
     /// F3 were not compiled in.
     verify_command: Vec<String>,
+    /// B3: the controlled memory candidate queue. `None` = the
+    /// `propose_memory` tool does not exist, exactly as if B3 were not
+    /// compiled in.
+    memory: Option<std::sync::Arc<MemoryStore>>,
 }
 
 impl Toolkit {
@@ -42,7 +46,21 @@ impl Toolkit {
     pub fn with_verify_command(command: Vec<String>) -> Self {
         Self {
             verify_command: command,
+            memory: None,
         }
+    }
+
+    /// B3: attach the memory candidate queue. The model can only *propose*
+    /// through it; acceptance, rejection, and revocation are operator-only
+    /// CLI actions outside any run.
+    pub fn with_memory(mut self, store: std::sync::Arc<MemoryStore>) -> Self {
+        self.memory = Some(store);
+        self
+    }
+
+    /// B3: the memory store handle, if attached.
+    pub fn memory_store(&self) -> Option<&std::sync::Arc<MemoryStore>> {
+        self.memory.as_ref()
     }
 
     /// B1: the static declaration of every capability this toolkit can
@@ -156,6 +174,23 @@ impl Toolkit {
                 timeout_ms: None,
             });
         }
+        // B3: proposing a memory only appends an inert pending candidate —
+        // nothing reads it into a prompt until an operator accepts it, and it
+        // can be rejected. The write target is Pangu-owned storage that is
+        // excluded from every generic tool I/O path.
+        if self.memory.is_some() {
+            capabilities.push(Capability {
+                name: "propose_memory".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: empty(),
+                writes: vec![".pangu/memory/candidates.json".into()],
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            });
+        }
         CapabilityManifest::new(capabilities)
     }
 }
@@ -262,6 +297,24 @@ impl ToolExecutor for Toolkit {
                     "additionalProperties": false,
                     "required": [],
                     "properties": {}
+                }),
+            ));
+        }
+        // B3: advertise the memory proposal tool only when the operator
+        // enabled the queue. Proposals are inert until an operator accepts
+        // them through the CLI.
+        if self.memory.is_some() {
+            specs.push(ToolSpec::new(
+                "propose_memory",
+                "Propose a memory candidate for the operator to review. It is NOT written into any prompt until the operator accepts it, and it never changes permissions or boundaries.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["content"],
+                    "properties": {
+                        "content": {"type": "string", "minLength": 1},
+                        "kind": {"type": "string", "description": "short slug like note/preference/lesson"}
+                    }
                 }),
             ));
         }
@@ -420,6 +473,34 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "propose_memory" => {
+                ensure_allowed_keys(&call.args, &["content", "kind"])?;
+                let store = self
+                    .memory
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("propose_memory tool is not configured"))?;
+                let content = required_string(&call.args, "content")?;
+                let kind = call
+                    .args
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("note");
+                let mut assessment = ToolAssessment::new(Risk::Reversible).with_effect(
+                    EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                );
+                // The write target is the store's own file — the same file
+                // every generic tool I/O path is forbidden to touch.
+                assessment = assessment.write(store.path().to_path_buf());
+                // Preview carries the digest, never the raw content: the
+                // content is model text and may contain secrets.
+                assessment.preview = format!(
+                    "propose_memory kind={} bytes={} sha256={}",
+                    kind,
+                    content.len(),
+                    short_hash(&content)
+                );
+                Ok(assessment)
+            }
             "git_diff" => {
                 ensure_allowed_keys(&call.args, &["staged", "path"])?;
                 let staged = call
@@ -469,6 +550,13 @@ impl ToolExecutor for Toolkit {
             "git_diff" => execute_command(action).await,
             "run_command" => execute_command(action).await,
             "verify" => execute_verify(action).await,
+            "propose_memory" => {
+                let store = self
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("propose_memory tool is not configured"))?;
+                execute_propose_memory(action, &store)
+            }
             other => bail!("tool `{other}` has no executor"),
         }
     }
@@ -895,6 +983,34 @@ async fn execute_command(action: &VerifiedAction) -> Result<ToolOutput> {
 /// env, closed stdin, timeout, bounded output); only the evidence tag differs.
 async fn execute_verify(action: &VerifiedAction) -> Result<ToolOutput> {
     execute_command_tagged(action, "verify").await
+}
+
+/// B3: append a pending memory candidate. The output carries the id and the
+/// content digest only — the agent audits the proposal into the journal
+/// without the raw content.
+fn execute_propose_memory(action: &VerifiedAction, store: &MemoryStore) -> Result<ToolOutput> {
+    let call = action.call();
+    let content = call
+        .args
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("propose_memory content is missing"))?
+        .to_string();
+    let kind = call
+        .args
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("note");
+    let candidate = store.propose(&content, kind)?;
+    Ok(ToolOutput {
+        content: serde_json::to_string(&serde_json::json!({
+            "id": candidate.id,
+            "status": candidate.status.as_str(),
+            "content_sha256": candidate.content_digest,
+            "review": "queued for operator review; it is not active and carries no effect until accepted",
+        }))?,
+        evidence: Some(format!("memory:{}", candidate.id)),
+    })
 }
 
 async fn execute_command_tagged(action: &VerifiedAction, tag: &str) -> Result<ToolOutput> {

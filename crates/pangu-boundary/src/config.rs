@@ -43,6 +43,37 @@ pub struct Config {
     /// is not advertised, exactly as if F3 were not compiled in.
     #[serde(default)]
     pub verify: VerifySection,
+    /// B3: the controlled memory candidate queue. Disabled by default: no
+    /// tool, no injection, no digest change.
+    #[serde(default)]
+    pub memory: MemorySection,
+}
+
+/// B3: controlled memory candidate queue configuration. Disabled by default:
+/// the `propose_memory` tool does not exist, nothing is injected, and the
+/// contract digest is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemorySection {
+    pub enabled: bool,
+    pub max_pending: usize,
+    pub max_content_bytes: usize,
+    pub max_kind_bytes: usize,
+    pub max_injected: usize,
+    pub max_injected_bytes: usize,
+}
+
+impl Default for MemorySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_pending: 256,
+            max_content_bytes: 4_096,
+            max_kind_bytes: 32,
+            max_injected: 24,
+            max_injected_bytes: 16_384,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -387,6 +418,9 @@ impl Default for BoundarySection {
                 "**/secrets/**".into(),
                 "**/*.pem".into(),
                 "**/id_rsa*".into(),
+                // B3: Pangu-owned storage (journal, checkpoints, conversation
+                // store, memory queue) is never tool-writable.
+                "**/.pangu/**".into(),
             ],
             approval: ApprovalSection::default(),
             max_tool_output_bytes: 16_384,
@@ -662,6 +696,36 @@ impl Config {
                 ));
             }
             pangu_core::Glob::new(pattern)?;
+        }
+        // B3: bounded memory behavior. The bounds must themselves be bounded
+        // so a misconfigured store cannot silently disable the guarantees.
+        let memory = &self.memory;
+        if memory.enabled {
+            if memory.max_pending == 0 {
+                return Err(Error::Config(
+                    "memory.max_pending must be at least 1".into(),
+                ));
+            }
+            if memory.max_content_bytes < 64 || memory.max_content_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "memory.max_content_bytes must be between 64 and 1048576".into(),
+                ));
+            }
+            if memory.max_kind_bytes == 0 || memory.max_kind_bytes > 256 {
+                return Err(Error::Config(
+                    "memory.max_kind_bytes must be between 1 and 256".into(),
+                ));
+            }
+            if memory.max_injected > 1_000 {
+                return Err(Error::Config(
+                    "memory.max_injected must be at most 1000".into(),
+                ));
+            }
+            if memory.max_injected_bytes < 256 || memory.max_injected_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "memory.max_injected_bytes must be between 256 and 1048576".into(),
+                ));
+            }
         }
         for host in &self.boundary.network.hosts {
             if host.chars().any(char::is_control) {
@@ -1887,5 +1951,47 @@ control"
         // same directory written two ways would produce two digests.
         assert!(excluded.checkpoint.exclude_roots[0].is_absolute());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// B3: memory enabled changes the digest; the default (disabled) keeps
+    /// historical digests. The frozen bounds ride with the contract.
+    #[test]
+    fn memory_section_freezes_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        let disabled = crate::goal::GoalContract::from_config("b3 off", &base).unwrap();
+        assert!(!disabled.memory().enabled);
+        assert!(!base.explain().contains("memory: enabled"));
+
+        let mut enabled_config = base.clone();
+        enabled_config.memory.enabled = true;
+        enabled_config.memory.max_pending = 7;
+        let enabled = crate::goal::GoalContract::from_config("b3 on", &enabled_config).unwrap();
+        assert!(enabled.memory().enabled);
+        assert_eq!(enabled.memory().max_pending, 7);
+        assert_ne!(disabled.digest(), enabled.digest());
+    }
+
+    /// B3: the memory bounds must themselves be sane when the queue is on.
+    #[test]
+    fn memory_limits_fail_closed_when_enabled() {
+        let mut config = crate::Config::embedded().unwrap();
+        config.memory.enabled = true;
+        config.memory.max_pending = 0;
+        let error = config.validate().expect_err("max_pending must be >= 1");
+        assert!(error.to_string().contains("max_pending"), "{error}");
+
+        config.memory.max_pending = 256;
+        config.memory.max_content_bytes = 8;
+        let error = config
+            .validate()
+            .expect_err("max_content_bytes must be >= 64");
+        assert!(error.to_string().contains("max_content_bytes"), "{error}");
+
+        // Disabled runs do not care about the limits.
+        let mut disabled = crate::Config::embedded().unwrap();
+        disabled.memory.max_pending = 0;
+        disabled
+            .validate()
+            .expect("disabled queue skips limit checks");
     }
 }

@@ -19,6 +19,18 @@ pub struct ContractFallback {
     pub input_usd_per_mtok: f64,
     pub output_usd_per_mtok: f64,
 }
+
+/// B3: the controlled memory queue, frozen into the contract. The bounds ride
+/// with the contract so an injected store cannot quietly widen them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ContractMemory {
+    pub enabled: bool,
+    pub max_pending: usize,
+    pub max_content_bytes: usize,
+    pub max_kind_bytes: usize,
+    pub max_injected: usize,
+    pub max_injected_bytes: usize,
+}
 use crate::sandbox::{absolute_path_from, Sandbox};
 
 /// The immutable, human-supplied portion of one run. The agent builds its
@@ -70,6 +82,10 @@ pub struct GoalContract {
     /// the contract so an injected Sandbox cannot quietly widen it.
     #[serde(default)]
     pub extra_readonly_commands: Vec<String>,
+    /// B3: the controlled memory queue, frozen at contract construction.
+    /// `enabled = false` keeps historical digests and runs unchanged.
+    #[serde(default)]
+    pub memory: ContractMemory,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
@@ -99,6 +115,8 @@ impl GoalContract {
                 "**/secrets/**".into(),
                 "**/*.pem".into(),
                 "**/id_rsa*".into(),
+                // B3: Pangu-owned storage is never tool-writable.
+                "**/.pangu/**".into(),
             ],
             approval_mode: ApprovalMode::DestructiveAndAbove,
             budget: Budget::default(),
@@ -115,6 +133,7 @@ impl GoalContract {
             max_write_bytes: 4_194_304,
             max_paths_per_action: 64,
             verify_command: Vec::new(),
+            memory: ContractMemory::default(),
             extra_readonly_commands: Vec::new(),
             checkpoint: CheckpointSection::default(),
             conversation: ConversationSection::default(),
@@ -187,6 +206,14 @@ impl GoalContract {
             max_write_bytes: config.boundary.max_write_bytes,
             max_paths_per_action: config.boundary.max_paths_per_action,
             verify_command: config.verify.command.clone(),
+            memory: ContractMemory {
+                enabled: config.memory.enabled,
+                max_pending: config.memory.max_pending,
+                max_content_bytes: config.memory.max_content_bytes,
+                max_kind_bytes: config.memory.max_kind_bytes,
+                max_injected: config.memory.max_injected,
+                max_injected_bytes: config.memory.max_injected_bytes,
+            },
             extra_readonly_commands: config.boundary.extra_readonly_commands.clone(),
             checkpoint,
             conversation,
@@ -245,6 +272,11 @@ impl GoalContract {
     /// F4: whether the run starts in the read-only plan phase.
     pub fn plan_first(&self) -> bool {
         self.plan_first
+    }
+
+    /// B3: the frozen memory-queue settings.
+    pub fn memory(&self) -> &ContractMemory {
+        &self.memory
     }
 
     /// C5: the declared execution backend.
@@ -326,6 +358,16 @@ impl GoalContract {
                 object.insert(
                     "fallbacks".into(),
                     serde_json::to_value(&self.fallbacks).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        // B3: only an enabled memory queue changes the digest; disabled runs
+        // keep their historical digest.
+        if self.memory.enabled {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "memory".into(),
+                    serde_json::to_value(&self.memory).unwrap_or(serde_json::Value::Null),
                 );
             }
         }

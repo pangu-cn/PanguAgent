@@ -135,7 +135,7 @@ FinishRequested, RunFinished, Note,
 CheckpointCreated, CheckpointFailed,
 RollbackRequested, RollbackStarted, RollbackApplied,
 RollbackSkippedAlreadyApplied, RollbackFailed, FailedPathRecorded,
-ContextAssembled, PhaseChanged, ProviderSwitched
+ContextAssembled, PhaseChanged, ProviderSwitched, MemoryProposed
 ```
 
 启用 checkpoint 的运行使用 `pangu-journal/v2`；禁用时保留 v1。v2 写入时封存 `schema`、连续 `seq`、`prev_sha`、内容 `sha` 和 `evt_<sha256>` 稳定 ID。`EventSink::emit` 保持兼容，内部 receipt 路径使用 `emit_with_receipt`；TeeSink 比较多个 durable sink 的 receipt，不一致则失败。Journal replay 只校验和索引，不恢复文件、不重放副作用。
@@ -255,6 +255,7 @@ B4 的 provider 注册表（`pangu-boundary::registry`）是静态配置数据�
 | I-Verify-Command-Binding | `pangu-boundary/src/config.rs`, `pangu-agent/src/lib.rs` (`Agent::new`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | verify 只运行 contract 冻结的整条命令；模型参数被拒绝；失败无 evidence 且 `complete` 降级 |
 | I-Plan-Phase-Read-Only | `pangu-boundary/src/goal.rs`, `pangu-agent/src/lib.rs` (`process_tool`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | plan_first 运行中变更动作在闸门前被拒；仅 `begin_act` 切相；act 动作仍逐项审批 |
 | I-Fallback-Declared-Chain | `pangu-boundary/src/config.rs`, `pangu-agent/src/lib.rs` (`with_chain`, `chat_with_fallback`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | fallback 只沿 contract 冻结链进行；切换与失败有事件；按段计价不低估成本；链耗尽即失败 |
+| I-Memory-Proposal-Only | `pangu-core/src/memory.rs`, `pangu-toolkit/src/lib.rs` (`propose_memory`), `pangu-agent/src/lib.rs` (`with_memory`, 注入), `crates/pangu-toolkit/tests/toolkit_integration.rs` | 模型只入队；accept 仅 CLI；`.pangu` 禁区 + internal I/O 语义；注入块标注 UNTRUSTED/no authorization |
 
 ## 已知边界
 

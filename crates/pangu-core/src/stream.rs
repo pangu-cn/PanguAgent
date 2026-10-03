@@ -105,6 +105,8 @@ pub enum StreamKind {
     PhaseChanged,
     /// B5: switch to a declared fallback provider after a failure.
     ProviderSwitched,
+    /// B3: a memory candidate was proposed (digest only, never content).
+    MemoryProposed,
 }
 
 impl StreamKind {
@@ -161,6 +163,7 @@ impl StreamKind {
             Self::ContextAssembled,
             Self::PhaseChanged,
             Self::ProviderSwitched,
+            Self::MemoryProposed,
         ]
     }
 
@@ -197,6 +200,7 @@ impl StreamKind {
             EventKind::ContextAssembled => Self::ContextAssembled,
             EventKind::PhaseChanged => Self::PhaseChanged,
             EventKind::ProviderSwitched => Self::ProviderSwitched,
+            EventKind::MemoryProposed => Self::MemoryProposed,
         })
     }
 }
@@ -765,6 +769,7 @@ mod tests {
                 StreamKind::ContextAssembled => EventKind::ContextAssembled,
                 StreamKind::PhaseChanged => EventKind::PhaseChanged,
                 StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
+                StreamKind::MemoryProposed => EventKind::MemoryProposed,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -812,6 +817,7 @@ mod tests {
                     StreamKind::ContextAssembled => EventKind::ContextAssembled,
                     StreamKind::PhaseChanged => EventKind::PhaseChanged,
                     StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
+                    StreamKind::MemoryProposed => EventKind::MemoryProposed,
                 },
                 0,
                 "hello",

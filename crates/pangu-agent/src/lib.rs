@@ -22,7 +22,7 @@ use pangu_boundary::{
 };
 use pangu_core::{
     assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event,
-    EventKind, EventSink, FailureClass, JournalMeta, Message, RestoreDisposition,
+    EventKind, EventSink, FailureClass, JournalMeta, MemoryStore, Message, RestoreDisposition,
     RollbackOperation, RollbackRequest, ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1,
     JOURNAL_FORMAT_V2,
 };
@@ -376,6 +376,10 @@ pub struct Agent {
     /// History to continue from. Model input only: it carries no decision and
     /// no approval, and every action in the resumed run is re-evaluated.
     resume_from: Option<Vec<Message>>,
+    /// B3: the memory candidate store. Attached only when the contract
+    /// enables the queue; used to inject accepted, clearly-labeled memory
+    /// into fresh runs.
+    memory: Option<Arc<MemoryStore>>,
 }
 
 impl Agent {
@@ -423,6 +427,18 @@ impl Agent {
                 "tool executor's verify command does not match GoalContract verify_command"
             ));
         }
+        // B3: the propose_memory advertisement must match the contract — a
+        // tool the contract does not know about must not exist, and a
+        // contract-enabled queue without its tool is a broken freeze.
+        let memory_advertised = tools
+            .specs()
+            .iter()
+            .any(|spec| spec.name == "propose_memory");
+        if contract.memory.enabled != memory_advertised {
+            return Err(anyhow!(
+                "tool executor's propose_memory advertisement does not match GoalContract memory.enabled"
+            ));
+        }
         if contract.policy_digest != policy.digest() {
             return Err(anyhow!(
                 "GoalContract and Policy do not describe the same rule set"
@@ -463,7 +479,16 @@ impl Agent {
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
             resume_from: None,
+            memory: None,
         })
+    }
+
+    /// B3: attach the memory candidate store. The same store instance must
+    /// back the toolkit's `propose_memory` tool; the run refuses to start if
+    /// the contract enables the queue but no store was attached.
+    pub fn with_memory(mut self, store: Arc<MemoryStore>) -> Self {
+        self.memory = Some(store);
+        self
     }
 
     /// Continue from a stored conversation.
@@ -771,7 +796,13 @@ impl Agent {
                 .into_iter()
                 .chain(resource_probes)
                 .collect(),
-            ..ResourceRequest::default()
+            // Pangu-internal I/O: the artifact root lives under `.pangu`,
+            // which tools can never touch (forbidden glob), but the runtime
+            // itself must.
+            hosts: Vec::new(),
+            argv: Vec::new(),
+            cwd: None,
+            internal: true,
         };
         if self.sandbox.validate_resources(&resources).is_err()
             || runtime.validate_rollback_resources().is_err()
@@ -1098,7 +1129,11 @@ impl Agent {
                 self.contract.checkpoint.artifact_root.clone(),
             ],
             write_paths: vec![self.contract.checkpoint.artifact_root.clone()],
-            ..ResourceRequest::default()
+            hosts: Vec::new(),
+            argv: Vec::new(),
+            cwd: None,
+            // Pangu-internal I/O: see the rollback site note.
+            internal: true,
         };
         if let Err(error) = self.sandbox.validate_resources(&resources) {
             return Err(("sandbox", anyhow!(error)));
@@ -1313,6 +1348,21 @@ impl Agent {
         }
     }
 
+    /// B3: the accepted-memory injection block for this run, or `None`. The
+    /// store must exist when the contract enables the queue.
+    fn memory_block(&self) -> Result<Option<String>> {
+        if !self.contract.memory.enabled {
+            return Ok(None);
+        }
+        let store = self.memory.as_ref().ok_or_else(|| {
+            anyhow!(
+                "GoalContract enables the memory queue but no memory store was attached; \
+                 build the agent with `with_memory`"
+            )
+        })?;
+        Ok(store.injection_block())
+    }
+
     async fn run_inner(&self) -> Result<Outcome> {
         let started = Instant::now();
         let mut usage = Usage::default();
@@ -1325,7 +1375,21 @@ impl Agent {
                 conversation::validate_resumable(history)?;
                 history.clone()
             }
-            None => conversation::seed_history(self.contract.system_prompt(), &self.contract.goal),
+            None => {
+                let mut seeded =
+                    conversation::seed_history(self.contract.system_prompt(), &self.contract.goal);
+                // B3: fresh runs get the accepted-memory block appended to the
+                // system turn, explicitly labeled untrusted. Resumed runs keep
+                // the memory block from when they were seeded — no mid-history
+                // context mutation.
+                if let Some(block) = self.memory_block()? {
+                    if let Some(pangu_core::Message::System { content }) = seeded.first_mut() {
+                        content.push_str("\n\n");
+                        content.push_str(&block);
+                    }
+                }
+                seeded
+            }
         };
         let mut terminal = None;
         let mut last_turn = 0;
@@ -1951,6 +2015,14 @@ impl Agent {
             hosts: assessment.hosts.clone(),
             argv: assessment.argv.clone(),
             cwd: assessment.cwd.clone(),
+            // B3: `propose_memory` writes exactly one Pangu-owned path (the
+            // store file declared in its manifest entry) whose location comes
+            // from the operator's config, never from model output. The
+            // forbidden globs exist to keep model-controlled tool paths out
+            // of Pangu-owned storage; the sanctioned writer itself is
+            // validated with the internal rule set (root containment,
+            // symlinks, limits) instead.
+            internal: call.name == "propose_memory",
         };
         let resources = match self.sandbox.validate_resources(&resource_request) {
             Ok(resources) => resources,
@@ -2179,6 +2251,34 @@ impl Agent {
                         })),
                     )
                     .await?;
+                // B3: audit the proposal into the journal. The event carries
+                // the candidate id and content digest, never the raw content:
+                // model text may contain secrets, and the store is the only
+                // place the full content lives.
+                if call.name == "propose_memory" {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&output.content) {
+                        let id = parsed.get("id").and_then(Value::as_str);
+                        let digest = parsed.get("content_sha256").and_then(Value::as_str);
+                        if let (Some(id), Some(digest)) = (id, digest) {
+                            self.emit(
+                                self.event(
+                                    EventKind::MemoryProposed,
+                                    turn,
+                                    format!("memory candidate {id} queued for operator review"),
+                                )
+                                .tool(&call.name)
+                                .call_id(&call.id)
+                                .action_digest(action_digest.clone())
+                                .payload(serde_json::json!({
+                                    "id": id,
+                                    "content_sha256": digest,
+                                    "status": "pending",
+                                })),
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 let mut checkpoint_error: Option<(&'static str, anyhow::Error)> = None;
                 if let (Some(runtime), Some(state)) =
                     (self.checkpoint.as_ref(), checkpoint_state.as_mut())

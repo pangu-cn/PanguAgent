@@ -21,6 +21,12 @@ pub struct ResourceRequest {
     pub hosts: Vec<String>,
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// B3: Pangu-internal I/O (checkpoint/rollback artifact access) is not a
+    /// tool path. Forbidden globs exist to stop *model-controlled* paths from
+    /// reaching secrets and Pangu-owned storage; Pangu itself must still read
+    /// and write its own `.pangu` tree. Internal requests skip the forbidden
+    /// glob check and keep every other check (root containment, symlinks).
+    pub internal: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -184,6 +190,33 @@ impl Sandbox {
         }
     }
 
+    /// Internal variant of [`Self::resolve_read`] for Pangu-owned storage:
+    /// identical checks minus the forbidden-glob test.
+    pub fn resolve_read_internal(&self, path: &Path) -> ResolveOutcome {
+        let target = match absolute_path_from(&self.workspace, path) {
+            Ok(target) => target,
+            Err(error) => return ResolveOutcome::Error(error),
+        };
+        if has_symlink_component(&target) {
+            return ResolveOutcome::Error(Error::Config(format!(
+                "symlink path not allowed: {}",
+                target.display()
+            )));
+        }
+        let canonical = match std::fs::canonicalize(&target) {
+            Ok(path) => path,
+            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+        };
+        if self.root_contains(&canonical, &self.readable_roots) {
+            ResolveOutcome::Allowed(canonical)
+        } else {
+            ResolveOutcome::OutsideRoot(format!(
+                "{} is not in a readable root",
+                canonical.display()
+            ))
+        }
+    }
+
     pub fn resolve_write(&self, path: &Path) -> ResolveOutcome {
         let target = match absolute_path_from(&self.workspace, path) {
             Ok(target) => target,
@@ -228,6 +261,49 @@ impl Sandbox {
         }
     }
 
+    /// Internal variant of [`Self::resolve_write`] for Pangu-owned storage:
+    /// identical checks minus the forbidden-glob test.
+    pub fn resolve_write_internal(&self, path: &Path) -> ResolveOutcome {
+        let target = match absolute_path_from(&self.workspace, path) {
+            Ok(target) => target,
+            Err(error) => return ResolveOutcome::Error(error),
+        };
+        let Some(file_name) = target.file_name() else {
+            return ResolveOutcome::Error(Error::Config("write target has no file name".into()));
+        };
+        let parent = match target.parent() {
+            Some(parent) => parent,
+            None => {
+                return ResolveOutcome::Error(Error::Config("write target has no parent".into()))
+            }
+        };
+        if has_symlink_component(parent) {
+            return ResolveOutcome::Error(Error::Config(format!(
+                "symlink path not allowed: {}",
+                parent.display()
+            )));
+        }
+        let canonical_parent = match std::fs::canonicalize(parent) {
+            Ok(path) => path,
+            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+        };
+        let candidate = canonical_parent.join(file_name);
+        if has_symlink_component(&candidate) {
+            return ResolveOutcome::Error(Error::Config(format!(
+                "symlink path not allowed: {}",
+                candidate.display()
+            )));
+        }
+        if self.root_contains(&candidate, &self.writable_roots) {
+            ResolveOutcome::Allowed(candidate)
+        } else {
+            ResolveOutcome::OutsideRoot(format!(
+                "{} is not in a writable root",
+                candidate.display()
+            ))
+        }
+    }
+
     pub fn root_contains(&self, target: &Path, roots: &[PathBuf]) -> bool {
         roots.iter().any(|root| target.starts_with(root))
     }
@@ -254,11 +330,21 @@ impl Sandbox {
         }
         let mut read_paths = Vec::with_capacity(request.read_paths.len());
         for path in &request.read_paths {
-            read_paths.push(require_allowed(self.resolve_read(path), "read")?);
+            let outcome = if request.internal {
+                self.resolve_read_internal(path)
+            } else {
+                self.resolve_read(path)
+            };
+            read_paths.push(require_allowed(outcome, "read")?);
         }
         let mut write_paths = Vec::with_capacity(request.write_paths.len());
         for path in &request.write_paths {
-            write_paths.push(require_allowed(self.resolve_write(path), "write")?);
+            let outcome = if request.internal {
+                self.resolve_write_internal(path)
+            } else {
+                self.resolve_write(path)
+            };
+            write_paths.push(require_allowed(outcome, "write")?);
         }
 
         let mut hosts = Vec::with_capacity(request.hosts.len());

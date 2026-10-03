@@ -17,7 +17,7 @@ max_output_tokens = 4_096
 workspace = "."
 readable_roots = ["."]
 writable_roots = ["."]
-forbidden_globs = ["**/.git/**", "**/.env", "**/.env.*", "**/secrets/**", "**/*.pem", "**/id_rsa*"]
+forbidden_globs = ["**/.git/**", "**/.env", "**/.env.*", "**/secrets/**", "**/*.pem", "**/id_rsa*", "**/.pangu/**"]
 max_tool_output_bytes = 16_384
 max_arg_bytes = 8_192
 subprocess_timeout_secs = 45
@@ -27,6 +27,19 @@ max_paths_per_action = 64
 # F3: 追加到只读 argv 白名单的裸程序名（如 cargo/npm），供 verify 命令使用。
 # 只接受裸名；不放宽路径、flag 和 host 检查。默认空。
 extra_readonly_commands = []
+
+# B3: 受控记忆候选队列。默认关闭：关闭时 propose_memory 工具不存在、
+# 不注入任何记忆、digest 不变。开启后模型只能提出候选（写入
+# .pangu/memory/，该目录同时对一切工具 I/O 禁区），接受/拒绝/撤销
+# 只能由操作者通过 `pangu memory ...` 完成；被接受的记忆以后续运行的
+# system prompt 注入，并明确标注不可信、不承载授权。
+[memory]
+enabled = false
+max_pending = 256
+max_content_bytes = 4_096
+max_kind_bytes = 32
+max_injected = 24
+max_injected_bytes = 16_384
 
 [boundary.approval]
 mode = "destructive_and_above"

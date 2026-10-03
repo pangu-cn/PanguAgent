@@ -36,6 +36,10 @@ pub enum EventKind {
     /// provider failed. The chain is frozen in the contract; a switch is
     /// never silent and per-segment cost accounting uses the new price.
     ProviderSwitched,
+    /// B3: the model proposed a memory candidate. The proposal is inert
+    /// data until an operator accepts it; events carry the content digest,
+    /// never the raw content.
+    MemoryProposed,
     CheckpointCreated,
     CheckpointFailed,
     RollbackRequested,

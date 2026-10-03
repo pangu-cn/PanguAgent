@@ -292,6 +292,7 @@ impl ConsoleSink {
             EventKind::ContextAssembled => "◧ ctx ",
             EventKind::PhaseChanged => "⇄ phase",
             EventKind::ProviderSwitched => "⇄ prov ",
+            EventKind::MemoryProposed => "✎ mem ",
         };
         let mut output = format!("{tag} ");
         if let Some(tool) = &event.tool {

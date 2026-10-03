@@ -11,6 +11,7 @@ use pangu_boundary::{
     ApprovalMode, Config, FallbackCandidate, GoalContract, Policy, Rule, Sandbox, ScriptedApproval,
 };
 use pangu_core::{ChatResponse, EventKind, MemSink, Message, ToolCall, ToolSpec, Usage};
+use pangu_core::{MemoryLimits, MemoryStatus, MemoryStore};
 use pangu_toolkit::Toolkit;
 use serde_json::json;
 
@@ -1361,5 +1362,259 @@ async fn with_chain_refuses_a_mismatched_fallback_chain() {
             .contains("does not match GoalContract fallback model"),
         "{error}"
     );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+// ---- B3: controlled memory candidate queue --------------------------------
+
+/// A scripted provider that also records every message list it is shown, so
+/// tests can assert what actually reached the model (e.g. the memory block).
+struct RecordingProvider {
+    model: String,
+    responses: Mutex<VecDeque<ChatResponse>>,
+    captured: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn describe(&self) -> String {
+        format!("recording model={}", self.model)
+    }
+
+    async fn chat(&self, messages: Vec<Message>, _tools: Vec<ToolSpec>) -> Result<ChatResponse> {
+        self.captured.lock().expect("captured lock").push(messages);
+        self.responses
+            .lock()
+            .expect("responses lock")
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("script exhausted"))
+    }
+}
+
+fn memory_limits() -> MemoryLimits {
+    MemoryLimits::default()
+}
+
+/// A memory-enabled agent: contract `memory.enabled = true`, the store backed
+/// toolkit and agent, scripted provider, scripted approvals.
+fn build_memory_agent(
+    root: &Path,
+    store: Arc<MemoryStore>,
+    provider: Arc<dyn Provider>,
+) -> (Agent, Arc<MemSink>) {
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    // Scripted usage is zero, but the fail-closed cost gate still requires a
+    // parseable price: without one, every run exhausts its budget.
+    config.model.input_usd_per_mtok = Some(0.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    config.memory.enabled = true;
+    let contract = GoalContract::from_config("b3 test", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let sink = Arc::new(MemSink::default());
+    let agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new().with_memory(store.clone())),
+        approval,
+        sink.clone(),
+    )
+    .expect("agent")
+    .with_memory(store);
+    (agent, sink)
+}
+
+#[tokio::test]
+async fn memory_proposal_is_audited_and_stays_inert() {
+    let root = temp_root("b3-propose");
+    let store = Arc::new(
+        MemoryStore::open_with_label(
+            &root.join(".pangu").join("memory"),
+            memory_limits(),
+            Some("test-run".into()),
+        )
+        .expect("store"),
+    );
+    let proposal = response_with_usage(
+        vec![ToolCall::new(
+            "propose_memory",
+            json!({"content": "the project always uses tabs", "kind": "preference"}),
+        )],
+        0,
+    );
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(vec![proposal, finish_response()].into()),
+    });
+    let (agent, sink) = build_memory_agent(&root, store.clone(), provider);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+
+    // The proposal landed as pending - inert data, never active memory.
+    let pending = store.pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].content, "the project always uses tabs");
+    assert_eq!(pending[0].kind, "preference");
+    assert_eq!(pending[0].status, MemoryStatus::Pending);
+    assert_eq!(pending[0].proposed_in_run.as_deref(), Some("test-run"));
+    assert!(store.accepted().is_empty(), "a proposal is never active");
+
+    // The run audited the proposal with id + digest; the raw content lives
+    // only in the store.
+    let proposed = sink
+        .snapshot()
+        .into_iter()
+        .find(|event| event.kind == EventKind::MemoryProposed)
+        .expect("MemoryProposed event");
+    let payload = proposed.payload.expect("payload");
+    assert_eq!(payload["id"], pending[0].id);
+    assert_eq!(payload["content_sha256"], pending[0].content_digest);
+    assert!(payload.get("content").is_none(), "no raw content in events");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn accepted_memory_reaches_the_system_turn_as_untrusted() {
+    let root = temp_root("b3-inject");
+    let store = Arc::new(
+        MemoryStore::open(&root.join(".pangu").join("memory"), memory_limits()).expect("store"),
+    );
+    let candidate = store
+        .propose("the project always uses tabs", "preference")
+        .expect("propose");
+    store.accept(&candidate.id, "cli", None).expect("accept");
+    // A still-pending proposal must never be injected.
+    store.propose("pending and inert", "note").expect("propose");
+
+    // One successful tool call so the evidence requirement is satisfied.
+    std::fs::write(
+        root.join("note.txt"),
+        "data
+",
+    )
+    .expect("seed");
+    let read = response_with_usage(
+        vec![ToolCall::new("read_file", json!({"path": "note.txt"}))],
+        0,
+    );
+    let provider = Arc::new(RecordingProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(vec![read, finish_response()].into()),
+        captured: Mutex::new(Vec::new()),
+    });
+    let (agent, _sink) = build_memory_agent(&root, store, provider.clone());
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+
+    let captured = provider.captured.lock().expect("captured lock");
+    assert!(!captured.is_empty(), "the model was called");
+    let system = captured[0]
+        .iter()
+        .find(|message| matches!(message, Message::System { .. }))
+        .expect("system turn");
+    let Message::System { content } = system else {
+        panic!("expected system message")
+    };
+    assert!(
+        content.contains("UNTRUSTED"),
+        "the block is labeled: {content}"
+    );
+    assert!(content.contains("no authorization"));
+    assert!(content.contains("the project always uses tabs"));
+    assert!(
+        !content.contains("pending and inert"),
+        "pending candidates are never injected"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn memory_disabled_refuses_an_advertising_toolkit() {
+    let root = temp_root("b3-disabled");
+    let store = Arc::new(
+        MemoryStore::open(&root.join(".pangu").join("memory"), memory_limits()).expect("store"),
+    );
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.model.input_usd_per_mtok = Some(0.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    // memory stays disabled
+    let contract = GoalContract::from_config("b3 off", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let error = match Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new().with_memory(store.clone())),
+        approval,
+        Arc::new(MemSink::default()),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a toolkit advertising propose_memory must be refused when disabled"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("propose_memory advertisement does not match"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn pangu_owned_storage_is_never_tool_writable() {
+    let root = temp_root("b3-forbidden");
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    let sandbox = Sandbox::from_config(&config.boundary).expect("sandbox");
+    std::fs::create_dir_all(root.join(".pangu/memory")).expect("dir");
+    std::fs::write(root.join(".pangu/memory/candidates.json"), "{}").expect("seed store file");
+    let outcome = sandbox.resolve_write(&root.join(".pangu/memory/candidates.json"));
+    assert!(matches!(
+        outcome,
+        pangu_boundary::sandbox::ResolveOutcome::ForbiddenGlob(_)
+    ));
+    let outcome = sandbox.resolve_write(&root.join(".pangu/anything.txt"));
+    assert!(matches!(
+        outcome,
+        pangu_boundary::sandbox::ResolveOutcome::ForbiddenGlob(_)
+    ));
+    // The internal read path (used by the checkpoint runtime itself) is not
+    // blocked: Pangu must read its own storage.
+    let outcome = sandbox.resolve_read_internal(&root.join(".pangu/memory/candidates.json"));
+    assert!(matches!(
+        outcome,
+        pangu_boundary::sandbox::ResolveOutcome::Allowed(_)
+    ));
     std::fs::remove_dir_all(root).expect("cleanup");
 }

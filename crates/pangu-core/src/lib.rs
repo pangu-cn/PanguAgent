@@ -16,6 +16,7 @@ pub mod glob;
 pub mod inspect;
 pub mod journal;
 pub mod json;
+pub mod memory;
 pub mod messages;
 pub mod replay;
 pub mod repomap;
@@ -60,6 +61,9 @@ pub use inspect::{
     TransactionLockEvidence, ARTIFACT_INSPECTION_SCHEMA,
 };
 pub use journal::{ConsoleSink, Journal};
+pub use memory::{
+    MemoryCandidate, MemoryLimits, MemoryStatus, MemoryStore, MemoryTransition, MEMORY_SCHEMA,
+};
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
 pub use repomap::{
     build as build_repomap, fingerprint as repomap_fingerprint, view as repomap_view, FileEntry,

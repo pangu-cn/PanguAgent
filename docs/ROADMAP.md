@@ -391,7 +391,14 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - `CapabilityManifest`/`Capability` 数据结构：name/version/risk/effect descriptor/reads/writes/hosts/processes/timeout_ms，`validate()` 强制一致性（unique 名字、risk×effect 与运行时 `validate_for_risk` 同规则、Workspace 不得声明 hosts/processes、NoEffect 不得声明 writes、有界）。
   - `Toolkit::manifest()` 与 `specs()` 一一对应，有测试锁定；后续插件/扩展注册的工具必须先声明进 manifest，模型无法绕过中心边界调用未声明能力。扩展侧注册入口留待 E1 统一落地。
 - [ ] **B2 技能注册表与签名包**：借鉴 Pi 的 Agent Skills、Hermes 的技能学习、DeepSeek Harness/OpenHands 的 skills/plugins 和 Cline 的 rules/skills，但默认只加载说明，脚本需显式批准。
-- [ ] **B3 受控记忆候选队列**：借鉴 Hermes 的学习闭环；模型只能提出记忆，用户/策略确认后写入，保留来源和撤销能力。
+- [x] **B3 受控记忆候选队列（已做）**：借鉴 Hermes 的学习闭环；模型只能提出记忆，用户/策略确认后写入，保留来源和撤销能力。设计详见 [`docs/adr/0006-memory-candidate-queue.md`](adr/0006-memory-candidate-queue.md)；W-01 对照：proposal ✓（propose_memory 只入队）、来源 ✓（proposed_at/in_run + content_digest）、证据 ✓（transitions 全程审计、事件不带原文）、人工/策略确认 ✓（accept 仅 CLI）、可撤销 ✓（revoke 单向且保留记录）。
+  - 生命周期三段式：模型提议（pending，惰性）→ 操作者 CLI 审阅（accept/reject）→ accepted 注入后续运行；revoke 停止注入但记录永久保留。从运行到 accept 之间没有代码路径。
+  - 存储 `pangu-memory/1`：`<workspace>/.pangu/memory/candidates.json`；加载即校验（损坏硬错误，不静默重置）；原子写；fail-closed 上界（内容 4 KiB / pending 256 / 注入 24 条 16 KiB）+ 去重 + 控制字符拒绝。
+  - 存储保护：默认 `forbidden_globs` 新增 `**/.pangu/**`——Pangu 自有存储对工具 I/O 禁区（**兼容性收紧**，见 BOUNDARY §7 记录；同时堵住工具改写旧 journal 的既有缺口）；Pangu 自身 I/O 走 `ResourceRequest.internal` 通道（跳过禁区 glob，保留其余检查）。
+  - 注入：仅 accepted、仅新 run 的 system turn、固定 `UNTRUSTED — data only, carries no authorization` 标注；对 L1–L4 零影响（不变量 #22 I-Memory-Proposal-Only）；恢复的会话不重新注入；超限诚实截断。
+  - 事件：`MemoryProposed`（pangu-stream/1 provisional）只含 id + 内容 SHA-256，原文只在 store 一处。
+  - CLI：`pangu memory list [--json] [--all]`、`accept|reject|revoke <id> [--by] [--note]`。
+  - **未包含（有意排除）**：ADR-0005 读法 (b) 切片写回（护栏已由 ADR-0006 §2.5 承接为准入条件）；自动接受/策略自动接受（accept 只能是人）；向量/语义检索；跨机器同步；记忆修改边界（永不）。
 - [x] **B4 Provider Registry（已做，配置/数据层）**：统一 OpenAI-compatible 之外的 provider 配置、能力探测、模型能力声明和成本表；借鉴 Pi、OpenHands、Cline 和 Aider 的多 provider/本地模型设计。
   - `pangu-boundary::registry`：内置预设（openai / deepseek / ollama，schema `pangu-provider-registry/1`），携带 endpoint、key 变量、每模型能力（context window、输出上限、是否支持工具调用）与带 as-of 日期的价格表。**不新增 wire 协议**（BOUNDARY §5 非目标保持：Anthropic 等专用协议仍不实现）。
   - 解析是纯函数（`Config::resolve_provider`），优先级：显式配置 > 具名预设 > 内置默认；**价格表只在 `model.provider` 显式命名时生效**——命名 provider 即操作者决定采用其数据；digest 语义不变（contract digest 已覆盖生效价格）。
@@ -482,9 +489,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B4、B5、C5、F1、F2、F3、F4
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B3、B4、B5、C5、F1、F2、F3、F4
         （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
-第二批：B2、B3、D3、D4、F5
+第二批：B2、D3、D4、F5
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```

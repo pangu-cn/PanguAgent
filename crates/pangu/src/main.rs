@@ -13,7 +13,10 @@ use pangu_boundary::{
     explain_action, CliOverrides, Config, ExplainContext, ExplainRequest, GoalContract, Policy,
     Risk, Sandbox, StdinApproval, Unattended,
 };
-use pangu_core::{ChatResponse, Journal, Message, RollbackRequest, TeeSink, ToolCall, Usage};
+use pangu_core::{
+    ChatResponse, Journal, MemoryLimits, MemoryStore, Message, RollbackRequest, TeeSink, ToolCall,
+    Usage,
+};
 use pangu_provider::OpenAiCompatibleProvider;
 use pangu_toolkit::Toolkit;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -136,6 +139,52 @@ enum Commands {
     Repo {
         #[command(subcommand)]
         action: RepoCommands,
+    },
+    /// B3: operator lifecycle for the memory candidate queue. The model can
+    /// only propose; accepting, rejecting, and revoking happen here, outside
+    /// any run.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryCommands,
+    },
+}
+
+/// B3: memory candidate queue lifecycle (operator-only).
+#[derive(Clone, Debug, Subcommand)]
+enum MemoryCommands {
+    /// List candidates (pending by default, all with --all).
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Show rejected/revoked candidates too.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Accept a pending candidate; it will be injected (labeled untrusted)
+    /// into future runs.
+    Accept {
+        id: String,
+        #[arg(long, default_value = "cli")]
+        by: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Reject a pending candidate.
+    Reject {
+        id: String,
+        #[arg(long, default_value = "cli")]
+        by: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Revoke an accepted candidate; the record and its history remain in
+    /// the store.
+    Revoke {
+        id: String,
+        #[arg(long, default_value = "cli")]
+        by: String,
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -361,6 +410,18 @@ async fn main() -> Result<()> {
         Some(Commands::Models { action }) => match action {
             ModelsCommands::List { json } => models_list(json),
             ModelsCommands::Probe { json } => models_probe(&args, json).await,
+        },
+        Some(Commands::Memory { action }) => match action {
+            MemoryCommands::List { json, all } => memory_list(&args, json, all),
+            MemoryCommands::Accept { id, by, note } => {
+                memory_decide(&args, "accept", &id, &by, note)
+            }
+            MemoryCommands::Reject { id, by, note } => {
+                memory_decide(&args, "reject", &id, &by, note)
+            }
+            MemoryCommands::Revoke { id, by, note } => {
+                memory_decide(&args, "revoke", &id, &by, note)
+            }
         },
         None if args.demo => demo(&args).await,
         None => {
@@ -807,6 +868,101 @@ fn models_list(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// B3: open the operator-side memory store handle (no run label: the CLI
+/// never proposes, it only reviews and transitions).
+fn memory_store_cli(config: &Config) -> Result<MemoryStore> {
+    let workspace = config.workspace_abs();
+    let limits = MemoryLimits {
+        max_pending: config.memory.max_pending,
+        max_content_bytes: config.memory.max_content_bytes,
+        max_kind_bytes: config.memory.max_kind_bytes,
+        max_injected: config.memory.max_injected,
+        max_injected_bytes: config.memory.max_injected_bytes,
+    };
+    Ok(MemoryStore::open(
+        &workspace.join(".pangu").join("memory"),
+        limits,
+    )?)
+}
+
+/// B3: show the candidate queue for operator review. The full content is
+/// shown on purpose: the operator is the reviewer and must see exactly what
+/// would be injected.
+fn memory_list(args: &Cli, json: bool, all: bool) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let store = memory_store_cli(&config)?;
+    let candidates = store.candidates();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": pangu_core::MEMORY_SCHEMA,
+                "candidates": candidates,
+                "derived": true,
+                "authoritative": false,
+            }))?
+        );
+        return Ok(());
+    }
+    let shown: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| all || candidate.status == pangu_core::MemoryStatus::Pending)
+        .collect();
+    if shown.is_empty() {
+        println!("no {} candidates", if all { "" } else { "pending" });
+        return Ok(());
+    }
+    for candidate in shown {
+        println!(
+            "{} [{}] {} proposed={} digest={}",
+            candidate.id,
+            candidate.kind,
+            candidate.status.as_str(),
+            candidate.proposed_at,
+            &candidate.content_digest[..12],
+        );
+        if let Some(run) = &candidate.proposed_in_run {
+            println!("  run: {run}");
+        }
+        println!("  content: {}", candidate.content);
+        for transition in &candidate.transitions {
+            println!(
+                "  transition: {} at {} by {}{}",
+                transition.action,
+                transition.at,
+                transition.by,
+                transition
+                    .note
+                    .as_deref()
+                    .map(|note| format!(" ({note})"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// B3: one operator lifecycle transition (accept/reject/revoke). The store
+/// enforces the legal-transition rules; the CLI only routes the decision.
+fn memory_decide(args: &Cli, action: &str, id: &str, by: &str, note: Option<String>) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let store = memory_store_cli(&config)?;
+    match action {
+        "accept" => store.accept(id, by, note)?,
+        "reject" => store.reject(id, by, note)?,
+        "revoke" => store.revoke(id, by, note)?,
+        other => bail!("unknown memory action {other}"),
+    }
+    let past = match action {
+        "accept" => "accepted",
+        "reject" => "rejected",
+        "revoke" => "revoked",
+        other => other,
+    };
+    println!("{past} {id}");
+    Ok(())
+}
+
 /// B4: one bounded capability probe against the effective provider endpoint.
 async fn models_probe(args: &Cli, json: bool) -> Result<()> {
     let (config, _files) = Config::load(args.config.as_deref())?;
@@ -1062,17 +1218,33 @@ async fn rollback_command(
         contract.approval_mode,
         Duration::from_secs(config.boundary.approval.ask_timeout_secs),
     ));
-    let agent = Agent::new(
+    let memory = build_memory_store(
+        &config,
+        contract.workspace(),
+        &format!("run-{}", unix_nanos()),
+    )?;
+    let toolkit = {
+        let base = Toolkit::with_verify_command(config.verify.command.clone());
+        let base = match &memory {
+            Some(store) => base.with_memory(store.clone()),
+            None => base,
+        };
+        Arc::new(base)
+    };
+    let mut agent = Agent::new(
         contract,
         policy,
         sandbox,
         Arc::new(DemoProvider {
             calls: AtomicUsize::new(0),
         }),
-        Arc::new(Toolkit::with_verify_command(config.verify.command.clone())),
+        toolkit,
         approval,
         sink,
     )?;
+    if let Some(store) = memory {
+        agent = agent.with_memory(store);
+    }
     let result = agent.rollback(request).await?;
     println!(
         "rollback: {:?}\ncheckpoint: {}\nsession_node: {}\njournal: {}",
@@ -1136,6 +1308,32 @@ async fn demo(args: &Cli) -> Result<()> {
 /// of silently dropping the candidate.
 type ProviderChain = (Arc<dyn Provider>, Vec<Arc<dyn Provider>>);
 
+/// B3: build the run-side memory store when the contract enables the queue.
+/// The store lives under `<workspace>/.pangu/memory/`, which the default
+/// forbidden globs exclude from every tool I/O path — the only writers are
+/// this store's own propose/transition methods.
+fn build_memory_store(
+    config: &Config,
+    workspace: &std::path::Path,
+    run_label: &str,
+) -> Result<Option<Arc<MemoryStore>>> {
+    if !config.memory.enabled {
+        return Ok(None);
+    }
+    let limits = MemoryLimits {
+        max_pending: config.memory.max_pending,
+        max_content_bytes: config.memory.max_content_bytes,
+        max_kind_bytes: config.memory.max_kind_bytes,
+        max_injected: config.memory.max_injected,
+        max_injected_bytes: config.memory.max_injected_bytes,
+    };
+    Ok(Some(Arc::new(MemoryStore::open_with_label(
+        &workspace.join(".pangu").join("memory"),
+        limits,
+        Some(run_label.to_string()),
+    )?)))
+}
+
 fn build_provider_chain(config: &Config) -> Result<ProviderChain> {
     let resolved = config.resolve_provider()?;
     let model = resolved
@@ -1186,10 +1384,11 @@ async fn execute_goal(
         .collect();
     let policy = Arc::new(Policy::new(config.rules.clone())?);
     let sandbox = Arc::new(Sandbox::from_config(&config.boundary)?);
+    let run_label = format!("run-{}", unix_nanos());
     let journal_path = contract
         .workspace()
         .join(".pangu")
-        .join(format!("journal-{}.jsonl", unix_nanos()));
+        .join(format!("journal-{run_label}.jsonl"));
     let journal = Arc::new(if contract.checkpoint.enabled {
         Journal::create_v2(&journal_path)?
     } else {
@@ -1208,15 +1407,24 @@ async fn execute_goal(
         };
     let mut providers: Vec<Arc<dyn Provider>> = vec![primary];
     providers.extend(fallbacks);
-    let agent = Agent::with_chain(
-        contract,
-        policy,
-        sandbox,
-        providers,
-        Arc::new(Toolkit::with_verify_command(config.verify.command.clone())),
-        approval,
-        sink,
+    // B3: attach the memory queue when the contract enables it. The same
+    // store backs the toolkit's `propose_memory` tool and the agent's
+    // accepted-memory injection; the run refuses a half-attached queue.
+    let memory = build_memory_store(&config, contract.workspace(), &run_label)?;
+    let toolkit = {
+        let base = Toolkit::with_verify_command(config.verify.command.clone());
+        let base = match &memory {
+            Some(store) => base.with_memory(store.clone()),
+            None => base,
+        };
+        Arc::new(base)
+    };
+    let mut agent = Agent::with_chain(
+        contract, policy, sandbox, providers, toolkit, approval, sink,
     )?;
+    if let Some(store) = memory {
+        agent = agent.with_memory(store);
+    }
     let outcome = agent.run().await?;
     eprintln!("journal: {}", journal_path.display());
     println!(
