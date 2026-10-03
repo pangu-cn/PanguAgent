@@ -27,10 +27,12 @@ use pangu_core::{
     JOURNAL_FORMAT_V2,
 };
 
+pub mod capability;
 mod checkpoint;
 pub mod conversation;
 mod effect;
 
+pub use capability::{Capability, CapabilityManifest};
 pub use effect::{EffectDescriptor, EffectScope, Reversibility};
 
 const MAX_TOOL_CALLS_PER_RESPONSE: usize = 128;

@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use pangu_agent::{
-    EffectDescriptor, EffectScope, Reversibility, ToolAssessment, ToolExecutor, ToolOutput,
-    VerifiedAction,
+    Capability, CapabilityManifest, EffectDescriptor, EffectScope, Reversibility, ToolAssessment,
+    ToolExecutor, ToolOutput, VerifiedAction,
 };
 use pangu_boundary::{Risk, Sandbox};
 use pangu_core::{short_hash, ToolCall, ToolSpec};
@@ -29,6 +29,92 @@ pub struct Toolkit;
 impl Toolkit {
     pub fn new() -> Self {
         Self
+    }
+
+    /// B1: the static declaration of every capability this toolkit can
+    /// dispatch. `specs()` and `manifest()` must stay in lockstep — a test
+    /// asserts that the names match 1:1.
+    pub fn manifest(&self) -> CapabilityManifest {
+        let empty = || Vec::new();
+        CapabilityManifest::new(vec![
+            Capability {
+                name: "read_file".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "list_dir".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "search".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "write_file".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: vec!["workspace".into()],
+                writes: vec!["workspace".into()],
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "http_fetch".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ExternalRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: vec!["allowlisted".into()],
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "finish".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Session, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "run_command".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: empty(),
+                processes: vec!["allowlisted".into()],
+                timeout_ms: None,
+            },
+        ])
     }
 }
 
@@ -765,5 +851,17 @@ mod tests {
         let specs = Toolkit::new().specs();
         assert!(specs.iter().any(|spec| spec.name == "finish"));
         assert!(!specs.iter().any(|spec| spec.name == "verify_claims"));
+    }
+
+    #[test]
+    fn manifest_matches_specs_one_to_one() {
+        let specs = Toolkit::new().specs();
+        let manifest = Toolkit::new().manifest();
+        manifest.validate().expect("manifest validates");
+        let mut spec_names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let mut manifest_names: Vec<&str> = manifest.names();
+        spec_names.sort();
+        manifest_names.sort();
+        assert_eq!(spec_names, manifest_names);
     }
 }

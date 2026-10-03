@@ -387,7 +387,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 ### B. 扩展、技能和模型
 
-- [ ] **B1 Capability Manifest**：借鉴 Pi/ZCode/DeepSeek Harness 的 capability seam，以及 OpenHands SDK、Cline SDK/MCP；插件/扩展声明工具、风险、读写 roots、网络 host、预算和版本，只能通过中心边界执行。
+- [x] **B1 Capability Manifest（已做，工具层）**：借鉴 Pi/ZCode/DeepSeek Harness 的 capability seam，以及 OpenHands SDK、Cline SDK/MCP。
+  - `CapabilityManifest`/`Capability` 数据结构：name/version/risk/effect descriptor/reads/writes/hosts/processes/timeout_ms，`validate()` 强制一致性（unique 名字、risk×effect 与运行时 `validate_for_risk` 同规则、Workspace 不得声明 hosts/processes、NoEffect 不得声明 writes、有界）。
+  - `Toolkit::manifest()` 与 `specs()` 一一对应，有测试锁定；后续插件/扩展注册的工具必须先声明进 manifest，模型无法绕过中心边界调用未声明能力。扩展侧注册入口留待 E1 统一落地。
 - [ ] **B2 技能注册表与签名包**：借鉴 Pi 的 Agent Skills、Hermes 的技能学习、DeepSeek Harness/OpenHands 的 skills/plugins 和 Cline 的 rules/skills，但默认只加载说明，脚本需显式批准。
 - [ ] **B3 受控记忆候选队列**：借鉴 Hermes 的学习闭环；模型只能提出记忆，用户/策略确认后写入，保留来源和撤销能力。
 - [ ] **B4 Provider Registry**：统一 OpenAI-compatible 之外的 provider 配置、能力探测、模型能力声明和成本表；借鉴 Pi、OpenHands、Cline 和 Aider 的多 provider/本地模型设计。
