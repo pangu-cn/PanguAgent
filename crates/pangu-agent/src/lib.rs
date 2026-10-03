@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// How many trailing turns are always in the assembled window (§3.2 FORCED).
+const RECENT_TURNS: usize = 8;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
@@ -18,9 +21,10 @@ use pangu_boundary::{
     ValidatedResources,
 };
 use pangu_core::{
-    redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event, EventKind,
-    EventSink, FailureClass, JournalMeta, Message, RestoreDisposition, RollbackOperation,
-    RollbackRequest, ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
+    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event,
+    EventKind, EventSink, FailureClass, JournalMeta, Message, RestoreDisposition,
+    RollbackOperation, RollbackRequest, ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1,
+    JOURNAL_FORMAT_V2,
 };
 
 mod checkpoint;
@@ -1280,16 +1284,67 @@ impl Agent {
         let specs = self.tools.specs();
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
-            let estimated_input = history.iter().fold(0u64, |total, message| {
-                total.saturating_add(message.approx_tokens())
-            });
             let mut breaches =
                 self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed());
-            if estimated_input >= self.contract.budget().max_input_tokens {
-                breaches.push(pangu_boundary::Breach::InputTokens);
-            }
             if !breaches.is_empty() {
                 self.emit_budget(turn, &breaches).await?;
+                terminal = Some(GoalStatus::BudgetExhausted);
+                break;
+            }
+
+            // A6-5: the assembled window is what the model sees. The full
+            // history stays in memory (and in `history`); assembly is a pure
+            // projection (§3.9). Input-token pressure is resolved here — by
+            // degradation — not by ending the run.
+            let (assembled, assembly) = match assemble(
+                &history,
+                RECENT_TURNS,
+                &[],
+                self.contract.budget().max_input_tokens,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // "组装器组装不出来" must be distinguishable from "上下文确实
+                    // 太大": it is an assembler failure, not a budget event.
+                    self.emit(self.event(
+                        EventKind::ModelRequest,
+                        turn,
+                        format!("context assembly failed: {error}"),
+                    ))
+                    .await?;
+                    return Err(anyhow!("context assembly failed: {error}"));
+                }
+            };
+            let modes = assembly.selections.iter().fold(
+                (0usize, 0usize, 0usize),
+                |(full, summary, omitted), selection| match selection.mode {
+                    pangu_core::DegradeMode::Full => (full + 1, summary, omitted),
+                    pangu_core::DegradeMode::Summary => (full, summary + 1, omitted),
+                    pangu_core::DegradeMode::Omitted => (full, summary, omitted + 1),
+                },
+            );
+            self.emit(self.event(
+                EventKind::ContextAssembled,
+                turn,
+                format!(
+                    "messages={} tokens~{} forced_over_budget={} slices: {} full, {} summary, \
+                     {} omitted, {} seam(s)",
+                    assembled.messages.len(),
+                    assembly.estimated_tokens,
+                    assembly.forced_over_budget,
+                    modes.0,
+                    modes.1,
+                    modes.2,
+                    assembled.seams.len()
+                ),
+            ))
+            .await?;
+            if assembly.forced_over_budget {
+                // The honest tail of the chain: even every forced slice at its
+                // summary form does not fit. Terminate — but for a *budget*
+                // reason, with the report attached.
+                self.emit_budget(turn, &[pangu_boundary::Breach::InputTokens])
+                    .await?;
                 terminal = Some(GoalStatus::BudgetExhausted);
                 break;
             }
@@ -1300,16 +1355,20 @@ impl Agent {
                 EventKind::ModelRequest,
                 turn,
                 format!(
-                    "provider={} model={} messages={} tools={}",
+                    "provider={} model={} messages={} tools={} (history={})",
                     self.provider.name(),
                     self.provider.model(),
-                    history.len(),
-                    specs.len()
+                    assembled.messages.len(),
+                    specs.len(),
+                    history.len()
                 ),
             ))
             .await?;
 
-            let response = self.provider.chat(history.clone(), specs.clone()).await?;
+            let response = self
+                .provider
+                .chat(assembled.messages.clone(), specs.clone())
+                .await?;
             let response_usage = response.usage;
             usage.merge(&response_usage);
             self.emit(
@@ -1370,14 +1429,6 @@ impl Agent {
 
             for call in tool_calls {
                 let mut call_breaches = self.budget_breaches(turn, &usage, started.elapsed());
-                let estimated_input = history.iter().fold(0u64, |total, message| {
-                    total.saturating_add(message.approx_tokens())
-                });
-                if estimated_input >= self.contract.budget().max_input_tokens
-                    && !call_breaches.contains(&pangu_boundary::Breach::InputTokens)
-                {
-                    call_breaches.push(pangu_boundary::Breach::InputTokens);
-                }
                 if !call_breaches.is_empty() {
                     self.emit_budget(turn, &call_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -1480,14 +1531,6 @@ impl Agent {
             }
             if terminal.is_none() {
                 let mut final_breaches = self.budget_breaches(turn, &usage, started.elapsed());
-                let estimated_input = history.iter().fold(0u64, |total, message| {
-                    total.saturating_add(message.approx_tokens())
-                });
-                if estimated_input >= self.contract.budget().max_input_tokens
-                    && !final_breaches.contains(&pangu_boundary::Breach::InputTokens)
-                {
-                    final_breaches.push(pangu_boundary::Breach::InputTokens);
-                }
                 if !final_breaches.is_empty() {
                     self.emit_budget(turn, &final_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
