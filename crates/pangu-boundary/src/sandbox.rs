@@ -448,11 +448,47 @@ impl Sandbox {
             "diff",
             "md5sum",
             "sha256sum",
+            // F2: read-only git is admissible, but only the explicit
+            // read-only subcommand list below. Anything else (`push`,
+            // `reset`, `clean`, …) is rejected before this point.
+            "git",
         ];
         if !COMMANDS.contains(&program) {
             return Err(Error::Config(format!(
                 "command `{program}` is not on the read-only argv allow-list"
             )));
+        }
+        if program == "git" {
+            const GIT_READONLY: &[&str] = &["diff", "status", "log", "show"];
+            let subcommand = argv.get(1).map(String::as_str).unwrap_or_default();
+            if !GIT_READONLY.contains(&subcommand) {
+                return Err(Error::Config(format!(
+                    "git subcommand `{subcommand}` is not read-only"
+                )));
+            }
+            const GIT_FLAGS: &[&str] = &[
+                "--",
+                "--cached",
+                "--stat",
+                "--porcelain",
+                "--oneline",
+                "-p",
+                "-n",
+                "-s",
+                "--no-pager",
+                "--",
+            ];
+            for argument in argv.iter().skip(2) {
+                if argument.starts_with('-')
+                    && argument.len() > 1
+                    && !GIT_FLAGS.contains(&argument.as_str())
+                {
+                    return Err(Error::Config(format!(
+                        "git flag is not allowed: {argument}"
+                    )));
+                }
+            }
+            return Ok(());
         }
         if !self
             .env_allow
@@ -503,6 +539,7 @@ impl Sandbox {
                 | "diff"
                 | "md5sum"
                 | "sha256sum"
+                | "git"
         )
     }
 

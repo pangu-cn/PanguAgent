@@ -427,7 +427,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 - [x] **F1 Repo Map / 代码库地图（已做）**：借鉴 Aider，生成可解释的文件、符号、依赖图和 token budget；默认只读，显示来源、时效和发送给模型的上下文。
   - `pangu-core::repomap`：`build(root)` 确定性扫描（忽略 .git/target 等，不跟随 symlink、不写盘），Rust/Python/JS/TS/Go 符号抽取，`use crate::`/`mod` 内部边，`view(map, budget_tokens)` 预算视图（超预算文件进入 `omitted_files`，视图永不静默丢信息），`fingerprint` 供 staleness 检测。CLI `pangu repo map`。
-- [ ] **F2 Git diff/undo 可选后端**：借鉴 Aider 和 Cline，保存可审查的 diff、恢复点和 Git 辅助信息；它不是 Pangu checkpoint 的必需实现，默认不自动 commit，不跳过项目 hooks。
+- [x] **F2 Git diff/undo 可选后端（已做，只读 git_diff 能力；undo 归 F7 rollback）**：借鉴 Aider 和 Cline，保存可审查的 diff、恢复点和 Git 辅助信息；它不是 Pangu checkpoint 的必需实现，默认不自动 commit，不跳过项目 hooks。
+  - `git_diff` 工具（ReadOnly/ProcessRead/NoEffect）：argv 仅允许 `git diff|status|log|show` + 白名单 flag + 相对路径；沙箱执行、输出过限即失败；集成测试走完整 verified-action 链。
+  - "undo" 不归此处：工作区恢复走 F7 的 `pangu rollback`（显式 capability + L4 审批 + failed-path 账本），F2 只提供可读 diff/状态，不替 checkpoint 承担恢复语义。
 - [ ] **F3 Lint/Test/Compile evidence loop**：借鉴 Aider、Cline 和 OpenHands，在编辑后运行受限验证命令，记录退出码、测试摘要和产物；失败不能自动改写为完成。
 - [ ] **F4 Plan/Act 与逐步审批**：借鉴 Cline 和 OpenHands 的计划/执行分离；Plan 阶段只读探索，Act 阶段逐项显示 diff、命令和影响范围。
 - [ ] **F5 Issue-to-patch 评测 profile**：借鉴 SWE-agent，把 issue、仓库版本、测试、patch、trajectory 和成本固定为可复现实验；benchmark 分数不替代验收。

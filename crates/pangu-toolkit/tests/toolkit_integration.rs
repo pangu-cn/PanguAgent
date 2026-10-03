@@ -270,6 +270,82 @@ async fn symlink_escape_is_blocked_before_tool_execution() {
 }
 
 #[tokio::test]
+async fn git_diff_reports_the_workspace_diff_through_the_verified_action_chain() {
+    let root = temp_root("git-diff");
+    let git_available = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !git_available {
+        return;
+    }
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .expect("git init");
+    std::fs::write(
+        root.join("tracked.txt"),
+        "before
+",
+    )
+    .expect("seed");
+    for args in [
+        vec!["add", "tracked.txt"],
+        vec![
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&root)
+            .status()
+            .expect("git")
+            .success());
+    }
+    std::fs::write(
+        root.join("tracked.txt"),
+        "after
+",
+    )
+    .expect("modify");
+
+    let (agent, sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new(
+                "git_diff",
+                json!({"path": "tracked.txt"}),
+            )]),
+            finish_response(),
+        ],
+        None,
+    );
+
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    assert_eq!(outcome.evidence.len(), 1);
+    let tool_text = outcome
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("tool message");
+    assert!(tool_text.contains("-before"), "tool output: {tool_text}");
+    assert!(tool_text.contains("+after"), "tool output: {tool_text}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn output_limit_failure_cannot_create_evidence() {
     let root = temp_root("output-limit");
     std::fs::write(root.join("large.txt"), "x".repeat(512)).expect("seed large file");

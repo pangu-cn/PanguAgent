@@ -104,6 +104,17 @@ impl Toolkit {
                 timeout_ms: None,
             },
             Capability {
+                name: "git_diff".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: Vec::new(),
+                hosts: Vec::new(),
+                processes: vec!["git".into()],
+                timeout_ms: None,
+            },
+            Capability {
                 name: "run_command".into(),
                 version: "1".into(),
                 risk: Risk::NeedsHuman,
@@ -180,6 +191,18 @@ impl ToolExecutor for Toolkit {
                     "additionalProperties": false,
                     "required": ["status"],
                     "properties": {"status": {"type": "string", "enum": ["complete", "failed", "needs_input", "aborted"]}}
+                }),
+            ),
+            ToolSpec::new(
+                "git_diff",
+                "Show the working-tree or staged diff of the workspace (read-only git).",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "staged": {"type": "boolean"},
+                        "path": {"type": "string"}
+                    }
                 }),
             ),
             ToolSpec::new(
@@ -327,6 +350,41 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "git_diff" => {
+                ensure_allowed_keys(&call.args, &["staged", "path"])?;
+                let staged = call
+                    .args
+                    .get("staged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut argv = vec!["git".to_string(), "diff".to_string()];
+                if staged {
+                    argv.push("--cached".to_string());
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                    EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                );
+                if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                    if path.is_empty() || path.contains("..") || path.starts_with('/') {
+                        bail!("path must be a relative in-workspace path");
+                    }
+                    argv.push("--".to_string());
+                    argv.push(path.to_string());
+                    assessment = assessment.read(PathBuf::from(path));
+                }
+                sandbox.validate_argv(&argv)?;
+                assessment.argv = argv.clone();
+                assessment.preview = format!(
+                    "git diff{}{}",
+                    if staged { " --cached" } else { "" },
+                    call.args
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(|p| format!(" -- {p}"))
+                        .unwrap_or_default()
+                );
+                Ok(assessment)
+            }
             other => bail!("unknown tool `{other}`"),
         }
     }
@@ -338,6 +396,7 @@ impl ToolExecutor for Toolkit {
             "search" => execute_search(action).await,
             "write_file" => execute_write(action).await,
             "http_fetch" => execute_http(action).await,
+            "git_diff" => execute_command(action).await,
             "run_command" => execute_command(action).await,
             other => bail!("tool `{other}` has no executor"),
         }
