@@ -915,6 +915,18 @@ mod tests {
             .is_err());
         assert!(sandbox.validate_argv(&["../cat".into()]).is_err());
         assert!(sandbox
+            .validate_argv(&["git".into(), "diff".into(), "--".into(), "a.rs".into()])
+            .is_ok());
+        assert!(sandbox
+            .validate_argv(&["git".into(), "diff".into(), "--cached".into()])
+            .is_ok());
+        assert!(sandbox
+            .validate_argv(&["git".into(), "push".into(), "origin".into()])
+            .is_err());
+        assert!(sandbox
+            .validate_argv(&["git".into(), "reset".into(), "--hard".into()])
+            .is_err());
+        assert!(sandbox
             .validate_argv(&["cat".into(), "../outside".into()])
             .is_err());
         assert!(sandbox.validate_argv(&[]).is_err());
