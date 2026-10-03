@@ -321,6 +321,12 @@ pub trait Provider: Send + Sync {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn specs(&self) -> Vec<ToolSpec>;
+    /// F3: the exact argv the executor's `verify` tool will run. Must equal
+    /// the contract-frozen `GoalContract::verify_command`; `Agent::new`
+    /// refuses a mismatch. Empty means the executor has no verify tool.
+    fn verify_command(&self) -> Vec<String> {
+        Vec::new()
+    }
     async fn assess(&self, call: &ToolCall, sandbox: &Sandbox) -> Result<ToolAssessment>;
     async fn execute(&self, action: &VerifiedAction) -> Result<ToolOutput>;
 }
@@ -383,6 +389,11 @@ impl Agent {
         if approval.mode() != contract.approval_mode {
             return Err(anyhow!(
                 "approval handler mode does not match GoalContract approval mode"
+            ));
+        }
+        if tools.verify_command() != contract.verify_command {
+            return Err(anyhow!(
+                "tool executor's verify command does not match GoalContract verify_command"
             ));
         }
         if contract.policy_digest != policy.digest() {
@@ -1287,6 +1298,20 @@ impl Agent {
             boundary_digest: self.contract.digest(),
             unattended: self.contract.is_unattended(),
             config_files: self.contract.config_files.clone(),
+            // C5: record the declared backend so audit trails show what the
+            // operator claimed about the environment. Redacted like every
+            // payload string; absent when undeclared.
+            execution_profile: if self.contract.execution().is_declared() {
+                Some(self.contract.execution().profile.as_str().to_string())
+            } else {
+                None
+            },
+            execution_description: self
+                .contract
+                .execution()
+                .description
+                .as_deref()
+                .map(redact_text),
         };
         self.emit(
             self.event(EventKind::RunStarted, 0, "run started")
@@ -1294,11 +1319,27 @@ impl Agent {
         )
         .await?;
 
-        let specs = self.tools.specs();
+        let mut act_phase = !self.contract.plan_first();
+        // F4: the begin_act control tool exists only in plan-first runs. It is
+        // agent-owned (like `finish`): it executes nothing and passes no gate,
+        // it just ends the read-only phase.
+        let mut specs = self.tools.specs();
+        if self.contract.plan_first() {
+            specs.push(pangu_core::ToolSpec::new(
+                "begin_act",
+                "End the read-only plan phase and start the act phase. Takes no arguments; \
+                 mutating actions still require approval one by one.",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {}
+                }),
+            ));
+        }
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
-            let mut breaches =
-                self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed());
+            let breaches = self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed());
             if !breaches.is_empty() {
                 self.emit_budget(turn, &breaches).await?;
                 terminal = Some(GoalStatus::BudgetExhausted);
@@ -1441,7 +1482,7 @@ impl Agent {
             }
 
             for call in tool_calls {
-                let mut call_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+                let call_breaches = self.budget_breaches(turn, &usage, started.elapsed());
                 if !call_breaches.is_empty() {
                     self.emit_budget(turn, &call_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -1497,7 +1538,43 @@ impl Agent {
                     .await?;
                     continue;
                 }
-                if call.name == "finish" {
+                if call.name == "begin_act" {
+                    // F4 control call: no assess, no gates, no side effect —
+                    // it only ends the read-only plan phase. Every mutating
+                    // action afterwards still passes L1-L4 individually.
+                    if act_phase {
+                        let context = FailureContext::from_call(&call);
+                        let error = anyhow!("already in the act phase");
+                        self.record_tool_error_with_context(
+                            &mut history,
+                            &call,
+                            turn,
+                            EventKind::ToolBlocked,
+                            error,
+                            checkpoint_state.as_ref(),
+                            &context,
+                            FailureClass::InvalidToolCall,
+                        )
+                        .await?;
+                    } else {
+                        act_phase = true;
+                        self.emit(
+                            self.event(
+                                EventKind::PhaseChanged,
+                                turn,
+                                "plan phase complete; entering the act phase",
+                            )
+                            .tool("begin_act")
+                            .call_id(&call.id),
+                        )
+                        .await?;
+                        history.push(Message::tool_result(
+                            &call.id,
+                            "begin_act",
+                            "act phase started; mutating actions now proceed through the gates",
+                        ));
+                    }
+                } else if call.name == "finish" {
                     match self.finish_status(&call, evidence.len()) {
                         Ok(status) => {
                             self.emit(
@@ -1533,6 +1610,7 @@ impl Agent {
                         &mut history,
                         call,
                         turn,
+                        act_phase,
                         &mut evidence,
                         &mut checkpoint_state,
                     )
@@ -1543,7 +1621,7 @@ impl Agent {
                 }
             }
             if terminal.is_none() {
-                let mut final_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+                let final_breaches = self.budget_breaches(turn, &usage, started.elapsed());
                 if !final_breaches.is_empty() {
                     self.emit_budget(turn, &final_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -1603,6 +1681,7 @@ impl Agent {
         history: &mut Vec<Message>,
         call: ToolCall,
         turn: u32,
+        act_phase: bool,
         evidence: &mut Vec<String>,
         checkpoint_state: &mut Option<checkpoint::RunCheckpointState>,
     ) -> Result<Option<GoalStatus>> {
@@ -1653,6 +1732,27 @@ impl Agent {
                 return Ok(None);
             }
         };
+        // F4: in the plan phase the run is read-only. Mutating actions are
+        // refused before any gate can approve them; only the typed `begin_act`
+        // control call ends the phase, and it executes nothing.
+        if !act_phase && assessment.risk.at_least(pangu_boundary::Risk::Reversible) {
+            let context = FailureContext::from_assessment(&call, &assessment);
+            let error = pangu_core::Error::Denied {
+                reason: "plan phase is read-only; call `begin_act` before any mutating action"
+                    .into(),
+            };
+            self.tool_blocked_with_context(
+                history,
+                &call,
+                turn,
+                error,
+                checkpoint_state.as_ref(),
+                &context,
+                FailureClass::PolicyDenied,
+            )
+            .await?;
+            return Ok(None);
+        }
         if let Err(error) = assessment.validate_effect() {
             let context = FailureContext::from_assessment(&call, &assessment);
             self.tool_blocked_with_context(
@@ -1855,6 +1955,9 @@ impl Agent {
                         .cwd
                         .as_ref()
                         .map(|path| path.display().to_string()),
+                    // F4: show what would change, bounded and redacted; honest
+                    // summary when no inline diff is possible.
+                    diffs: write_file_diffs(&call, &resources),
                 },
             };
             self.emit(
@@ -2413,4 +2516,47 @@ pub struct RollbackOutcome {
     /// new restore. A repeated idempotent call returns `None` because it did
     /// not create another node.
     pub session_node_id: Option<String>,
+}
+
+/// F4: bounded, redacted content diff for a `write_file` approval preview.
+/// Says honestly when no inline diff is possible (non-regular target, too
+/// large, non-UTF-8, unreadable) instead of faking a "new file" diff. The
+/// read is display-only: the path is already validated as a write target.
+fn write_file_diffs(call: &ToolCall, resources: &ValidatedResources) -> Vec<String> {
+    const MAX_INLINE_BYTES: u64 = 256 * 1024;
+    const DIFF_CAP: usize = 8 * 1024;
+    if call.name != "write_file" {
+        return Vec::new();
+    }
+    let Some(content) = call.args.get("content").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(path) = resources.write_paths.first() else {
+        return Vec::new();
+    };
+    let shown = path.display().to_string();
+    let diff = match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            format!("`{shown}` exists and is not a regular file; inline diff unavailable")
+        }
+        Ok(meta) if meta.len() > MAX_INLINE_BYTES => {
+            format!(
+                "existing `{shown}` is {} bytes; too large for an inline diff",
+                meta.len()
+            )
+        }
+        Ok(_) => match std::fs::read_to_string(path) {
+            Ok(old) => pangu_core::unified_diff(&old, content, &shown, DIFF_CAP),
+            Err(_) => {
+                format!("existing `{shown}` is not valid UTF-8; inline diff unavailable")
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            pangu_core::unified_diff("", content, &shown, DIFF_CAP)
+        }
+        Err(error) => {
+            format!("existing `{shown}` could not be read ({error}); inline diff unavailable")
+        }
+    };
+    vec![truncate_middle(&redact_text(&diff), DIFF_CAP)]
 }

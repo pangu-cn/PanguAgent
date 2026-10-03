@@ -28,6 +28,10 @@ pub enum EventKind {
     FinishRequested,
     RunFinished,
     Note,
+    /// F4: the run moved between the read-only plan phase and the act phase
+    /// (`begin_act` control call). Not an action and never an authorization:
+    /// every act-phase mutation still passes L1-L4.
+    PhaseChanged,
     CheckpointCreated,
     CheckpointFailed,
     RollbackRequested,
@@ -790,6 +794,12 @@ pub struct JournalMeta {
     pub unattended: bool,
     #[serde(default)]
     pub config_files: Vec<String>,
+    /// C5: the operator's declared execution backend. A declaration, not a
+    /// verified fact; absent for undeclared (default local) runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_description: Option<String>,
 }
 
 impl JournalMeta {

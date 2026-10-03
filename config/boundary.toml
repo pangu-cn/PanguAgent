@@ -24,6 +24,9 @@ subprocess_timeout_secs = 45
 subprocess_output_limit = 200_000
 max_write_bytes = 4_194_304
 max_paths_per_action = 64
+# F3: 追加到只读 argv 白名单的裸程序名（如 cargo/npm），供 verify 命令使用。
+# 只接受裸名；不放宽路径、flag 和 host 检查。默认空。
+extra_readonly_commands = []
 
 [boundary.approval]
 mode = "destructive_and_above"
@@ -52,6 +55,9 @@ rollback_requires_approval = true
 [goal]
 require_evidence = true
 min_successful_tool_calls = 1
+# F4: true = 运行从只读 plan 阶段开始；模型只能用 begin_act 控制调用进入
+# act 阶段，act 内每个变更动作仍逐项走 L1-L4 审批。默认 false。
+plan_first = false
 system_prompt = """
 你是 Pangu，一个在显式边界内工作的自主 agent。
 只能通过提供的工具改变外部世界；一次只执行一个可审计动作。
@@ -99,3 +105,25 @@ id = "ask-command"
 effect = "ask"
 tool = "run_command"
 reason = "子进程前需要确认"
+
+[[rules]]
+id = "ask-verify"
+effect = "ask"
+tool = "verify"
+reason = "验证命令会执行项目代码，运行前需要确认"
+
+[verify]
+# F3: 验证命令（lint/test/compile 等）。留空 = 不向模型广告 verify 工具。
+# 程序名必须在只读 argv 白名单（内置命令或 extra_readonly_commands）上，
+# flag 受与 run_command 相同的限制；启动时冻结进 GoalContract，
+# 模型只能触发整条命令，不能增改参数。示例：
+# command = ["cargo", "test", "-q"]
+command = []
+
+[execution]
+# C5: 声明运行所在的执行后端（local/container/remote）。这是操作者声明，
+# 不是 Pangu 验证过的事实：Pangu 不启动、不管理、不验证容器或远程后端，
+# 任何 profile 下 L1-L4 链完全相同。声明会冻结进 contract 并记入 RunStarted。
+# description 可选，用于审计（脱敏、限长 512 字节）。
+profile = "local"
+# description = "docker:ubuntu-24.04 image sha256:..."

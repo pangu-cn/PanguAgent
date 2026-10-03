@@ -165,10 +165,10 @@ fn rust_internal_edges(path: &str, text: &str, files: &[FileEntry]) -> Vec<(Stri
             Some(rest.trim_end_matches(';').trim())
         } else if let Some(rest) = trimmed.strip_prefix("mod ") {
             Some(rest.trim_end_matches(';').trim())
-        } else if let Some(rest) = trimmed.strip_prefix("use crate::") {
-            Some(rest.split("::").next().unwrap_or("").trim_end_matches(';'))
         } else {
-            None
+            trimmed
+                .strip_prefix("use crate::")
+                .map(|rest| rest.split("::").next().unwrap_or("").trim_end_matches(';'))
         };
         if let Some(module) = target_mod.and_then(|m| m.split([';', '{', ' ']).next()) {
             if module.is_empty() || module == "self" || module == "super" {

@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod assemble;
 pub mod checkpoint;
 pub mod conversation;
+pub mod diff;
 pub mod error;
 pub mod events;
 pub mod export;
@@ -42,6 +43,7 @@ pub use conversation::{
     redact_messages, validate_encoded_size, CompactionRecord, ConversationSnapshot,
     MAX_CONVERSATION_BYTES, MAX_CONVERSATION_MESSAGES,
 };
+pub use diff::unified_diff;
 pub use error::{Error, Result};
 pub use events::{
     redact_event, redact_text, redact_value, Event, EventKind, EventSink, JournalMeta, MemSink,

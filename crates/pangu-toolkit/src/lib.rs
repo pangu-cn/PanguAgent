@@ -24,11 +24,25 @@ const MAX_SEARCH_ENTRIES: usize = 10_000;
 const MAX_LIST_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Default)]
-pub struct Toolkit;
+pub struct Toolkit {
+    /// F3: the operator-configured verification command. Empty = the verify
+    /// tool is not advertised and every call to it is rejected, exactly as if
+    /// F3 were not compiled in.
+    verify_command: Vec<String>,
+}
 
 impl Toolkit {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Build a toolkit whose `verify` tool runs exactly this argv. The command
+    /// comes from `[verify] command` in the config, never from model output;
+    /// the model can only trigger it as a whole.
+    pub fn with_verify_command(command: Vec<String>) -> Self {
+        Self {
+            verify_command: command,
+        }
     }
 
     /// B1: the static declaration of every capability this toolkit can
@@ -36,7 +50,7 @@ impl Toolkit {
     /// asserts that the names match 1:1.
     pub fn manifest(&self) -> CapabilityManifest {
         let empty = || Vec::new();
-        CapabilityManifest::new(vec![
+        let mut capabilities = vec![
             Capability {
                 name: "read_file".into(),
                 version: "1".into(),
@@ -125,14 +139,31 @@ impl Toolkit {
                 processes: vec!["allowlisted".into()],
                 timeout_ms: None,
             },
-        ])
+        ];
+        // F3: the verify capability mirrors the configured command. It exists
+        // in the manifest only when the operator configured one, keeping the
+        // manifest in lockstep with `specs()`.
+        if !self.verify_command.is_empty() {
+            capabilities.push(Capability {
+                name: "verify".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: empty(),
+                processes: vec![self.verify_command[0].clone()],
+                timeout_ms: None,
+            });
+        }
+        CapabilityManifest::new(capabilities)
     }
 }
 
 #[async_trait]
 impl ToolExecutor for Toolkit {
     fn specs(&self) -> Vec<ToolSpec> {
-        vec![
+        let mut specs = vec![
             ToolSpec::new(
                 "read_file",
                 "Read a UTF-8 file inside the readable boundary.",
@@ -218,7 +249,27 @@ impl ToolExecutor for Toolkit {
                     }
                 }),
             ),
-        ]
+        ];
+        // F3: advertise the verify tool only when the operator configured a
+        // command. The model gets no arguments to control: it can trigger the
+        // configured command as a whole, never change it.
+        if !self.verify_command.is_empty() {
+            specs.push(ToolSpec::new(
+                "verify",
+                "Run the operator-configured verification command (e.g. lint/test/compile) and return its output and exit status.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {}
+                }),
+            ));
+        }
+        specs
+    }
+
+    fn verify_command(&self) -> Vec<String> {
+        self.verify_command.clone()
     }
 
     async fn assess(&self, call: &ToolCall, sandbox: &Sandbox) -> Result<ToolAssessment> {
@@ -350,6 +401,25 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "verify" => {
+                // The model gets no arguments to control: any key is a
+                // rejection. The argv is the contract-frozen configured one.
+                ensure_allowed_keys(&call.args, &[])?;
+                if self.verify_command.is_empty() {
+                    bail!("verify tool is not configured");
+                }
+                sandbox.validate_argv(&self.verify_command)?;
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman).with_effect(
+                    EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                );
+                assessment.argv = self.verify_command.clone();
+                assessment.preview = format!(
+                    "verify {} args_sha256={}",
+                    self.verify_command[0],
+                    short_hash(&self.verify_command[1..].join(" "))
+                );
+                Ok(assessment)
+            }
             "git_diff" => {
                 ensure_allowed_keys(&call.args, &["staged", "path"])?;
                 let staged = call
@@ -398,6 +468,7 @@ impl ToolExecutor for Toolkit {
             "http_fetch" => execute_http(action).await,
             "git_diff" => execute_command(action).await,
             "run_command" => execute_command(action).await,
+            "verify" => execute_verify(action).await,
             other => bail!("tool `{other}` has no executor"),
         }
     }
@@ -817,6 +888,16 @@ fn resolve_executable(program: &str, sandbox: &Sandbox) -> Result<PathBuf> {
 }
 
 async fn execute_command(action: &VerifiedAction) -> Result<ToolOutput> {
+    execute_command_tagged(action, "command").await
+}
+
+/// F3: verify shares the run_command subprocess discipline (no shell, cleaned
+/// env, closed stdin, timeout, bounded output); only the evidence tag differs.
+async fn execute_verify(action: &VerifiedAction) -> Result<ToolOutput> {
+    execute_command_tagged(action, "verify").await
+}
+
+async fn execute_command_tagged(action: &VerifiedAction, tag: &str) -> Result<ToolOutput> {
     let argv = &action.resources().argv;
     if argv.is_empty() {
         bail!("empty command");
@@ -877,7 +958,7 @@ async fn execute_command(action: &VerifiedAction) -> Result<ToolOutput> {
     }
     Ok(ToolOutput::evidenced(
         text,
-        format!("command:{}", short_hash(&argv.join(" "))),
+        format!("{tag}:{}", short_hash(&argv.join(" "))),
     ))
 }
 
@@ -916,6 +997,35 @@ mod tests {
     fn manifest_matches_specs_one_to_one() {
         let specs = Toolkit::new().specs();
         let manifest = Toolkit::new().manifest();
+        manifest.validate().expect("manifest validates");
+        let mut spec_names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let mut manifest_names: Vec<&str> = manifest.names();
+        spec_names.sort();
+        manifest_names.sort();
+        assert_eq!(spec_names, manifest_names);
+    }
+
+    #[test]
+    fn verify_tool_is_advertised_only_when_configured() {
+        let default = Toolkit::new();
+        assert!(!default.specs().iter().any(|spec| spec.name == "verify"));
+        assert!(!default.manifest().names().contains(&"verify"));
+        assert!(default.verify_command().is_empty());
+
+        let configured = Toolkit::with_verify_command(vec!["cargo".into(), "test".into()]);
+        assert!(configured.specs().iter().any(|spec| spec.name == "verify"));
+        assert!(configured.manifest().names().contains(&"verify"));
+        assert_eq!(
+            configured.verify_command(),
+            vec!["cargo".to_string(), "test".to_string()]
+        );
+    }
+
+    #[test]
+    fn manifest_matches_specs_one_to_one_with_verify() {
+        let toolkit = Toolkit::with_verify_command(vec!["cargo".into(), "test".into()]);
+        let specs = toolkit.specs();
+        let manifest = toolkit.manifest();
         manifest.validate().expect("manifest validates");
         let mut spec_names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         let mut manifest_names: Vec<&str> = manifest.names();

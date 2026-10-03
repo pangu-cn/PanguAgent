@@ -456,7 +456,10 @@ impl Sandbox {
             "git",
         ];
         if !COMMANDS.contains(&program)
-            && !self.extra_readonly_commands.iter().any(|extra| extra == program)
+            && !self
+                .extra_readonly_commands
+                .iter()
+                .any(|extra| extra == program)
         {
             return Err(Error::Config(format!(
                 "command `{program}` is not on the read-only argv allow-list"
@@ -514,7 +517,10 @@ impl Sandbox {
         ];
         for argument in argv.iter().skip(1) {
             let path = Path::new(argument);
-            if path.is_absolute()
+            // `has_root` rather than `is_absolute`: on Windows, `/etc/x` has
+            // no drive prefix and `is_absolute` would let it pass config-time
+            // validation even though it points outside the workspace.
+            if path.has_root()
                 || argument.contains("..")
                 || (argument.starts_with('-')
                     && argument.len() > 1
@@ -544,8 +550,10 @@ impl Sandbox {
                 | "md5sum"
                 | "sha256sum"
                 | "git"
-        )
-            || self.extra_readonly_commands.iter().any(|extra| extra == command)
+        ) || self
+            .extra_readonly_commands
+            .iter()
+            .any(|extra| extra == command)
     }
 
     pub fn sanitize_env(&self, input: &HashMap<String, String>) -> HashMap<String, String> {

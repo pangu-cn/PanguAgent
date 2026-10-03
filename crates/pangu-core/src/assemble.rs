@@ -198,28 +198,6 @@ fn slice_summary_marker(entry: &crate::SliceEntry) -> Message {
     ))
 }
 
-fn omitted_gap_marker(
-    from: &crate::SliceEntry,
-    into: &crate::SliceEntry,
-    omitted: &[&crate::SliceEntry],
-) -> Message {
-    let names: Vec<&str> = omitted
-        .iter()
-        .map(|entry| entry.slice_id.as_str())
-        .collect();
-    Message::system(format!(
-        "[pangu context seam: slice \"{}\" follows \"{}\"; the history between them is in this store \
-         but not in this window{}. Derived context, not the original turn sequence.]",
-        into.slice_id,
-        from.slice_id,
-        if omitted.is_empty() {
-            String::new()
-        } else {
-            format!("; omitted under budget: {}", names.join(", "))
-        }
-    ))
-}
-
 /// Assign a presentation mode to every selected slice, degrading under budget
 /// pressure. Keeping `Full` is prioritized for forced-core, then recent
 /// forced (newest first), then requested (request order). Core slices floor at
@@ -404,12 +382,9 @@ pub fn assemble(
 
     // --- forced set, in slice order so reasons do not overlap arbitrarily ---
     for (index, entry) in entries.iter().enumerate() {
-        match entry.kind {
-            crate::SliceKind::Phase => {
-                selected.insert(index);
-                reasons.insert(index, SelectionReason::ForcedSystem);
-            }
-            _ => {}
+        if entry.kind == crate::SliceKind::Phase {
+            selected.insert(index);
+            reasons.insert(index, SelectionReason::ForcedSystem);
         }
     }
     // The goal lives in the first user-bearing slice. Checked *after* the
@@ -494,7 +469,6 @@ pub fn assemble(
     let mut out_messages: Vec<Message> = Vec::new();
     let mut seams: Vec<Seam> = Vec::new();
     let mut previous_end: Option<usize> = None;
-    let mut previous_index: Option<usize> = None;
     let mut selections = Vec::new();
     let mut last_slice_id = String::new();
     for index in &selected {
@@ -558,7 +532,6 @@ pub fn assemble(
             mode,
         });
         previous_end = Some(entry.end_message);
-        previous_index = Some(*index);
         last_slice_id = entry.slice_id.clone();
     }
 
@@ -674,7 +647,8 @@ mod tests {
             .expect("turn 2")
             .slice_id
             .clone();
-        let (_context, report) = assemble(&messages, 1, &[turn2.clone()], 1).expect("assemble");
+        let (_context, report) =
+            assemble(&messages, 1, std::slice::from_ref(&turn2), 1).expect("assemble");
         assert!(report.forced_over_budget);
         assert!(
             report
@@ -801,11 +775,9 @@ mod tests {
         messages.push(Message::user("second"));
         messages.push(Message::assistant("ok"));
         // Probe a budget that forces exactly one Summary degradation.
-        let mut budget = 0u64;
         let probes: Vec<u64> = (0..=12).map(|i| 2u64.pow(i)).collect();
         let mut seen_summary = false;
-        for probe in probes {
-            budget = probe;
+        for budget in probes {
             let (context, report) = assemble(&messages, 2, &[], budget).expect("assemble");
             let has_summary = context.messages.iter().any(
                 |m| matches!(m, Message::System { content } if content.contains("slice summary")),

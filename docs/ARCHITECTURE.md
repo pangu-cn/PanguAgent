@@ -121,7 +121,7 @@ RollbackRequested
 5. `finish(status="complete")` 只有在 `min_successful_tool_calls` 个成功 evidence 后才保持 `Complete`；否则降级为 `Failed`。
 6. 发出 `RunFinished` 并返回 `Outcome`。provider 或事件 sink 异常也尝试发终态事件，原始错误仍向上返回。
 
-一个响应中的多个调用按顺序处理；第一个终态调用会终止当前响应剩余调用。未知工具、无法解析的参数和无法分类的适配器动作都走错误回灌，而不是直接执行。
+一个响应中的多个调用按顺序处理；第一个终态调用会终止当前响应剩余调用。未知工具、无法解析的参数和无法分类的适配器动作都走错误回灌，而不是直接执行。`begin_act` 是 agent 拥有的控制调用（仅 `goal.plan_first` 时广告）：它在工具循环中与 `finish` 同层拦截，不经过 assess，只把运行从只读 plan 阶段切到 act 阶段并发 `PhaseChanged` 事件；plan 阶段中风险高于 `read_only` 的动作在 assess 之后、Policy 之前被拒绝并回灌（I-Plan-Phase-Read-Only）。
 
 ## 事件与 Journal
 
@@ -135,7 +135,7 @@ FinishRequested, RunFinished, Note,
 CheckpointCreated, CheckpointFailed,
 RollbackRequested, RollbackStarted, RollbackApplied,
 RollbackSkippedAlreadyApplied, RollbackFailed, FailedPathRecorded,
-ContextAssembled
+ContextAssembled, PhaseChanged
 ```
 
 启用 checkpoint 的运行使用 `pangu-journal/v2`；禁用时保留 v1。v2 写入时封存 `schema`、连续 `seq`、`prev_sha`、内容 `sha` 和 `evt_<sha256>` 稳定 ID。`EventSink::emit` 保持兼容，内部 receipt 路径使用 `emit_with_receipt`；TeeSink 比较多个 durable sink 的 receipt，不一致则失败。Journal replay 只校验和索引，不恢复文件、不重放副作用。
@@ -156,7 +156,7 @@ sha = SHA256(prev_sha || NUL || canonical_json)
 
 ### L1 — `pangu-boundary::GoalContract`
 
-Contract 保存一次 run 的目标文本、canonical workspace/roots、forbidden globs、预算、审批模式、网络 host、环境 allow-list、工具/进程限制、evidence 要求和 Policy digest。`Config::validate` 在构造时检查路径、symlink、glob、TOML、环境键、provider URL 和规则；`GoalContract::validate_against` 再检查 contract 与 Sandbox 的有效字段和 roots 有效顺序完全一致，`Agent::new` 检查实际 Policy digest 与 contract 一致，并拒绝 approval handler mode 不匹配的注入。
+Contract 保存一次 run 的目标文本、canonical workspace/roots、forbidden globs、预算、审批模式、网络 host、环境 allow-list、工具/进程限制、evidence 要求、F3 验证命令、F4 plan/act 阶段纪律、C5 执行后端声明和 Policy digest。`Config::validate` 在构造时检查路径、symlink、glob、TOML、环境键、provider URL 和规则；`GoalContract::validate_against` 再检查 contract 与 Sandbox 的有效字段和 roots 有效顺序完全一致，`Agent::new` 检查实际 Policy digest 与 contract 一致，并拒绝 approval handler mode 不匹配的注入。C5 的执行后端声明是操作者声明而非验证事实：contract 只负责冻结与审计，不改变任何闸门（见 BOUNDARY §3）。
 
 ### L2 — `pangu-boundary::Policy`
 
@@ -188,7 +188,9 @@ rollback 始终把动作作为 destructive capability 送入 L2/L3/L4；CLI 使�
 
 ### Provider 与工具适配器
 
-当前只有 `OpenAiCompatibleProvider`。它将统一的 `Message`/`ToolSpec` 转为 OpenAI `/chat/completions` 请求，限制响应体，并要求每个响应提供有效的 `prompt_tokens` 和 `completion_tokens`；可选的 `cache_read_tokens` 也必须有效并计入输入预算。`Toolkit` 实现 `ToolExecutor`，所有工具在 `assess` 阶段声明资源和风险，在 `execute` 阶段只消费 `VerifiedAction`。Provider 集成测试使用本地 TCP mock server 覆盖成功响应、usage/cache token、非 2xx 脱敏、redirect 禁止和响应体上限，不依赖外部网络或 API key。
+当前只有 `OpenAiCompatibleProvider`。它将统一的 `Message`/`ToolSpec` 转为 OpenAI `/chat/completions` 请求，限制响应体，并要求每个响应提供有效的 `prompt_tokens` 和 `completion_tokens`；可选的 `cache_read_tokens` 也必须有效并计入输入预算。`Toolkit` 实现 `ToolExecutor`，所有工具在 `assess` 阶段声明资源和风险，在 `execute` 阶段只消费 `VerifiedAction`。F3 的 `verify` 工具只执行 `GoalContract.verify_command` 冻结的整条 argv；`Toolkit` 必须精确广告这条命令，`Agent::new` 拒绝与 contract 不一致的 executor，模型参数在 `assess` 前即被拒绝。退出码与输出回灌模型，失败不产生 evidence。Provider 集成测试使用本地 TCP mock server 覆盖成功响应、usage/cache token、非 2xx 脱敏、redirect 禁止和响应体上限，不依赖外部网络或 API key。
+
+B4 的 provider 注册表（`pangu-boundary::registry`）是静态配置数据：内置预设（openai/deepseek/ollama）携带 endpoint、key 变量、每模型能力声明与带 as-of 日期的价格表。`Config::resolve_provider()` 以纯函数方式解析（显式配置 > 具名预设 > 内置默认），不 mutate 配置，digest 语义不变；注册表价格仅在 `model.provider` 显式命名时生效。能力探测是 `pangu_provider::probe_models`：操作者显式发起的单次有界 `GET /models`，与 `chat` 同等客户端纪律（无代理、无重定向、有界响应），非 2xx 只报状态码。
 
 ## Checkpoint/rollback 实现细节
 
@@ -250,6 +252,8 @@ rollback 始终把动作作为 destructive capability 送入 L2/L3/L4；CLI 使�
 | I-Rollback-Idempotent | artifact/agent/invariant tests | operation CAS、重复请求、transition node 修复和 Failed operation 不自动重试 |
 | I-Failed-Path-Not-Repeated | agent/core tests | 同 run 等价失败执行前阻断，跨 run/错误 digest 拒绝 |
 | I-No-Implicit-Git-Commit | `tests/invariants.rs`, config tests | Git backend 显式失败，默认不触发 Git |
+| I-Verify-Command-Binding | `pangu-boundary/src/config.rs`, `pangu-agent/src/lib.rs` (`Agent::new`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | verify 只运行 contract 冻结的整条命令；模型参数被拒绝；失败无 evidence 且 `complete` 降级 |
+| I-Plan-Phase-Read-Only | `pangu-boundary/src/goal.rs`, `pangu-agent/src/lib.rs` (`process_tool`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | plan_first 运行中变更动作在闸门前被拒；仅 `begin_act` 切相；act 动作仍逐项审批 |
 
 ## 已知边界
 
@@ -259,3 +263,4 @@ rollback 始终把动作作为 destructive capability 送入 L2/L3/L4；CLI 使�
 - Journal replay 当前提供完整性校验和摘要，不重新执行工具。
 - checkpoint/rollback 阶段二实现默认关闭、仅实验性 opt-in；Windows replace hand-off、stale lock 和无锁并发 writer 的限制见“已知恢复限制”，不构成 OS 级隔离或正式支持声明。operator 处理步骤和证据清单见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
 - 默认 `pangu run` 需要用户提供 API key 和模型输入/输出价格；`pangu --demo` 使用本地 scripted provider 并显式声明零价格来验证状态机。
+- C5 的执行后端声明是操作者声明，不是验证事实：Pangu 不启动/管理/验证容器或远程后端，L1–L4 在所有 profile 下相同；真正的容器/远程编排属 C4/远程 Runner 范畴。

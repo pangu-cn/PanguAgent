@@ -196,3 +196,71 @@ async fn oversized_response_is_rejected_before_json_parsing() {
     assert!(message.contains("provider response exceeds 2097152 bytes"));
     let _ = server.request.await;
 }
+
+// ---- B4: capability probe ------------------------------------------------
+
+#[tokio::test]
+async fn probe_lists_models_from_the_endpoint() {
+    let body = serde_json::json!({"data": [{"id": "gpt-4o"}, {"id": "local-model"}]}).to_string();
+    let server = spawn_server("200 OK", body, Vec::new()).await;
+    let ids = pangu_provider::probe_models(&server.base_url, Some("sk-probe-key"), 5)
+        .await
+        .expect("probe");
+    assert_eq!(ids, vec!["gpt-4o".to_string(), "local-model".to_string()]);
+    let request = server.request.await.expect("request captured");
+    assert!(request.starts_with("GET"), "probe must use GET: {request}");
+    assert!(request.contains("/models"), "probe path: {request}");
+    let request = request.to_ascii_lowercase();
+    assert!(
+        request.contains("authorization: bearer sk-probe-key"),
+        "probe must send the key as a bearer token: {request}"
+    );
+}
+
+#[tokio::test]
+async fn probe_failure_reports_status_only_and_never_the_body() {
+    let server = spawn_server(
+        "401 Unauthorized",
+        "SECRET-PROVIDER-BODY".into(),
+        Vec::new(),
+    )
+    .await;
+    let error = pangu_provider::probe_models(&server.base_url, None, 5)
+        .await
+        .expect_err("401 must fail");
+    let text = error.to_string();
+    assert!(text.contains("401"), "status required: {text}");
+    assert!(
+        !text.contains("SECRET-PROVIDER-BODY"),
+        "error body must not be echoed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn probe_rejects_oversized_and_malformed_bodies() {
+    // MAX_RESPONSE_BYTES in the provider is 2 MiB; 3 MiB must be refused.
+    let oversized = "x".repeat(3 * 1024 * 1024);
+    let server = spawn_server("200 OK", oversized, Vec::new()).await;
+    assert!(
+        pangu_provider::probe_models(&server.base_url, None, 5)
+            .await
+            .is_err(),
+        "oversized body must be refused"
+    );
+
+    let server = spawn_server("200 OK", "not-json".into(), Vec::new()).await;
+    assert!(
+        pangu_provider::probe_models(&server.base_url, None, 5)
+            .await
+            .is_err(),
+        "malformed body must be refused"
+    );
+
+    let server = spawn_server("200 OK", "{\"nope\": 1}".into(), Vec::new()).await;
+    assert!(
+        pangu_provider::probe_models(&server.base_url, None, 5)
+            .await
+            .is_err(),
+        "missing `data` must be refused"
+    );
+}

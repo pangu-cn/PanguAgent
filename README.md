@@ -106,9 +106,13 @@ ToolExecutor::execute(&VerifiedAction)
 | `http_fetch` | 有界 HTTP `GET` | `needs_human` | 仅 allow-list host；禁止重定向和私网/metadata |
 | `run_command` | 运行无 shell 的只读命令 allow-list | `needs_human` | 不提供通用 shell；仍需审批 |
 | `git_diff` | 只读查看 `git diff/status/log/show` | `read_only` | 仅白名单子命令与 flag + 相对路径；输出超限即失败；不提交、不修改 index |
+| `verify` | 运行配置中预声明的验证命令（lint/test 等） | `needs_human` | 命令来自 `[verify] command`，模型只能整体触发；未配置时该工具不存在 |
+| `begin_act` | 控制调用：结束只读 plan 阶段（仅 `goal.plan_first = true` 时存在） | 控制工具 | 不执行任何动作、不过任何闸门；act 阶段的每个变更动作仍逐项审批 |
 | `finish` | 提交运行状态 | 控制工具 | `complete` 需要成功证据；不是外部副作用 |
 
 `run_command` 当前只允许 `pwd`, `cat`, `ls`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `diff`, `md5sum`, `sha256sum` 及受限参数。`git_diff` 当前只允许 `git diff|status|log|show` 与白名单 flag（"undo" 归 `pangu rollback`，见 ROADMAP F2）。`http_fetch` 当前只实现 GET。
+
+`verify` 只运行 `[verify] command` 预声明的**整条命令**：程序名必须在只读 argv 白名单（内置命令或 `boundary.extra_readonly_commands`）上，flag 受与 `run_command` 相同的 SAFE 列表限制，配置在启动时冻结进 `GoalContract`，每次调用都需人工批准。`extra_readonly_commands` 是操作者对被声明程序副作用的**断言**——Pangu 不验证其真实副作用，验证命令的外部效果（如依赖下载）不进 effect ledger、不被 rollback 处理。退出码与输出回灌模型；失败不产生 evidence，`finish(complete)` 因此被拒（I-Honest-Terminal）。
 
 ## Provider
 
@@ -118,8 +122,24 @@ ToolExecutor::execute(&VerifiedAction)
 - 远程端点默认要求 HTTPS；`http://localhost` 可用于本地兼容服务（例如 Ollama 的 OpenAI-compatible endpoint）。
 - API key 只从 `model.api_key_env` 指定的环境变量读取，不从 TOML 参数直接读取。
 - 响应体、工具参数和工具输出都有上限；provider 错误在边界处脱敏。
-- 成本闸门要求同时配置 `model.input_usd_per_mtok` 和 `model.output_usd_per_mtok`；provider 报告的 `cache_read_tokens` 计入输入 token 预算并按输入价计费。缺少价格不会被当作免费运行，而会在下一次 provider 请求前以 `budget_exhausted` 失败。`--demo` 明确使用零价格脚本 provider。
+- 成本闸门要求价格可知：显式配置，或由内置注册表（见下）提供；缺失价格不会被当作免费运行，而会在下一次 provider 请求前以 `budget_exhausted` 失败。provider 报告的 `cache_read_tokens` 计入输入 token 预算并按输入价计费。`--demo` 明确使用零价格脚本 provider。
 - 没有实现 Anthropic 专用协议；可使用提供 OpenAI-compatible API 的适配端点。
+
+内置 provider 注册表（B4）为常见 OpenAI-compatible 服务提供 endpoint/key 默认值、每模型能力声明（context window、输出上限、是否支持工具调用）与带 as-of 日期的价格表：
+
+```toml
+[model]
+provider = "deepseek"       # 使用注册表预设（`pangu models list` 查看全部）
+model = "deepseek-chat"     # 已知模型自动获得价格与能力；未知模型须显式声明价格
+# base_url / api_key_env / 价格显式设置时覆盖预设
+```
+
+规则与诚实边界：
+
+- **价格表只在 `model.provider` 显式命名时生效**——命名 provider 即操作者决定采用其数据；显式配置永远覆盖预设。
+- 价格表会过期：`pangu models list` 显示每个预设的 as-of 日期，依赖前请核对；本地 provider（如 ollama）无内置价格，必须显式声明。
+- fail-closed 前移到配置期：未知 provider、keyed provider 缺 key 变量、不支持工具调用的模型、`budget.max_input_tokens` 超出模型 context window、请求输出上限超过模型能力，均在启动时拒绝。
+- `pangu models list [--json]` 离线列出注册表；`pangu models probe [--json]` 对生效 endpoint 发一次有界 `GET /models`（操作者显式发起，非 2xx 只报状态码，不回显 body/key）。
 
 ## 配置与 CLI
 
@@ -138,6 +158,8 @@ pangu events contract [--json]
 pangu conversation list
 pangu conversation show [--json]
 pangu conversation export [--id ID] --out PATH [--strict] [--json]
+pangu models list [--json]
+pangu models probe [--json]
 pangu session tree [--json]
 pangu session replay NODE [--full] [--json]
 pangu repo map [--root PATH] [--budget N] [--json]
@@ -168,6 +190,34 @@ save_every_turn = true
 `pangu session tree` / `pangu session replay` 是**只读**导航：列出会话节点（roots、children、各节点的 checkpoint），或把某个节点上记录的对话重建出来。两者都不写、不删、不移动节点，`replay` **也不恢复工作区**——那是 `pangu rollback` 的职责，两者不能互相替代。账本是一份可被手工编辑的 JSON 目录，所以遍历对环和缺失 parent 都按**损坏账本**处理：报错或标注，而不是给出一个看起来完整其实残缺的答案。当前已知每次普通运行的树**恰好有一个孤儿**（运行根节点从不落盘），`session tree` 会打 `WARNING`，`session replay` 拒绝执行——详见 [`docs/adr/0004-conversation-persistence.md`](docs/adr/0004-conversation-persistence.md) §7.3。
 
 上下文组装（A6）已接入默认运行路径：每轮发给模型的不是全量 history，而是按预算组装的窗口——**不可协商的强制集**（system 轮、goal、被拒路径、未完成工具调用的配对闭包、最近 8 轮）∪ **请求集**（模型只能请求、不能排除；当前默认运行请求集为空，第二阶段选择器接缝留给 B6）。摘要是确定性抽取而非模型生成；切片绑定会话消息前缀 digest 与逐范围 digest，对不上即报错，绝不静默重生成；切片拼接处显式插入 seam 标记，每次组装发 `ContextAssembled` 事件并带降级统计（full / summary / omitted / seam 数）。降级链 `full → summary → omit-with-reason` 走完仍放不下强制集时按 `BudgetExhausted` 硬终止——不存在“永不终止的运行”。本地留存硬上界（8 MiB / 10,000 条 / 单条 256 KiB）暂未放宽。设计与非目标见 [`docs/adr/0005-context-assembly.md`](docs/adr/0005-context-assembly.md)。
+
+验证命令（F3）默认关闭，需显式配置：
+
+```toml
+[boundary]
+extra_readonly_commands = ["cargo"]   # 只接受裸程序名；不放宽路径/host 检查
+
+[verify]
+command = ["cargo", "test", "-q"]     # 留空 = 不向模型广告 verify 工具
+```
+
+配置后，模型可以调用 `verify` 运行这条命令（每次需人工批准），但不能增改任何参数；命令在启动时冻结进 contract，toolkit 广告与 contract 不一致时 Agent 拒绝启动。
+
+Plan/Act 逐步审批（F4）默认关闭，需显式配置 `goal.plan_first = true`：
+
+- 运行从**只读 plan 阶段**开始：风险高于 `read_only` 的动作（写入、命令、网络）在进任何闸门前被拒绝，回灌信息指向 `begin_act`；`read_file`/`search`/`git_diff` 等只读探索不受影响。
+- 模型通过 `begin_act` 控制调用进入 act 阶段（发 `PhaseChanged` 事件）；它不执行任何动作，也不是授权——act 阶段的每个变更动作仍逐项走 L1-L4，人工批准一次一个。
+- `write_file` 的审批请求带**有界、脱敏的 unified diff**（保留/删除/新增行）；无法内联 diff 时（非 UTF-8、过大、不可读）明确说明原因。Phase 规则冻结进 contract，模型不能更改。
+
+执行后端声明（C5）默认关闭：
+
+```toml
+[execution]
+profile = "container"                              # local（默认）| container | remote
+description = "docker:ubuntu-24.04 sha256:..."     # 可选，审计用，脱敏限长
+```
+
+这是**操作者声明，不是 Pangu 验证过的事实**：Pangu 不启动、不管理、不验证容器或远程后端——从进程内部看它们与 local 无法区分。声明冻结进 contract 并记入 `RunStarted`（审计用）；任何 profile 下 L1-L4 链完全相同，`doctor`/`--dry-run` 会打印各 profile 的真实保护范围（例如：local = 仅应用层闸门、无 OS 隔离；container = 容器边界由部署者的容器运行时负责）。声明只改变"审计记录里写什么"，不改变任何闸门行为。
 
 `--dangerously-unattended` 会把 approval mode 设为 `never`、使用 fail-closed 的 `Unattended` handler，并在 `RunStarted` 元数据中记录 `unattended=true`；需要人工或破坏性风险的动作会被拒绝，读-only 动作仍须通过其它闸门。它不是安全模式，只是明确放弃人工确认。
 

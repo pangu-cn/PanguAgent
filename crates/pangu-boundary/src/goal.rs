@@ -7,6 +7,7 @@ use pangu_core::{Error, Price, Result};
 use crate::approval::ApprovalMode;
 use crate::budget::Budget;
 use crate::config::{canonicalize_with_missing, CheckpointSection, Config, ConversationSection};
+use crate::execution::ExecutionSection;
 use crate::sandbox::{absolute_path_from, Sandbox};
 
 /// The immutable, human-supplied portion of one run. The agent builds its
@@ -33,6 +34,26 @@ pub struct GoalContract {
     pub subprocess_output_limit: usize,
     pub max_write_bytes: usize,
     pub max_paths_per_action: usize,
+    /// F4: when true, the run starts in the read-only plan phase; only the
+    /// model's `begin_act` control call enters the act phase, where every
+    /// mutating action still passes L1-L4 individually. Frozen at contract
+    /// construction; the model cannot change it.
+    #[serde(default)]
+    pub plan_first: bool,
+    /// C5: the declared execution backend, frozen at contract construction.
+    /// A declaration, not a verified fact: Pangu does not launch, manage, or
+    /// verify backends; L1-L4 apply identically in every profile.
+    #[serde(default)]
+    pub execution: ExecutionSection,
+    /// F3: the operator-configured verification command, frozen at contract
+    /// construction. The toolkit must advertise exactly this argv; `Agent::new`
+    /// refuses a mismatch. Empty = the verify tool does not exist.
+    #[serde(default)]
+    pub verify_command: Vec<String>,
+    /// F3: extra programs admitted to the read-only argv allow-list. Kept on
+    /// the contract so an injected Sandbox cannot quietly widen it.
+    #[serde(default)]
+    pub extra_readonly_commands: Vec<String>,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
@@ -77,10 +98,14 @@ impl GoalContract {
             subprocess_output_limit: 200_000,
             max_write_bytes: 4_194_304,
             max_paths_per_action: 64,
+            verify_command: Vec::new(),
+            extra_readonly_commands: Vec::new(),
             checkpoint: CheckpointSection::default(),
             conversation: ConversationSection::default(),
             require_evidence: true,
             min_successful_tool_calls: 1,
+            plan_first: false,
+            execution: ExecutionSection::default(),
             price: None,
             policy_digest: crate::Policy::empty().digest(),
         }
@@ -91,10 +116,8 @@ impl GoalContract {
         let workspace = config.workspace_abs();
         let readable_roots = canonical_roots(&workspace, &config.boundary.readable_roots)?;
         let writable_roots = canonical_roots(&workspace, &config.boundary.writable_roots)?;
-        let price = match (
-            config.model.input_usd_per_mtok,
-            config.model.output_usd_per_mtok,
-        ) {
+        let resolved = config.resolve_provider()?;
+        let price = match (resolved.input_usd_per_mtok, resolved.output_usd_per_mtok) {
             (Some(input), Some(output)) => Some(Price {
                 input_usd_per_mtok: input,
                 output_usd_per_mtok: output,
@@ -146,10 +169,14 @@ impl GoalContract {
             subprocess_output_limit: config.boundary.subprocess_output_limit,
             max_write_bytes: config.boundary.max_write_bytes,
             max_paths_per_action: config.boundary.max_paths_per_action,
+            verify_command: config.verify.command.clone(),
+            extra_readonly_commands: config.boundary.extra_readonly_commands.clone(),
             checkpoint,
             conversation,
             require_evidence: config.goal.require_evidence,
             min_successful_tool_calls: config.goal.min_successful_tool_calls,
+            plan_first: config.goal.plan_first,
+            execution: config.execution.clone(),
             price,
             policy_digest: crate::Policy::new(config.rules.clone())?.digest(),
         };
@@ -187,6 +214,16 @@ impl GoalContract {
 
     pub fn is_unattended(&self) -> bool {
         self.unattended
+    }
+
+    /// F4: whether the run starts in the read-only plan phase.
+    pub fn plan_first(&self) -> bool {
+        self.plan_first
+    }
+
+    /// C5: the declared execution backend.
+    pub fn execution(&self) -> &ExecutionSection {
+        &self.execution
     }
 
     /// Digest of the effective boundary, excluding user text and config file
@@ -235,11 +272,42 @@ impl GoalContract {
             "policy_digest": &self.policy_digest,
             "unattended": self.unattended,
         });
+        // F4: only a plan-first run carries the phase discipline; a default
+        // single-phase run must keep its historical digest.
+        if self.plan_first {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("plan_first".into(), serde_json::json!(true));
+            }
+        }
+        // C5: only a declared backend changes the digest; the default local
+        // profile is undeclared and keeps historical digests stable.
+        if self.execution.is_declared() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "execution".into(),
+                    serde_json::json!({
+                        "profile": self.execution.profile.as_str(),
+                        "description": &self.execution.description,
+                    }),
+                );
+            }
+        }
         if self.checkpoint.enabled {
             if let Some(object) = value.as_object_mut() {
                 object.insert(
                     "checkpoint".into(),
                     serde_json::to_value(&self.checkpoint).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        if !self.verify_command.is_empty() || !self.extra_readonly_commands.is_empty() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "verify".into(),
+                    serde_json::json!({
+                        "command": &self.verify_command,
+                        "extra_readonly_commands": &self.extra_readonly_commands,
+                    }),
                 );
             }
         }
@@ -258,6 +326,7 @@ impl GoalContract {
             || self.subprocess_output_limit != sandbox.subprocess_output_limit
             || self.max_write_bytes != sandbox.max_write_bytes
             || self.max_paths_per_action != sandbox.max_paths_per_action
+            || self.extra_readonly_commands != sandbox.extra_readonly_commands
         {
             return Err(Error::Config(
                 "GoalContract and Sandbox do not describe the same effective boundary".into(),

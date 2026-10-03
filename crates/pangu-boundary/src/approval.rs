@@ -64,10 +64,10 @@ impl std::str::FromStr for ApprovalMode {
 }
 
 /// Structured impact of an approved call, shown before the human says yes.
-/// A3: diff/previews were previously buried inside the free-form `preview`
-/// string; the parts that are machine-checkable (command, network targets,
-/// read/write scope) now have a stable shape. A diff of file contents comes
-/// with F2 and is intentionally not promised here.
+/// A3: the machine-checkable parts (command, network targets, read/write
+/// scope) have a stable shape. F4 adds bounded file-content diffs for
+/// `write_file` approvals — already redacted and length-capped by the agent
+/// before they reach this struct.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalImpact {
     /// The exact subprocess preview, e.g. `git status`. Redacted and
@@ -86,6 +86,12 @@ pub struct ApprovalImpact {
     /// Working directory the call runs in, if distinct from the workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// F4: unified diff of existing vs. requested content, per write target,
+    /// for content previews. Redacted, length-capped, and absent when a diff
+    /// is impossible (new file metadata, non-UTF-8, too large) — the text
+    /// says which and why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diffs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +266,7 @@ impl StdinApproval {
             || !impact.reads.is_empty()
             || !impact.writes.is_empty()
             || impact.cwd.is_some()
+            || !impact.diffs.is_empty()
         {
             output.push_str("  影响范围 :\n");
             if let Some(command) = &impact.command {
@@ -276,6 +283,12 @@ impl StdinApproval {
             }
             if let Some(cwd) = &impact.cwd {
                 output.push_str(&format!("    目录 : {}\n", safe_display(cwd, 4_096)));
+            }
+            for diff in &impact.diffs {
+                output.push_str(&format!(
+                    "    差异 :\n{}",
+                    indent(&safe_display(diff, 8_192))
+                ));
             }
         }
         output.push_str(&format!(
@@ -370,6 +383,7 @@ mod tests {
             reads: vec!["src/lib.rs".into()],
             writes: vec!["dist/".into()],
             cwd: None,
+            diffs: vec!["--- dist/x\n+++ dist/x\n@@ -1 +1 @@\n-old\n+new\n".into()],
         };
         let rendered = handler.render(&request);
         assert!(rendered.contains("影响范围"));
@@ -377,6 +391,7 @@ mod tests {
         assert!(rendered.contains("example.com"));
         assert!(rendered.contains("src/lib.rs"));
         assert!(rendered.contains("dist/"));
+        assert!(rendered.contains("+new"));
     }
 
     #[test]

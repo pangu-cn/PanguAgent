@@ -8,6 +8,7 @@ use pangu_core::{Error, Result};
 
 use crate::approval::ApprovalMode;
 use crate::budget::Budget;
+use crate::execution::ExecutionSection;
 use crate::policy::{Policy, Rule};
 use crate::sandbox::{absolute_path, absolute_path_from, Sandbox};
 
@@ -34,6 +35,10 @@ pub struct Config {
     pub goal: GoalSection,
     pub rules: Vec<Rule>,
     pub unattended: bool,
+    /// C5: the declared execution backend. A declaration, not a verified
+    /// fact; frozen into the contract and recorded in `RunStarted`.
+    #[serde(default)]
+    pub execution: ExecutionSection,
     /// F3: the lint/test command the `verify` tool runs. Empty = the tool
     /// is not advertised, exactly as if F3 were not compiled in.
     #[serde(default)]
@@ -301,6 +306,10 @@ fn path_has_symlink_component_under(base: &Path, path: &Path) -> bool {
 #[serde(deny_unknown_fields, default)]
 pub struct ModelSection {
     pub protocol: Option<String>,
+    /// B4: name of a built-in registry preset (`pangu models list`). Naming
+    /// the provider opts into its endpoint/key defaults and its price table
+    /// for known models; explicit config values always win.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
@@ -427,6 +436,11 @@ pub struct GoalSection {
     pub require_evidence: bool,
     pub min_successful_tool_calls: u32,
     pub system_prompt: String,
+    /// F4: when true, the run starts in a read-only plan phase; the model's
+    /// `begin_act` control call is the only way into the act phase, where
+    /// every mutating action is still individually approved. Default false:
+    /// single-phase runs behave exactly as before.
+    pub plan_first: bool,
 }
 
 impl Default for GoalSection {
@@ -435,6 +449,7 @@ impl Default for GoalSection {
             require_evidence: true,
             min_successful_tool_calls: 1,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            plan_first: false,
         }
     }
 }
@@ -737,11 +752,95 @@ impl Config {
             ));
         }
         // Construct the effective sandbox once during validation so roots,
+        // B4: provider resolution and capability cross-checks. Fails closed at
+        // config time for unknown providers, keyed providers without a key
+        // variable, tool-less models, and budgets that exceed the model's
+        // context window.
+        let resolved = self.resolve_provider()?;
+        if let Some(capabilities) = resolved.capabilities {
+            if self.budget.max_input_tokens > capabilities.context_window_tokens {
+                return Err(Error::Config(format!(
+                    "budget.max_input_tokens ({}) exceeds the `{}` context window ({}) on provider `{}`; lower budget.max_input_tokens",
+                    self.budget.max_input_tokens,
+                    capabilities.name,
+                    capabilities.context_window_tokens,
+                    resolved.preset.expect("preset").name,
+                )));
+            }
+            if let Some(max_output) = self.model.max_output_tokens {
+                if max_output as u64 > capabilities.max_output_tokens {
+                    return Err(Error::Config(format!(
+                        "model.max_output_tokens ({max_output}) exceeds the `{}` output limit ({}) on provider `{}`",
+                        capabilities.name,
+                        capabilities.max_output_tokens,
+                        resolved.preset.expect("preset").name,
+                    )));
+                }
+            }
+        }
+        // C5: validate the execution declaration.
+        self.execution.validate()?;
+        // F3: extra programs join the read-only argv allow-list, so each
+        // entry must be a bare program name. Declaring one does not weaken
+        // path, flag, or host checks.
+        for command in &self.boundary.extra_readonly_commands {
+            if command.is_empty()
+                || command.len() > 128
+                || command.starts_with('-')
+                || command.contains('/')
+                || command.contains('\\')
+                || command.contains("..")
+                || command.chars().any(char::is_control)
+            {
+                return Err(Error::Config(format!(
+                    "boundary.extra_readonly_commands entries must be bare program names: {command}"
+                )));
+            }
+        }
+        for argument in &self.verify.command {
+            if argument.is_empty()
+                || argument.len() > 4_096
+                || argument.chars().any(char::is_control)
+            {
+                return Err(Error::Config(
+                    "verify.command entries must be non-empty, bounded, and free of control characters"
+                        .into(),
+                ));
+            }
+        }
+        if self.verify.command.len() > 32 {
+            return Err(Error::Config(
+                "verify.command must not exceed 32 argv entries".into(),
+            ));
+        }
         // symlink components, globs, limits, and network filters cannot drift
-        // between configuration and runtime enforcement.
-        Sandbox::from_config(&self.boundary)?;
+        // between configuration and runtime enforcement. Building the Sandbox
+        // here also fail-closes an unrunnable verify command: its program must
+        // be on the read-only argv allow-list (built-in or declared through
+        // extra_readonly_commands) and every flag must pass the same argv
+        // rules as `run_command`.
+        let sandbox = Sandbox::from_config(&self.boundary)?;
+        if !self.verify.command.is_empty() {
+            sandbox.validate_argv(&self.verify.command)?;
+        }
         Policy::new(self.rules.clone())?;
         Ok(())
+    }
+
+    /// B4: resolve the effective provider endpoint, key variable, prices and
+    /// capabilities from config + built-in registry. Pure function: nothing is
+    /// mutated, so digest semantics are unchanged (the contract digest already
+    /// covers the effective price).
+    pub fn resolve_provider(&self) -> Result<crate::registry::ResolvedProvider> {
+        crate::registry::resolve(
+            self.model.provider.as_deref(),
+            self.model.model.as_deref(),
+            self.model.protocol.as_deref(),
+            self.model.base_url.as_deref(),
+            self.model.api_key_env.as_deref(),
+            self.model.input_usd_per_mtok,
+            self.model.output_usd_per_mtok,
+        )
     }
 
     pub fn workspace_abs(&self) -> PathBuf {
@@ -829,12 +928,102 @@ impl Config {
                 object.insert("checkpoint".into(), checkpoint);
             }
         }
+        // Same compatibility rule as the checkpoint: an unconfigured verify
+        // tool must not change the digest of an existing v1 run. Once either
+        // F3 field is set, the exact command and the extended allow-list are
+        // part of the effective boundary.
+        if !self.verify.command.is_empty() || !self.boundary.extra_readonly_commands.is_empty() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "verify".into(),
+                    serde_json::json!({
+                        "command": &self.verify.command,
+                        "extra_readonly_commands": &self.boundary.extra_readonly_commands,
+                    }),
+                );
+            }
+        }
+        // Same compatibility rule: the default local profile is undeclared and
+        // must not change the digest of an existing deployment. A declared
+        // backend is part of the effective boundary claims.
+        if self.execution.is_declared() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "execution".into(),
+                    serde_json::json!({
+                        "profile": self.execution.profile.as_str(),
+                        "description": &self.execution.description,
+                    }),
+                );
+            }
+        }
         pangu_core::hex_sha256(&serde_json::to_string(&value).unwrap_or_default())
     }
 
     pub fn explain(&self) -> String {
+        let plan_line = if self.goal.plan_first {
+            "plan_first      : true — run starts read-only; the model's `begin_act` control call starts the act phase\n"
+                .to_string()
+        } else {
+            String::new()
+        };
+        let execution_line = if self.execution.is_declared() {
+            let description = self
+                .execution
+                .description
+                .as_deref()
+                .map(|description| format!(" ({description})"))
+                .unwrap_or_default();
+            format!(
+                "execution       : {}{description}\n                  {}\n",
+                self.execution.profile.as_str(),
+                self.execution.profile.scope_statement(),
+            )
+        } else {
+            String::new()
+        };
+        let resolved = self.resolve_provider().ok();
+        let provider_line = match &resolved {
+            Some(resolved) => {
+                let preset = resolved
+                    .preset
+                    .map(|preset| preset.name.to_string())
+                    .unwrap_or_else(|| "(default)".to_string());
+                let model = resolved
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "unset".to_string());
+                let prices = match resolved.input_usd_per_mtok {
+                    Some(input) => format!(
+                        "{input:.2}/{:.2} USD per MTok",
+                        resolved.output_usd_per_mtok.unwrap_or(f64::NAN)
+                    ),
+                    None => "unset: fail closed".to_string(),
+                };
+                let price_source = match resolved.price_source {
+                    crate::registry::PriceSource::Explicit => "explicit".to_string(),
+                    crate::registry::PriceSource::Registry(as_of) => {
+                        format!("registry as of {as_of}; verify before relying")
+                    }
+                    crate::registry::PriceSource::Absent => "no price".to_string(),
+                };
+                let capabilities = match resolved.capabilities {
+                    Some(caps) => format!(
+                        "context {}, max out {}, tools {}",
+                        caps.context_window_tokens, caps.max_output_tokens, caps.supports_tools
+                    ),
+                    None => "unknown (not in registry)".to_string(),
+                };
+                format!(
+                    "provider       : {preset} / {model}\nendpoint       : {} ({})\nprices         : {prices} ({price_source})\ncapabilities   : {capabilities}\n",
+                    resolved.base_url,
+                    resolved.base_url_source.as_str()
+                )
+            }
+            None => "provider       : <unresolvable>\n".to_string(),
+        };
         format!(
-            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n\nrules:\n{}\n",
+            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}\nrules:\n{}\n",
             self.boundary_digest(),
             self.workspace_abs().display(),
             self.boundary.writable_roots,
@@ -1099,6 +1288,269 @@ mod tests {
         );
         assert!(loaded.conversation.save_every_turn);
         assert!(loaded.conversation.artifact_root.is_relative());
+    }
+
+    /// F3: an old config has no `[verify]` section; it must load with the
+    /// tool absent.
+    #[test]
+    fn old_config_without_verify_section_loads_with_defaults() {
+        let base = Config::embedded().unwrap();
+        let mut value = toml::Value::try_from(&base).unwrap();
+        value.as_table_mut().unwrap().remove("verify");
+        let loaded = Config::from_toml(&toml::to_string(&value).unwrap()).unwrap();
+        assert!(
+            loaded.verify.command.is_empty(),
+            "an absent section must not configure a verify command"
+        );
+    }
+
+    fn config_with_verify(
+        extras: Vec<String>,
+        command: Vec<String>,
+    ) -> std::result::Result<Config, Error> {
+        let base = Config::embedded().unwrap();
+        let mut value = toml::Value::try_from(&base).unwrap();
+        {
+            let table = value.as_table_mut().unwrap();
+            let boundary = table.get_mut("boundary").unwrap().as_table_mut().unwrap();
+            boundary.insert(
+                "extra_readonly_commands".into(),
+                toml::Value::Array(
+                    extras
+                        .into_iter()
+                        .map(toml::Value::String)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+            table.insert(
+                "verify".into(),
+                toml::Value::Table(
+                    [(
+                        "command".into(),
+                        toml::Value::Array(
+                            command
+                                .into_iter()
+                                .map(toml::Value::String)
+                                .collect::<Vec<_>>(),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
+        }
+        let config = Config::from_toml(&toml::to_string(&value).unwrap())?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn extra_readonly_commands_must_be_bare_program_names() {
+        for bad in ["a/b", "a\\b", "..", "-x"] {
+            let error = config_with_verify(vec![bad.to_string()], Vec::new())
+                .expect_err("must reject non-bare extra command");
+            assert!(
+                error.to_string().contains("bare program names"),
+                "unexpected error for {bad}: {error}"
+            );
+        }
+        config_with_verify(vec!["cargo".into()], Vec::new()).expect("bare name is accepted");
+    }
+
+    #[test]
+    fn verify_command_must_use_allowlisted_programs() {
+        let error = config_with_verify(Vec::new(), vec!["python".into(), "-c".into()])
+            .expect_err("undeclared program must fail at config time");
+        assert!(
+            error.to_string().contains("allow-list"),
+            "unexpected error: {error}"
+        );
+        config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "-q".into()],
+        )
+        .expect("declared program with a safe flag passes");
+    }
+
+    #[test]
+    fn verify_command_flags_follow_run_command_rules() {
+        let error = config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "--quiet".into()],
+        )
+        .expect_err("flags outside the safe list must fail at config time");
+        assert!(
+            error.to_string().contains("not allowed"),
+            "unexpected error: {error}"
+        );
+        let error = config_with_verify(Vec::new(), vec!["cat".into(), "/etc/passwd".into()])
+            .expect_err("absolute path arguments must fail");
+        assert!(
+            error.to_string().contains("not allowed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unconfigured_verify_does_not_change_boundary_digest() {
+        let base = Config::embedded().unwrap();
+        let mut stripped = toml::Value::try_from(&base).unwrap();
+        stripped.as_table_mut().unwrap().remove("verify");
+        let kept = Config::from_toml(&toml::to_string(&base).unwrap()).unwrap();
+        let stripped = Config::from_toml(&toml::to_string(&stripped).unwrap()).unwrap();
+        assert_eq!(
+            kept.boundary_digest(),
+            stripped.boundary_digest(),
+            "an empty verify section must not change the digest of an existing deployment"
+        );
+        let configured = config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "-q".into()],
+        )
+        .unwrap();
+        assert_ne!(configured.boundary_digest(), kept.boundary_digest());
+    }
+
+    /// F3 binding: a contract built with an extended allow-list must refuse a
+    /// Sandbox that does not carry the same extension, exactly like any other
+    /// effective-boundary field.
+    #[test]
+    fn contract_refuses_sandbox_with_different_extra_readonly_commands() {
+        use crate::goal::GoalContract;
+
+        let with_extras = config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "-q".into()],
+        )
+        .unwrap();
+        let without = Config::embedded().unwrap();
+        let contract = GoalContract::from_config("binding test", &with_extras).unwrap();
+        let sandbox = Sandbox::from_config(&without.boundary).unwrap();
+        assert!(contract.validate_against(&sandbox).is_err());
+        let matching = Sandbox::from_config(&with_extras.boundary).unwrap();
+        contract
+            .validate_against(&matching)
+            .expect("same-config contract and sandbox agree");
+    }
+
+    /// B4: naming a provider in config fills the endpoint, the key variable,
+    /// and the registry price for a known model; the contract inherits it.
+    #[test]
+    fn provider_resolution_fills_endpoint_and_prices() {
+        use crate::goal::GoalContract;
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o-mini".into());
+        config.budget.max_input_tokens = 100_000; // below the 128k context window
+        config.validate().expect("valid");
+        let resolved = config.resolve_provider().unwrap();
+        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+        assert_eq!(resolved.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(resolved.input_usd_per_mtok, Some(0.15));
+        let contract = GoalContract::from_config("b4", &config).unwrap();
+        let price = contract.price.expect("registry price reaches the contract");
+        assert_eq!(price.input_usd_per_mtok, 0.15);
+        assert_eq!(price.output_usd_per_mtok, 0.60);
+    }
+
+    #[test]
+    fn context_window_smaller_than_input_budget_fails() {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o".into()); // 128k context
+                                                    // Embedded budget is 200k input tokens: impossible for this model.
+        let error = config
+            .validate()
+            .expect_err("budget exceeds context window");
+        assert!(error.to_string().contains("context window"), "{error}");
+    }
+
+    #[test]
+    fn max_output_tokens_above_capability_fails() {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o".into());
+        config.model.max_output_tokens = Some(999_999);
+        config.budget.max_input_tokens = 100_000;
+        config.budget.max_output_tokens = 1_000_000; // avoid the budget-vs-request-cap check first
+        let error = config
+            .validate()
+            .expect_err("request cap exceeds model output limit");
+        assert!(error.to_string().contains("output limit"), "{error}");
+    }
+
+    #[test]
+    fn unknown_provider_fails_with_known_names() {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("nope".into());
+        let error = config.validate().expect_err("unknown provider");
+        assert!(error.to_string().contains("known providers"), "{error}");
+    }
+
+    /// C5: the default local profile is undeclared; removing the section (or
+    /// never having had one) must not change the digest of an existing
+    /// deployment. Declaring a backend does.
+    #[test]
+    fn execution_declaration_changes_digest_only_when_declared() {
+        let base = Config::embedded().unwrap();
+        let mut stripped = toml::Value::try_from(&base).unwrap();
+        stripped.as_table_mut().unwrap().remove("execution");
+        let kept = Config::from_toml(&toml::to_string(&base).unwrap()).unwrap();
+        let stripped = Config::from_toml(&toml::to_string(&stripped).unwrap()).unwrap();
+        assert_eq!(
+            kept.boundary_digest(),
+            stripped.boundary_digest(),
+            "an undeclared execution section must not change the digest"
+        );
+        let mut declared = Config::embedded().unwrap();
+        declared.execution.profile = crate::execution::ExecutionProfile::Container;
+        declared.execution.description = Some("docker:ubuntu-24.04".into());
+        declared.validate().unwrap();
+        assert_ne!(declared.boundary_digest(), kept.boundary_digest());
+    }
+
+    #[test]
+    fn execution_description_is_validated_at_config_time() {
+        let mut config = Config::embedded().unwrap();
+        config.execution.profile = crate::execution::ExecutionProfile::Remote;
+        config.execution.description = Some(
+            "bad
+control"
+                .into(),
+        );
+        let error = config.validate().expect_err("control characters refused");
+        assert!(
+            error.to_string().contains("execution.description"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn contract_carries_the_execution_declaration() {
+        use crate::goal::GoalContract;
+        let mut config = Config::embedded().unwrap();
+        config.execution.profile = crate::execution::ExecutionProfile::Container;
+        config.execution.description = Some("docker:ubuntu-24.04".into());
+        let contract = GoalContract::from_config("c5", &config).unwrap();
+        assert_eq!(
+            contract.execution().profile,
+            crate::execution::ExecutionProfile::Container
+        );
+        // The contract digest carries the declaration.
+        let mut undeclared_config = config.clone();
+        undeclared_config.execution = crate::execution::ExecutionSection::default();
+        let undeclared = GoalContract::from_config("c5", &undeclared_config).unwrap();
+        assert_ne!(contract.digest(), undeclared.digest());
+    }
+
+    #[test]
+    fn unnamed_provider_keeps_legacy_resolution() {
+        let config = Config::embedded().unwrap();
+        let resolved = config.resolve_provider().unwrap();
+        assert!(resolved.preset.is_none());
+        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+        assert_eq!(resolved.price_source, crate::registry::PriceSource::Absent);
+        assert!(resolved.capabilities.is_none());
     }
 
     #[test]

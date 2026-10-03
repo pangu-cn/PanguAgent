@@ -101,6 +101,8 @@ pub enum StreamKind {
     RollbackFailed,
     FailedPathRecorded,
     ContextAssembled,
+    /// F4: plan -> act phase transition (the `begin_act` control call).
+    PhaseChanged,
 }
 
 impl StreamKind {
@@ -155,6 +157,7 @@ impl StreamKind {
             Self::RollbackFailed,
             Self::FailedPathRecorded,
             Self::ContextAssembled,
+            Self::PhaseChanged,
         ]
     }
 
@@ -189,6 +192,7 @@ impl StreamKind {
             EventKind::RollbackFailed => Self::RollbackFailed,
             EventKind::FailedPathRecorded => Self::FailedPathRecorded,
             EventKind::ContextAssembled => Self::ContextAssembled,
+            EventKind::PhaseChanged => Self::PhaseChanged,
         })
     }
 }
@@ -755,6 +759,7 @@ mod tests {
                 StreamKind::RollbackFailed => EventKind::RollbackFailed,
                 StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
                 StreamKind::ContextAssembled => EventKind::ContextAssembled,
+                StreamKind::PhaseChanged => EventKind::PhaseChanged,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -800,6 +805,7 @@ mod tests {
                     StreamKind::RollbackFailed => EventKind::RollbackFailed,
                     StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
                     StreamKind::ContextAssembled => EventKind::ContextAssembled,
+                    StreamKind::PhaseChanged => EventKind::PhaseChanged,
                 },
                 0,
                 "hello",

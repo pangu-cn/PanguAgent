@@ -979,7 +979,7 @@ impl ArtifactStore {
     /// Whether a summary index exists for this key.
     pub fn has_summaries(&self, key: &str) -> Result<bool> {
         validate_id("summary key", key)?;
-        Ok(path_exists_without_symlink(&self.summaries_path(key)?)?)
+        path_exists_without_symlink(&self.summaries_path(key)?)
     }
 
     fn summaries_path(&self, key: &str) -> Result<PathBuf> {
@@ -1022,7 +1022,7 @@ impl ArtifactStore {
 
     pub fn has_slices(&self, key: &str) -> Result<bool> {
         validate_id("slice key", key)?;
-        Ok(path_exists_without_symlink(&self.slices_path(key)?)?)
+        path_exists_without_symlink(&self.slices_path(key)?)
     }
 
     fn slices_path(&self, key: &str) -> Result<PathBuf> {

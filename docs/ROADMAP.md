@@ -30,7 +30,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - `pangu-core`：消息、事件、错误、Journal 和 replay；
 - `pangu-boundary`：L1 `GoalContract`、L2 `Policy`、L3 `Sandbox`、L4 `Approval`、预算；
 - `pangu-agent`：唯一的 provider/tool 回合编排和 `VerifiedAction` 入口；
-- `pangu-toolkit`：读文件、列目录、搜索、写文件、有限 HTTP GET、只读命令 allow-list、`finish`；
+- `pangu-toolkit`：读文件、列目录、搜索、写文件、有限 HTTP GET、只读命令 allow-list、只读 `git diff/status/log/show`、配置预声明验证命令（`verify`）、`finish`；
 - `pangu-provider`：OpenAI-compatible provider；
 - CLI：配置导出、`doctor`、`explain`、dry-run、demo、append-only JSONL Journal，以及 `events`、`conversation`、`session`、`artifact inspect` 只读入口与 `rollback`；
 - G1–G5：诚实、可审计、自主但不越界、成本有界、可嵌入。
@@ -392,7 +392,13 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - `Toolkit::manifest()` 与 `specs()` 一一对应，有测试锁定；后续插件/扩展注册的工具必须先声明进 manifest，模型无法绕过中心边界调用未声明能力。扩展侧注册入口留待 E1 统一落地。
 - [ ] **B2 技能注册表与签名包**：借鉴 Pi 的 Agent Skills、Hermes 的技能学习、DeepSeek Harness/OpenHands 的 skills/plugins 和 Cline 的 rules/skills，但默认只加载说明，脚本需显式批准。
 - [ ] **B3 受控记忆候选队列**：借鉴 Hermes 的学习闭环；模型只能提出记忆，用户/策略确认后写入，保留来源和撤销能力。
-- [ ] **B4 Provider Registry**：统一 OpenAI-compatible 之外的 provider 配置、能力探测、模型能力声明和成本表；借鉴 Pi、OpenHands、Cline 和 Aider 的多 provider/本地模型设计。
+- [x] **B4 Provider Registry（已做，配置/数据层）**：统一 OpenAI-compatible 之外的 provider 配置、能力探测、模型能力声明和成本表；借鉴 Pi、OpenHands、Cline 和 Aider 的多 provider/本地模型设计。
+  - `pangu-boundary::registry`：内置预设（openai / deepseek / ollama，schema `pangu-provider-registry/1`），携带 endpoint、key 变量、每模型能力（context window、输出上限、是否支持工具调用）与带 as-of 日期的价格表。**不新增 wire 协议**（BOUNDARY §5 非目标保持：Anthropic 等专用协议仍不实现）。
+  - 解析是纯函数（`Config::resolve_provider`），优先级：显式配置 > 具名预设 > 内置默认；**价格表只在 `model.provider` 显式命名时生效**——命名 provider 即操作者决定采用其数据；digest 语义不变（contract digest 已覆盖生效价格）。
+  - fail-closed 前移到配置期：未知 provider、keyed preset 缺 key 变量、不支持工具调用的模型、`budget.max_input_tokens` 超出 context window、请求输出上限超过模型能力，均在启动时拒绝；混合价格（只设一边）也从运行期失败提前到配置期（兼容性说明：唯一的行为收紧点，旧配置中半设价格本就不可用）。
+  - CLI：`pangu models list [--json]`（离线）；`pangu models probe [--json]`（对生效 endpoint 发一次有界 `GET /models`，操作者显式发起，非 2xx 只报状态不回显 body/key，客户端纪律与 `chat` 相同）。
+  - **诚实边界**：价格表会过期——`models list` 显示 as-of 日期，覆盖以显式配置为准；本地 provider（ollama）无内置价格，必须显式声明（G4 fail closed 保持）。
+  - **未包含（有意排除）**：Anthropic 等专用 wire 协议；在线价格抓取；自动 fallback 到其他 provider（归 B5）。
 - [ ] **B5 Provider fallback 策略**：只有兼容性、价格、健康状态和用户策略均允许时才 fallback；禁止静默切换到更宽权限模型。
 - [ ] **B6 本地部署 laya（用户可选）**：支持把 laya 作为本地决策服务/模型运行，用于 triage、gate、routing 等有界判断；默认关闭，由用户在配置或安装时显式开启。laya 不得成为 Pangu 核心启动依赖，不得直接创建 `VerifiedAction`、修改 Policy/预算/审批模式或执行工具；服务默认仅绑定 loopback，模型下载、远程 endpoint 和数据出站必须分别显式配置。
 
@@ -405,7 +411,12 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [ ] **C2 Gateway 渠道**：CLI 之外增加 Web/API 或消息渠道适配器；借鉴 Hermes、OpenHands automation 和 Cline connectors；所有渠道共用同一 run contract。
 - [ ] **C3 定时任务与持久任务**：借鉴 Hermes/OpenHands/Cline；每个任务独立 workspace、预算、审批策略、取消和过期时间。
 - [ ] **C4 远程 Runner**：借鉴 ZCode 的 SSH/WSL 思路、OpenHands Agent Server 和 Cline SDK/ACP；支持临时挂载、短时令牌、断线恢复和完整审计。
-- [ ] **C5 隔离执行配置**：借鉴 Pi 的容器/VM 思路、OpenHands 的 Docker/Kubernetes workspace 和 Cline 的 sandbox/data-dir；提供 local、container、remote profile，并明确每种 profile 的真实保护范围。
+- [x] **C5 隔离执行配置（已做，声明/审计层）**：借鉴 Pi 的容器/VM 思路、OpenHands 的 Docker/Kubernetes workspace 和 Cline 的 sandbox/data-dir；提供 local、container、remote profile，并明确每种 profile 的真实保护范围。
+  - `[execution]` 配置段：`profile = local|container|remote`（默认 local）+ 可选 `description`（审计描述，脱敏、限长 512 字节、拒绝控制字符）。
+  - 冻结与审计：声明冻结进 `GoalContract`（digest 仅在声明时携带，保持既有 digest 稳定）并记入 `RunStarted` 载荷（`execution_profile`/`execution_description`，未声明时缺席）；`doctor`/`explain` 引用固定话术 `ExecutionProfile::scope_statement` 陈述各 profile 的真实保护范围。
+  - **诚实边界（本特性的核心）**：声明不是验证事实——Pangu 不启动、不管理、不验证容器/VM/远程后端，从进程内部看它们与 local 无法区分；L1–L4 在所有 profile 下逐位相同；容器边界由部署者的容器运行时提供（BOUNDARY §5 非目标保持）。
+  - 部署者提醒已写入 BOUNDARY：Artifact store 存在于声明的后端内，container/remote 下 artifact_root 应位于持久化存储。
+  - **未包含（有意排除）**：容器/远程编排、镜像拉取、远程 runner（归 C4/R4）；任何把声明冒充隔离保证的行为。
 
 ### D. 多 Agent 和产物
 
@@ -430,8 +441,18 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [x] **F2 Git diff/undo 可选后端（已做，只读 git_diff 能力；undo 归 F7 rollback）**：借鉴 Aider 和 Cline，保存可审查的 diff、恢复点和 Git 辅助信息；它不是 Pangu checkpoint 的必需实现，默认不自动 commit，不跳过项目 hooks。
   - `git_diff` 工具（ReadOnly/ProcessRead/NoEffect）：argv 仅允许 `git diff|status|log|show` + 白名单 flag + 相对路径；沙箱执行、输出过限即失败；集成测试走完整 verified-action 链。
   - "undo" 不归此处：工作区恢复走 F7 的 `pangu rollback`（显式 capability + L4 审批 + failed-path 账本），F2 只提供可读 diff/状态，不替 checkpoint 承担恢复语义。
-- [ ] **F3 Lint/Test/Compile evidence loop**：借鉴 Aider、Cline 和 OpenHands，在编辑后运行受限验证命令，记录退出码、测试摘要和产物；失败不能自动改写为完成。
-- [ ] **F4 Plan/Act 与逐步审批**：借鉴 Cline 和 OpenHands 的计划/执行分离；Plan 阶段只读探索，Act 阶段逐项显示 diff、命令和影响范围。
+- [x] **F3 Lint/Test/Compile evidence loop（已做，工具层）**：借鉴 Aider、Cline 和 OpenHands，在编辑后运行受限验证命令，记录退出码、测试摘要和产物；失败不能自动改写为完成。
+  - `verify` 工具：只执行 `[verify] command` 配置的**整条 argv**——模型无参数可控制（任何键即拒绝），空配置 = 工具不广告；程序名必须在只读 argv 白名单（内置或 `boundary.extra_readonly_commands`）上，flag 走同一 SAFE 列表；`Config::validate` 在启动时 fail-closed 校验不可运行的命令。
+  - 冻结与绑定：命令冻结进 `GoalContract.verify_command` 并进 contract digest；`Agent::new` 拒绝 toolkit 广告与 contract 不一致的 executor；Sandbox 的 `extra_readonly_commands` 同样进 contract 并参与 `validate_against` 比较。
+  - 风险与审批：`needs_human`——每次运行验证命令都需 L4 人工批准（W-38：验证命令会执行项目代码）。成功产生 `verify:` evidence；失败回灌退出码与输出、不产生 evidence，`complete` 因此被拒（I-Honest-Terminal）。
+  - **诚实边界**：`extra_readonly_commands` 是操作者对被声明程序副作用的断言，Pangu 不验证其真实副作用；验证命令的外部效果（如依赖下载）不进 effect ledger、不被 rollback 处理。
+  - **未包含（有意排除）**：结构化测试摘要解析（输出原样回灌）；产物收集；编辑后自动触发（何时调用 verify 由模型自主决定，每次仍需人工批准）；并行验证。
+- [x] **F4 Plan/Act 与逐步审批（已做）**：借鉴 Cline 和 OpenHands 的计划/执行分离；Plan 阶段只读探索，Act 阶段逐项显示 diff、命令和影响范围。
+  - `goal.plan_first = true`（默认 false）：运行从只读 plan 阶段开始；风险高于 `read_only` 的动作在任何闸门前拒绝并回灌指向 `begin_act` 的错误；只读工具不受影响，纯只读目标可以在 plan 阶段内 `complete`。
+  - `begin_act` 是 agent 拥有的控制调用（同 `finish` 类，不经过 assess/闸门，不执行任何动作）：仅 plan_first 运行广告；发 `PhaseChanged` 事件（pangu-stream/1 新 kind，provisional，沿用 F7 先例）；重入被拒；act 阶段每个变更动作仍逐项走 L1-L4。
+  - 逐项展示：`write_file` 审批请求携带有界（8 KiB）、脱敏的 unified diff（`pangu-core::diff::unified_diff`，确定性 LCS + 上下文行，超界时明确说明而非静默截断/伪造）；命令与网络/读写范围展示沿用 A3 的 `ApprovalImpact`。diff 无法内联时（非 UTF-8、过大、不可读）说明原因，不伪造 "new file"。
+  - 兼容性：`plan_first`/`diffs` 均为新增可选字段；digest 仅在 plan_first 启用时携带该键，默认运行 digest 不变；事件流新增 provisional kind 属契约"只增"演进。
+  - **未包含（有意排除）**：人工切换相位的 UI 开关（模型提名过渡 + 逐项人工审批已满足边界；纯 UI 交互归 C1）；多相位计划文档与计划持久化；`--plan-only` 旗标（用 plan_first + `Never` 审批模式即可达到只读运行）。
 - [ ] **F5 Issue-to-patch 评测 profile**：借鉴 SWE-agent，把 issue、仓库版本、测试、patch、trajectory 和成本固定为可复现实验；benchmark 分数不替代验收。
 - [ ] **F6 控制平面与 backend/automation profile**：借鉴 OpenHands Agent Canvas，支持本地、Docker、VM、远程 backend 和计划/webhook 任务；每个 backend 和任务都独立认证、限额、幂等和审计。
 - [x] **F7 Pangu Artifact 检查点与受限回退（需求已确认；ADR 已批准；阶段二实现已存在；默认关闭、实验性 opt-in、未正式激活）**：已实现成功 VerifiedAction 后的工作区快照、稳定事件指针、session node、operation ledger、typed rollback、failed-path/effect ledger、Journal v2 receipt 和 CLI 子命令；回退只恢复文件系统/会话状态，不回退外部副作用；默认不自动 commit。详细实现边界见 [`docs/adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md) 和 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)。当前不得把它描述为默认支持。
@@ -455,10 +476,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、F1、F2
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B4、C5、F1、F2、F3、F4
         （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
-第一批剩余：B4、C5
-代码场景可选：F3、F4
 第二批：B2、B3、D3、D4、F5
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3

@@ -37,7 +37,7 @@ GoalContract (L1)
 
 ### L1 — GoalContract（一次 run 的不可变意图）
 
-Agent 启动时从已校验的 `Config` 构造并冻结 `GoalContract`：目标文本、canonical workspace、readable/writable roots、forbidden globs、预算、审批模式、网络/环境 allow-list、工具和子进程限制、evidence 要求，以及与 Policy 规则集绑定的 digest。模型不能修改这些字段；本版本没有 `update_plan` 或动态放宽边界的工具。
+Agent 启动时从已校验的 `Config` 构造并冻结 `GoalContract`：目标文本、canonical workspace、readable/writable roots、forbidden globs、预算、审批模式、网络/环境 allow-list、工具和子进程限制、F3 验证命令与扩展只读白名单、F4 plan/act 阶段纪律、evidence 要求，以及与 Policy 规则集绑定的 digest。模型不能修改这些字段；本版本没有 `update_plan` 或动态放宽边界的工具。
 
 Contract 与 Sandbox 的有效字段及 readable/writable roots 的有效顺序必须在构造时一致。配置中的相对 roots 以有效 workspace 为基准；路径、symlink、glob、网络、argv 和环境配置在构造时验证。`Config::boundary_digest()` 描述有效配置边界；`GoalContract::digest()` 描述一次运行的 contract，并额外绑定 policy digest 与价格。Agent 启动时用后者校验传入的 Policy/Sandbox，并拒绝 approval handler mode 不匹配的注入。
 
@@ -55,7 +55,7 @@ Contract 与 Sandbox 的有效字段及 readable/writable roots 的有效顺序�
 ### L3 — Sandbox（资源硬限制）
 
 - **路径**：相对路径以 workspace 为基准；读路径必须存在并落在 `readable_roots`（workspace 必须包含在其中），写路径必须落在 workspace 内的 `writable_roots`。canonical path、symlink component、`..`、NUL、UNC 和越界路径均拒绝。禁止 glob 对绝对和 relative 路径都生效。
-- **进程**：不经过 shell；argv 总长度、可执行程序、flag 和路径参数受限；child stdin 关闭、环境按 allow-list 清洗、超时 kill、stdout/stderr 有界读取。当前工具只提供只读命令 allow-list。
+- **进程**：不经过 shell；argv 总长度、可执行程序、flag 和路径参数受限；child stdin 关闭、环境按 allow-list 清洗、超时 kill、stdout/stderr 有界读取。工具不提供通用 shell：`run_command`/`git_diff` 只允许只读命令 allow-list；`verify` 只运行 `[verify] command` 在启动时冻结进 contract 的**整条命令**——其程序名必须在同一只读白名单（内置或 `extra_readonly_commands`）上，模型不能增改参数，每次调用都需 L4 人工批准。`extra_readonly_commands` 是操作者对被声明程序副作用的断言，不放宽路径/flag/host 检查，也不构成 Pangu 对其外部副作用的追踪。
 - **网络**：仅 HTTP/HTTPS；主机必须在显式 allow-list；默认拒绝 localhost、私网、链路本地、组播和 `169.254.169.254` metadata；禁止 URL credentials、fragment、零端口、敏感 query 参数和重定向。审批 preview 移除 query/fragment，并以 path 的 SHA-256 摘要代替直接展示路径。
 - **凭据**：含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD`、`PASSWD`、`AUTH` 或 `CREDENTIAL` 的环境键不能进入 child env；事件字段、payload、错误和 provider 错误在边界处脱敏。
 - **资源**：每 action 的 path 数、写入字节、工具输出、搜索结果、argv、子进程输出和墙钟都有上限；provider 的 cache-read token 计入输入预算，cache-read 费用按输入价计算。Agent 在 provider/tool phase 边界以及每个 tool call 前检查预算和墙钟；内置 provider、approval handler 和 toolkit 适配器各自实施超时。任意外部注入的 trusted adapter 以及同步 OS DNS 解析不会被 Agent 强制抢占，宿主必须为它们提供可中断的超时适配器。
@@ -84,6 +84,24 @@ checkpoint/rollback 只有在 `GoalContract.checkpoint.enabled = true`、Artifac
 这里的 `evaluate_internal` 只用于不可由模型命名的固定 checkpoint capability：正常 deny 仍优先，匹配的 allow/ask 仍生效；没有匹配规则时，checkpoint 由 L1 显式开关授权。外部 mutation 仍始终要求 L4，rollback 也始终要求 L4。`Never`、NoAnswer、超时和未批准均失败关闭。
 
 rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型不能提交裸路径或自然语言来恢复。它只处理已验证 workspace roots 和 session ledger，不执行外部补偿、Git、网络、子进程或连接器。checkpoint 之后有外部 mutation、workspace CAS 漂移、损坏 Artifact、stale transaction lock 或不完整 transition binding 时拒绝继续。
+
+### Plan/Act 阶段纪律（F4）
+
+`goal.plan_first = true` 时，运行从只读 plan 阶段开始：
+
+- plan 阶段中，风险高于 `read_only` 的动作在任何闸门前被拒绝，并回灌指向 `begin_act` 的错误信息；只读探索（`read_file`/`list_dir`/`search`/`git_diff`）不受影响。
+- `begin_act` 是 agent 拥有的控制调用（与 `finish` 同类）：不执行任何动作、不过任何闸门、只结束只读阶段并发 `PhaseChanged` 事件。它不是授权——act 阶段的每个变更动作仍逐项经过 L1–L4。
+- 阶段规则冻结进 `GoalContract`（digest 仅在启用时携带，保持既有 digest 稳定）；模型不能更改、不能重入、不能以重试绕过。
+- `write_file` 的审批请求携带有界、脱敏的 unified diff；无法内联时明确说明原因（非 UTF-8、过大、不可读），不伪造 diff。
+
+### 执行后端声明（C5）
+
+`[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
+
+- **声明不是验证**。Pangu 不启动、不管理、不验证容器、VM 或远程后端；从进程内部看它们与 local 无法区分。声明只进入 contract（digest 仅在声明时携带）、`RunStarted` 审计载荷和 `doctor`/`explain` 输出。
+- **声明不改变任何闸门**。L1–L4 在所有 profile 下逐位相同；容器/VM 边界由部署者的运行时提供，网络与凭据隔离由部署者负责——这不是 Pangu 提供的保证（见第 5 节非目标）。
+- 各 profile 的真实保护范围由 `doctor`/`explain` 引用固定话术陈述（见 `ExecutionProfile::scope_statement`）；修改话术与修改代码同等对待。
+- 提醒部署者：checkpoint 的 Artifact store 存在于声明的后端内；container/remote profile 下应确保 artifact_root 位于持久化存储，否则后端被替换时恢复点随之丢失。
 
 阶段二实现和测试已经存在，但在正式激活/支持声明前，本节和第 4.1 节是条件性实验规范；部署者仍须遵守第 4.1 节的 operator recovery 限制。
 
@@ -130,6 +148,10 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 19. **I-No-Implicit-Git-Commit**：默认 backend 是 Pangu Artifact，不得隐式创建或修改 Git commit、branch、tag、stash 或 index。
 
 阶段二实现还保留以下恢复限制：`.rollback-operation.lock` 崩溃遗留时必须人工检查，不自动猜测；Windows 原子替换的 hand-off 临时文件需 operator 核验；不持有 Artifact lock 的并发 workspace writer 依赖最终 digest/CAS 检测，不能宣称 OS 级隔离。事故处理顺序和证据清单见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
+
+### 4.2 条件性不变量（非默认运行行为）
+
+20. **I-Plan-Phase-Read-Only**：仅当 `goal.plan_first = true` 时生效。运行开始于只读 plan 阶段；风险高于 `read_only` 的动作在任何闸门前被拒绝并回灌；进入 act 阶段的唯一途径是 `begin_act` 控制调用——它不执行任何动作、不是授权，act 阶段的每个变更动作仍逐项经过 L1–L4。阶段规则冻结进 contract，模型不能更改、重入或以重试绕过。
 
 ## 5. 非目标
 

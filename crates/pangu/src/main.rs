@@ -125,6 +125,12 @@ enum Commands {
         #[command(subcommand)]
         action: ArtifactCommands,
     },
+    /// B4 provider registry and endpoint diagnostics. `list` is offline;
+    /// `probe` makes one bounded GET to the configured provider endpoint.
+    Models {
+        #[command(subcommand)]
+        action: ModelsCommands,
+    },
     /// Read-only repository map (F1). Nothing here reads file contents
     /// beyond the declared surface or writes anything.
     Repo {
@@ -167,6 +173,22 @@ impl From<RiskArg> for Risk {
             RiskArg::NeedsHuman => Self::NeedsHuman,
         }
     }
+}
+
+/// B4: provider registry and endpoint diagnostics.
+#[derive(Clone, Debug, Subcommand)]
+enum ModelsCommands {
+    /// List built-in provider presets, models, and price tables (offline).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make one bounded GET `<base_url>/models` to the configured provider
+    /// endpoint. Operator-initiated diagnostics; never model-driven.
+    Probe {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -335,6 +357,10 @@ async fn main() -> Result<()> {
         },
         Some(Commands::Artifact { action }) => match action {
             ArtifactCommands::Inspect { root, json } => artifact_inspect(&root, json),
+        },
+        Some(Commands::Models { action }) => match action {
+            ModelsCommands::List { json } => models_list(json),
+            ModelsCommands::Probe { json } => models_probe(&args, json).await,
         },
         None if args.demo => demo(&args).await,
         None => {
@@ -737,6 +763,86 @@ fn conversation_export(
     Ok(())
 }
 
+/// B4: offline listing of the built-in provider registry. Read-only; makes no
+/// network request and prints each price table's as-of date.
+fn models_list(json: bool) -> Result<()> {
+    use pangu_boundary::{presets, REGISTRY_VERSION};
+    if json {
+        let value = serde_json::json!({
+            "schema": REGISTRY_VERSION,
+            "providers": presets(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    println!("provider registry {}:", REGISTRY_VERSION);
+    for preset in presets() {
+        println!(
+            "\n{}  {}  key_env={}  prices as of {}",
+            preset.name,
+            preset.base_url,
+            preset.api_key_env.unwrap_or("(none)"),
+            preset.prices_as_of,
+        );
+        if preset.models.is_empty() {
+            println!("  (no built-in models; declare prices explicitly in config)");
+            continue;
+        }
+        for model in preset.models {
+            println!(
+                "  {:<22} context {:>9}  max out {:>7}  tools {:>3}  ${:.2} in / ${:.2} out per MTok",
+                model.name,
+                model.context_window_tokens,
+                model.max_output_tokens,
+                if model.supports_tools { "yes" } else { "no" },
+                model.input_usd_per_mtok,
+                model.output_usd_per_mtok,
+            );
+        }
+    }
+    println!(
+        "\nprice tables go stale; verify against the provider before relying, \
+         and override model.input_usd_per_mtok / model.output_usd_per_mtok when they differ"
+    );
+    Ok(())
+}
+
+/// B4: one bounded capability probe against the effective provider endpoint.
+async fn models_probe(args: &Cli, json: bool) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let resolved = config.resolve_provider()?;
+    let api_key = match &resolved.api_key_env {
+        Some(name) => Some(
+            std::env::var(name)
+                .map_err(|_| anyhow::anyhow!("API key environment variable `{name}` is not set"))?,
+        ),
+        None => None,
+    };
+    let timeout = config.model.request_timeout_secs.unwrap_or(60);
+    let models =
+        pangu_provider::probe_models(&resolved.base_url, api_key.as_deref(), timeout).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "endpoint": resolved.base_url,
+                "count": models.len(),
+                "models": models,
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "endpoint {} offers {} model(s):",
+        resolved.base_url,
+        models.len()
+    );
+    for model in &models {
+        println!("  {model}");
+    }
+    Ok(())
+}
+
 fn repo_map(root: Option<PathBuf>, budget: u64, json: bool) -> Result<()> {
     let root = root.unwrap_or_else(|| PathBuf::from("."));
     let map = pangu_core::build_repomap(&root, pangu_core::RepoMapOptions::default())
@@ -963,7 +1069,7 @@ async fn rollback_command(
         Arc::new(DemoProvider {
             calls: AtomicUsize::new(0),
         }),
-        Arc::new(Toolkit::new()),
+        Arc::new(Toolkit::with_verify_command(config.verify.command.clone())),
         approval,
         sink,
     )?;
@@ -1024,33 +1130,23 @@ async fn demo(args: &Cli) -> Result<()> {
 }
 
 fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
-    let model = config
-        .model
+    // B4: one resolution path for endpoint, key variable, and prices. The
+    // registry only fills what the operator did not set explicitly.
+    let resolved = config.resolve_provider()?;
+    let model = resolved
         .model
         .clone()
         .ok_or_else(|| anyhow::anyhow!("model.model is required for a live run"))?;
-    if config.model.input_usd_per_mtok.is_none() || config.model.output_usd_per_mtok.is_none() {
-        bail!("model.input_usd_per_mtok and model.output_usd_per_mtok are required for a live run");
+    if resolved.input_usd_per_mtok.is_none() || resolved.output_usd_per_mtok.is_none() {
+        bail!(
+            "model input/output prices are required for a live run; set model.input_usd_per_mtok \
+             and model.output_usd_per_mtok, or use model.provider with a known model (see `pangu models list`)"
+        );
     }
-    let default_url = if config.model.protocol.as_deref() == Some("ollama") {
-        "http://localhost:11434/v1"
-    } else {
-        "https://api.openai.com/v1"
-    };
-    let base_url = config
-        .model
-        .base_url
-        .clone()
-        .unwrap_or_else(|| default_url.to_string());
-    let api_key_env = if config.model.protocol.as_deref() == Some("ollama") {
-        None
-    } else {
-        config.model.api_key_env.as_deref()
-    };
     let provider = OpenAiCompatibleProvider::from_env(
         model,
-        base_url,
-        api_key_env,
+        resolved.base_url,
+        resolved.api_key_env.as_deref(),
         config.model.temperature,
         config.model.max_output_tokens,
         config.model.request_timeout_secs.unwrap_or(60),
@@ -1097,7 +1193,7 @@ async fn execute_goal(
         policy,
         sandbox,
         provider,
-        Arc::new(Toolkit::new()),
+        Arc::new(Toolkit::with_verify_command(config.verify.command.clone())),
         approval,
         sink,
     )?;

@@ -29,6 +29,7 @@ operator 在整个恢复过程中必须遵守以下规则：
 4. Artifact root、workspace 和 `.pangu` 目录的只读副本或校验记录。
 5. 所有相关进程是否已停止，以及停止时间的时区记录。
 6. operator、审批人、变更单号和回滚原因。
+7. 当时的执行后端声明（`RunStarted` 载荷的 `execution_profile`/`execution_description`，见 BOUNDARY §3 C5；缺省即未声明/local）。
 
 只有在明确这些资料后，才进入下面的 incident 分支。不要为了“试一下”而先运行一次新的 rollback。
 
