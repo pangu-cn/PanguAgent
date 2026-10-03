@@ -17,6 +17,7 @@ pub mod journal;
 pub mod json;
 pub mod messages;
 pub mod replay;
+pub mod repomap;
 pub mod session;
 pub mod slice;
 pub mod stream;
@@ -58,6 +59,10 @@ pub use inspect::{
 };
 pub use journal::{ConsoleSink, Journal};
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
+pub use repomap::{
+    build as build_repomap, fingerprint as repomap_fingerprint, view as repomap_view, FileEntry,
+    MapView, RepoMap, RepoMapOptions, Symbol,
+};
 pub use slice::{
     extend as extend_slices, slice, verify as verify_slices, ConversationSlices, SliceEntry,
     SliceKind, SLICE_SCHEMA_VERSION,

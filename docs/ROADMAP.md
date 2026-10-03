@@ -425,7 +425,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 这些候选直接吸收 OpenHands、SWE-agent、Aider 和 Cline 的代码工作流优势；它们仍然必须服从 Pangu 的中心边界，不代表默认开放任意 shell 或自动提交。
 
-- [ ] **F1 Repo Map / 代码库地图**：借鉴 Aider，生成可解释的文件、符号、依赖图和 token budget；默认只读，显示来源、时效和发送给模型的上下文。
+- [x] **F1 Repo Map / 代码库地图（已做）**：借鉴 Aider，生成可解释的文件、符号、依赖图和 token budget；默认只读，显示来源、时效和发送给模型的上下文。
+  - `pangu-core::repomap`：`build(root)` 确定性扫描（忽略 .git/target 等，不跟随 symlink、不写盘），Rust/Python/JS/TS/Go 符号抽取，`use crate::`/`mod` 内部边，`view(map, budget_tokens)` 预算视图（超预算文件进入 `omitted_files`，视图永不静默丢信息），`fingerprint` 供staleness 检测。CLI `pangu repo map`。
 - [ ] **F2 Git diff/undo 可选后端**：借鉴 Aider 和 Cline，保存可审查的 diff、恢复点和 Git 辅助信息；它不是 Pangu checkpoint 的必需实现，默认不自动 commit，不跳过项目 hooks。
 - [ ] **F3 Lint/Test/Compile evidence loop**：借鉴 Aider、Cline 和 OpenHands，在编辑后运行受限验证命令，记录退出码、测试摘要和产物；失败不能自动改写为完成。
 - [ ] **F4 Plan/Act 与逐步审批**：借鉴 Cline 和 OpenHands 的计划/执行分离；Plan 阶段只读探索，Act 阶段逐项显示 diff、命令和影响范围。

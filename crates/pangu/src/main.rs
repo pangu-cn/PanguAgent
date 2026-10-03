@@ -125,6 +125,27 @@ enum Commands {
         #[command(subcommand)]
         action: ArtifactCommands,
     },
+    /// Read-only repository map (F1). Nothing here reads file contents
+    /// beyond the declared surface or writes anything.
+    Repo {
+        #[command(subcommand)]
+        action: RepoCommands,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum RepoCommands {
+    /// Build the repo map and print a token-budgeted view.
+    Map {
+        /// Root to scan. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Token budget for the printed view (approximate).
+        #[arg(long, default_value = "2000")]
+        budget: u64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Risk classes accepted on the command line. Kept separate from the boundary
@@ -308,6 +329,9 @@ async fn main() -> Result<()> {
         Some(Commands::Events { action }) => match action {
             EventsCommands::Read { path, json, kind } => events_read(&path, kind, json),
             EventsCommands::Contract { json } => events_contract(json),
+        },
+        Some(Commands::Repo { action }) => match action {
+            RepoCommands::Map { root, budget, json } => repo_map(root, budget, json),
         },
         Some(Commands::Artifact { action }) => match action {
             ArtifactCommands::Inspect { root, json } => artifact_inspect(&root, json),
@@ -709,6 +733,45 @@ fn conversation_export(
             report.large_objects,
             if strict { ", strict mode" } else { "" }
         );
+    }
+    Ok(())
+}
+
+fn repo_map(root: Option<PathBuf>, budget: u64, json: bool) -> Result<()> {
+    let root = root.unwrap_or_else(|| PathBuf::from("."));
+    let map = pangu_core::build_repomap(&root, pangu_core::RepoMapOptions::default())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let view = pangu_core::repomap_view(&map, budget);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "fingerprint": pangu_core::repomap_fingerprint(&map),
+                "files": map.files.len(),
+                "edges": map.edges.len(),
+                "skipped": map.skipped,
+                "view": view,
+            }))?
+        );
+    } else {
+        println!(
+            "# repo map  root={}  files={}  edges={}  fingerprint={}",
+            map.root,
+            map.files.len(),
+            map.edges.len(),
+            &pangu_core::repomap_fingerprint(&map)[..16]
+        );
+        if !map.skipped.is_empty() {
+            println!("# skipped: {} entries)", map.skipped.len());
+        }
+        print!("{}", view.text);
+        if view.truncated {
+            println!(
+                "# … {} file(s) omitted by the {}-token budget",
+                view.omitted_files.len(),
+                budget
+            );
+        }
     }
     Ok(())
 }
