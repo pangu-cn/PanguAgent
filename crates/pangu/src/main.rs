@@ -173,6 +173,23 @@ enum ConversationCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Export a conversation transcript after a privacy pre-scan. The
+    /// output is a derived, never-authoritative projection.
+    Export {
+        /// Snapshot id. Defaults to the most recent.
+        #[arg(long)]
+        id: Option<String>,
+        /// Destination file for the JSONL transcript. Required.
+        #[arg(long)]
+        out: PathBuf,
+        /// Refuse the export outright when a secret-shaped field is found,
+        /// instead of masking it.
+        #[arg(long)]
+        strict: bool,
+        /// Print the privacy report as JSON instead of the transcript path.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Read-only navigation over the session node ledger (A1-3). Nothing here
@@ -275,6 +292,12 @@ async fn main() -> Result<()> {
         Some(Commands::Conversation { action }) => match action {
             ConversationCommands::List => conversation_list(&args),
             ConversationCommands::Show { id, json } => conversation_show(&args, id, json),
+            ConversationCommands::Export {
+                id,
+                out,
+                strict,
+                json,
+            } => conversation_export(&args, id, out, strict, json),
         },
         Some(Commands::Session { action }) => match action {
             SessionCommands::Tree { json } => session_tree(&args, json),
@@ -630,6 +653,62 @@ authoritative: false",
                 record.compacted_from_digest, record.dropped_messages, record.kept_messages
             );
         }
+    }
+    Ok(())
+}
+
+fn conversation_export(
+    args: &Cli,
+    id: Option<String>,
+    out: PathBuf,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
+    let Some(store) = conversation_store(args)? else {
+        return Err(anyhow::anyhow!(
+            "conversation persistence is disabled; enable `conversation.enabled`"
+        ));
+    };
+    let snapshot = match id {
+        Some(id) => store.load(&id).map_err(|e| anyhow::anyhow!(e))?,
+        None => store
+            .latest()
+            .map_err(|e| anyhow::anyhow!(e))?
+            .ok_or_else(|| anyhow::anyhow!("no stored conversation to export"))?,
+    };
+    let policy = if strict {
+        pangu_core::ExportPolicy::Strict
+    } else {
+        pangu_core::ExportPolicy::Sanitize
+    };
+    let exported =
+        pangu_core::export_snapshot(&snapshot, policy).map_err(|e| anyhow::anyhow!(e))?;
+    std::fs::write(&out, &exported.transcript)
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", out.display()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "out": out,
+                "bytes": exported.transcript.len(),
+                "report": exported.report,
+            }))?
+        );
+    } else {
+        let report = &exported.report;
+        println!(
+            "exported {} message(s) to {} ({} bytes)",
+            snapshot.messages.len(),
+            out.display(),
+            exported.transcript.len()
+        );
+        println!(
+            "privacy: {} secret(s), {} absolute path(s), {} large object(s) masked/truncated{}",
+            report.secrets,
+            report.absolute_paths,
+            report.large_objects,
+            if strict { ", strict mode" } else { "" }
+        );
     }
     Ok(())
 }

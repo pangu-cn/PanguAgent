@@ -354,7 +354,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - 已有：`pangu doctor`（配置摘要 + digest + Journal 统计）、`pangu config`、`Config::explain()`。
   - 已完成（ADR-0002）：`pangu explain` 投影 `Policy → Sandbox → Approval` 三层，逐条规则报出 `decided` / `matched_but_refused` / `shadowed` / `no_match` / `not_reached`，并做遮蔽（死规则）分析。报告固定带 `advisory: true` / `authoritative: false`，不提供到 `Effect` 的转换，因此不可能被当作授权。
   - **未包含（有意排除）**：预算耗尽点预测、从 Journal 解释历史判定（依赖 A2 的稳定事件契约）、规则修改建议。
-- [ ] **A5 会话导出与隐私检查**：导出前扫描 secret、绝对路径、命令输出和大对象；借鉴 Pi session export、SWE-agent trajectory 和 Cline history。
+- [x] **A5 会话导出与隐私检查（已做）**：借鉴 Pi session export、SWE-agent trajectory 和 Cline history。
+  - `pangu conversation export --out <path> [--strict]`：导出前重扫 secret 标记、含用户名的绝对路径、超 64KiB 大对象（典型命令输出）；Sanitize 模式掩码/截断并出报告，Strict 模式直接拒绝。
+  - 输出为 JSONL 派生投影（`derived: true, authoritative: false`），只可读不可回灌；`pangu-export/1` schema。
 - [ ] **A6 无限上下文（切片、组装与写回）**：会话历史本地全量留存、不受模型上下文窗口限制；按需切片，只把当前需要的部分传上去，返回的内容再并回总上下文。详见 [`docs/adr/0005-context-assembly.md`](docs/adr/0005-context-assembly.md)。
   - **动机（仓库里的真实痛点）**：现在不是裁剪，是终止。`crates/pangu-agent/src/lib.rs` 的三处独立检查点（`Breach::InputTokens`）一旦 `estimated_input >= max_input_tokens` 就把 `terminal` 置为 `BudgetExhausted` 并 `break`，默认阈值 200,000。长任务今天只有两种结局：塞得下，或者死。
   - **与 A1 的关系(重要)**:这是 A1 路线的**分叉**,不是叠加。A1b 路线是"全量 + 显式压缩"= 有损但连续(压缩后原文没了,只留 `compacted_from_digest` 指针);A6 是"全量留存 + 按需切片"= 无损但非连续。两者不能同时是默认。A6 定为**主路线**（2026-10-03 已确认），`ConversationSnapshot::compacted()` 降级为“某个切片摘要的一种降级模式”而非会话级一次性压缩。

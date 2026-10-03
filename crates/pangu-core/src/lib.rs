@@ -4,12 +4,13 @@
 //! runtime, provider, and toolkit layers. Policy decisions belong in
 //! `pangu-boundary`; this crate does not decide whether an action is allowed.
 
-pub mod assemble;
 pub mod artifact;
+pub mod assemble;
 pub mod checkpoint;
 pub mod conversation;
 pub mod error;
 pub mod events;
+pub mod export;
 pub mod glob;
 pub mod inspect;
 pub mod journal;
@@ -22,14 +23,14 @@ pub mod stream;
 pub mod summary;
 pub mod util;
 
-pub use assemble::{
-    assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,
-    DegradeMode, Omission, SecondStageSelector, Seam, SelectionReason, SliceSelection,
-};
 pub use artifact::{
     ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
     RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,
     FAILED_PATH_LEDGER_FILE, ROLLBACK_OPERATION_SCHEMA_VERSION,
+};
+pub use assemble::{
+    assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,
+    DegradeMode, Omission, Seam, SecondStageSelector, SelectionReason, SliceSelection,
 };
 pub use checkpoint::{
     ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
@@ -44,6 +45,10 @@ pub use error::{Error, Result};
 pub use events::{
     redact_event, redact_text, redact_value, Event, EventKind, EventSink, JournalMeta, MemSink,
     NullSink, Price, TeeSink, Usage, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
+};
+pub use export::{
+    export_snapshot, ExportPolicy, Exported, Finding, FindingKind, PrivacyReport,
+    LARGE_OBJECT_BYTES,
 };
 pub use glob::Glob;
 pub use inspect::{
