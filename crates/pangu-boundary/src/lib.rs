@@ -11,8 +11,8 @@ pub mod risk;
 pub mod sandbox;
 
 pub use approval::{
-    ApprovalHandler, ApprovalMode, ApprovalRequest, ApprovalResponse, ScriptedApproval,
-    StdinApproval, Unattended,
+    ApprovalHandler, ApprovalImpact, ApprovalMode, ApprovalRequest, ApprovalResponse,
+    ScriptedApproval, StdinApproval, Unattended,
 };
 pub use budget::{Breach, Budget};
 pub use config::{

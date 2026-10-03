@@ -347,7 +347,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - 三个版本概念各管各的：Journal 磁盘格式（内部可演进）/ 事件流契约（**只增不改**，改则发 `/2`）/ 单条 kind 的冻结状态（`stable` vs `provisional`）。
   - 安全边界：事件流**不带自己的哈希链**，天然无法自证；每条记录固定 `derived: true` / `authoritative: false`，`validate()` 拒绝声称权威的记录；未知/未来 schema 硬失败不猜；损坏行整体失败不返回前缀；脱敏与 Journal 同一套。
   - **未包含（有意排除）**：实时推送（订阅式/gRPC/WebSocket）、写回 API、替代 Journal；F7 的 checkpoint/rollback kind 定为 `provisional` 而非 `stable`（F7 仍是实验性 opt-in，现在冻结等于对未定型行为做兼容承诺）。
-- [ ] **A3 审批与差异预览**：显示文件 diff、命令预览、网络目标摘要、预计风险和影响范围；借鉴 Pi 的交互扩展点和 Cline 的 Plan/Act、checkpoint/undo。
+- [x] **A3 审批与差异预览（已做，结构化 impact 先行；文件内容 diff 移列 F2）**：借鉴 Pi 的交互扩展点和 Cline 的 Plan/Act、checkpoint/undo。
+  - `ApprovalRequest` 新增 `impact: ApprovalImpact`（`command`/`network`/`reads`/`writes`/`cwd`，serde 默认空、向后兼容旧 journal 载荷）；审批提示按「影响范围」分组渲染命令预览、网络目标、读写路径清单。
+  - 文件内容的 unified diff 暂不提供——那依赖 F2 的 Git 可选后端；本期只保证读写**范围**可见。
 - [x] **A4 `doctor`/`explain`/策略模拟**：在不执行副作用的情况下解释配置、规则命中顺序、预算和预计阻塞点；扩展 Pangu 现有能力，并参考 OpenHands backend 状态检查。
   - 已有：`pangu doctor`（配置摘要 + digest + Journal 统计）、`pangu config`、`Config::explain()`。
   - 已完成（ADR-0002）：`pangu explain` 投影 `Policy → Sandbox → Approval` 三层，逐条规则报出 `decided` / `matched_but_refused` / `shadowed` / `no_match` / `not_reached`，并做遮蔽（死规则）分析。报告固定带 `advisory: true` / `authoritative: false`，不提供到 `Effect` 的转换，因此不可能被当作授权。

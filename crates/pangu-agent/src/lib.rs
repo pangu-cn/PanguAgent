@@ -744,6 +744,13 @@ impl Agent {
                 redact_text(&truncate_middle(&request.reason, 1024))
             ),
             args: approval_args(&args),
+            impact: pangu_boundary::ApprovalImpact {
+                writes: vec![format!(
+                    "checkpoint {} 恢复到 node {}",
+                    request.checkpoint_id, request.source_session_node_id
+                )],
+                ..Default::default()
+            },
         };
         self.emit(
             Event::new_v2(
@@ -1055,6 +1062,10 @@ impl Agent {
                 invariant: Some("I-Checkpoint-After-Verified-Action".into()),
                 preview: "create an internal workspace checkpoint".into(),
                 args: approval_args(&args),
+                impact: pangu_boundary::ApprovalImpact {
+                    writes: vec![self.contract.workspace().display().to_string()],
+                    ..Default::default()
+                },
             };
             self.emit(
                 Event::new_v2(
@@ -1762,11 +1773,11 @@ impl Agent {
         }
 
         let resource_request = ResourceRequest {
-            read_paths: assessment.read_paths,
-            write_paths: assessment.write_paths,
-            hosts: assessment.hosts,
-            argv: assessment.argv,
-            cwd: assessment.cwd,
+            read_paths: assessment.read_paths.clone(),
+            write_paths: assessment.write_paths.clone(),
+            hosts: assessment.hosts.clone(),
+            argv: assessment.argv.clone(),
+            cwd: assessment.cwd.clone(),
         };
         let resources = match self.sandbox.validate_resources(&resource_request) {
             Ok(resources) => resources,
@@ -1824,6 +1835,25 @@ impl Agent {
                 invariant: decision.invariant.clone(),
                 preview: truncate_middle(&redact_text(&assessment.preview), 16 * 1024),
                 args: approval_args(&call.args),
+                impact: pangu_boundary::ApprovalImpact {
+                    command: (!assessment.argv.is_empty())
+                        .then(|| truncate_middle(&redact_text(&assessment.argv.join(" ")), 4_096)),
+                    network: (!assessment.hosts.is_empty()).then(|| assessment.hosts.join(", ")),
+                    reads: resources
+                        .read_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                    writes: resources
+                        .write_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                    cwd: assessment
+                        .cwd
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                },
             };
             self.emit(
                 self.event(
