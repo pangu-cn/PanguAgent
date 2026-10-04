@@ -438,7 +438,12 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 ### D. 多 Agent 和产物
 
-- [ ] **D1 受限子 Agent**：借鉴 Hermes/WorkBuddy/DeepSeek Harness/OpenHands/Cline；子 Agent 只有父任务授予的 capability budget，不能扩大权限。
+- [x] **D1 受限子 Agent（已做）**：借鉴 Hermes/WorkBuddy/DeepSeek Harness/OpenHands/Cline；子 Agent 只有父任务授予的 capability budget，不能扩大权限。设计详见 [`docs/adr/0010-restricted-sub-agent.md`](adr/0010-restricted-sub-agent.md)。
+  - `[boundary] allow_delegation`（默认关，条件性 digest）启用 `delegate_task` 控制工具；子 contract 由 `GoalContract::derive_sub_contract` 从父 contract 派生——执行面字段全复制（sandbox/policy/审批/provider 链/网络/限额），run 作用域特性全剥离（memory/skills/deliverables/eval/checkpoint/委派本身）。
+  - 预算独立且可汇总（R4 完成门）：子预算钳到父级剩余（turns/cost/wall-clock），构造器拒绝任何加宽（纵深防御）；子花费 merge 进父级账本，每 turn 检查覆盖；委派失败 = 工具错误回灌，父 run 永不致命。
+  - 中央 Journal（子事件进同一 sink）+ `TaskDelegated` 事件（provisional，tag `⇒ sub  `，payload 只带 task digest 与钳制后子预算）+ 同一审批处理器；深度 1 结构性（子 contract `allow_delegation = false` + with_chain advertisement 校验双保险）。
+  - `pangu eval` 未动：委派与评测正交；子终态 + 脱敏汇总 + 统计作为工具结果回传。
+  - **未包含（有意排除）**：并行 DAG/多节点编排（D2）；跨 Agent 消息协议（父子通信 = task 文本 + 终态汇总）；按子任务收窄文件根（需要 sandbox 派生机制）；深度 > 1。
 - [ ] **D2 并行任务 DAG**：借鉴 OpenHands/Cline teams；每个节点独立预算、取消、超时、重试和终态，禁止无界 fan-out。
 - [x] **D3 Artifact + Evidence 管线（已做）**：借鉴 WorkBuddy 的产物导向、Aider 的 Git diff 和 Cline 的 checkpoint；支持报告、代码补丁、表格等结构化产物。与 D4 一并实现，设计详见 [`docs/adr/0008-deliverable-acceptance.md`](adr/0008-deliverable-acceptance.md)。
   - 交付物在目标里声明（`[[goal.deliverable]]`：name/path/kind/acceptor/min_bytes），冻结进 contract 并携带进 digest；产物文件本身经 write_file 与 L1–L4 产出，无新工具面。
@@ -506,7 +511,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D3、D4、F1、F2、F3、F4、F5
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D1、D3、D4、F1、F2、F3、F4、F5
         （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3

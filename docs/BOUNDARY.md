@@ -143,6 +143,15 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 - **没有 score 字段**：run 终态与证据计数是机器事实，不断言 issue 已修复；验收 = 测试证据（F3）+ 人工签收（D4），benchmark 分数不替代验收（W-31）。
 - 记录追加式、原子写、损坏硬错误；issue 文本是外部输入，goal 内标注来源与 digest（W-38）。
 
+### 受限子 Agent（D1）
+
+`[boundary] allow_delegation`（默认关）启用 `delegate_task` 控制工具。详见 [ADR-0010](adr/0010-restricted-sub-agent.md)。规则：
+
+- **子 contract 由运行时派生，模型只提供 task 文本与可选收窄**：子预算钳到父级剩余（turns/cost/wall-clock），构造器再拒绝任何加宽（纵深防御）——子 ⊆ 父在每条轴上由构造保证。
+- **子运行面复制父级**（同一 sandbox/policy/审批处理器/provider 链/中央 Journal），剥离 run 作用域特性（memory/skills/deliverables/eval/checkpoint/委派本身）；深度 1 是结构性的。
+- **花费聚合**：子的 token 与成本 merge 进父级账本，每 turn 预算检查覆盖子消耗；委派不能用来逃出父级预算。
+- 委派事件（`TaskDelegated`，provisional）只带 task digest 与钳制后的子预算；子终态与脱敏汇总作为工具结果回传，委派失败对父 run 永不致命。
+
 ### 执行后端声明（C5）
 
 `[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
@@ -206,6 +215,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 23. **I-Skill-Operator-Installed**：仅当 `[skills] enabled` 时生效。技能只能由操作者安装、校验、卸载；运行时逐文件 hash 校验，不匹配即拒载并 audible；脚本没有任何执行原语；技能内容标注无权限，不能单独或与任何输入组合构成 L1–L4 的豁免。
 24. **I-Deliverable-Evidence-Before-Complete**：仅当 goal 声明了交付物时生效。`complete` 必须通过每个交付物的运行时检查，检查失败回灌而非静默；交付快照（digest/时间/run）必须登记成功才算完成；人工签收只存在于 run 外，模型没有任何签收路径；`complete` 与 `accepted` 是两个不同的状态，不得混用。
 25. **I-Eval-Record-Not-Acceptance**：仅当 `[eval]` 已声明时生效。评测记录只含机器事实（终态、token、成本、证据计数、产物 digest），**没有 score 字段**，每条记录携带固定免责声明；记录中的状态不断言 issue 已修复；验收仍然只由 verify evidence 与人工签收构成；不声明 `[eval]` 时行为与 digest 完全不变。
+26. **I-Sub-Agent-Never-Wider**：仅当 `[boundary] allow_delegation` 已开启时生效。子 Agent 的 contract 由父 contract 派生，任何一维预算超过父级即拒绝；子的 sandbox/policy/审批面与父级相同，run 作用域特性全部剥离；子的事件进同一中央 Journal，花费聚合进父级账本；子不能再委派（深度 1，结构性）；委派事件只携带 task digest，不携带原文；关闭开关时行为与 digest 完全不变。
 
 ## 5. 非目标
 

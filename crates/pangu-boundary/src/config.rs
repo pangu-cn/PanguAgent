@@ -477,6 +477,12 @@ pub struct BoundarySection {
     /// program name; declaring one does not weaken path/host checks.
     #[serde(default)]
     pub extra_readonly_commands: Vec<String>,
+    /// D1: allow the model to delegate bounded subtasks to restricted
+    /// sub-agents. Default off keeps historical digests and runs unchanged;
+    /// a sub-agent's budget is always clamped to the parent's remaining
+    /// budget and its contract is derived, never model-supplied.
+    #[serde(default)]
+    pub allow_delegation: bool,
 }
 
 pub type BoundaryConfig = BoundarySection;
@@ -508,6 +514,7 @@ impl Default for BoundarySection {
             max_write_bytes: 4_194_304,
             max_paths_per_action: 64,
             extra_readonly_commands: Vec::new(),
+            allow_delegation: false,
         }
     }
 }
@@ -1397,6 +1404,14 @@ impl Config {
         } else {
             String::new()
         };
+        let delegation_line = if self.boundary.allow_delegation {
+            "delegation     : enabled - the model may delegate bounded subtasks; a sub-agent's \
+                  budget is clamped to the parent's remaining budget and its contract is \
+                  derived from the parent's (never wider)\n"
+                .to_string()
+        } else {
+            String::new()
+        };
         let eval_line = if self.eval.is_declared() {
             format!(
                 "eval           : profile `{}` — issue `{}`; records under .pangu/eval; scores never replace acceptance\n",
@@ -1416,7 +1431,7 @@ impl Config {
             String::new()
         };
         format!(
-            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{memory_line}{skills_line}{eval_line}\nrules:\n{}\n",
+            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{memory_line}{skills_line}{eval_line}{delegation_line}\nrules:\n{}\n",
             self.boundary_digest(),
             self.workspace_abs().display(),
             self.boundary.writable_roots,
@@ -2308,5 +2323,73 @@ control"
         disabled
             .validate()
             .expect("disabled queue skips limit checks");
+    }
+
+    /// D1: the delegation flag freezes into the contract (digest only when
+    /// enabled) and derive_sub_contract produces a strictly-narrowed child.
+    #[test]
+    fn delegation_freezes_into_the_contract_and_derives_narrower_children() {
+        let base = crate::Config::embedded().unwrap();
+        let plain = crate::goal::GoalContract::from_config("d1 off", &base).unwrap();
+        assert!(!plain.allows_delegation());
+
+        let mut enabled_config = base.clone();
+        enabled_config.boundary.allow_delegation = true;
+        let enabled = crate::goal::GoalContract::from_config("d1 on", &enabled_config).unwrap();
+        assert!(enabled.allows_delegation());
+        assert_ne!(plain.digest(), enabled.digest());
+
+        // A derived child copies every enforcement field from the parent and
+        // strips the run-scoped features: a sub-agent is a bounded worker.
+        let parent_budget = enabled.budget().clone();
+        let child = enabled
+            .derive_sub_contract("fix the parser", parent_budget.clone())
+            .unwrap();
+        assert!(child.goal.starts_with("[delegated subtask]"));
+        assert_eq!(child.workspace(), enabled.workspace());
+        assert_eq!(child.readable_roots, enabled.readable_roots);
+        assert_eq!(child.writable_roots, enabled.writable_roots);
+        assert_eq!(child.forbidden_globs, enabled.forbidden_globs);
+        assert_eq!(child.approval_mode, enabled.approval_mode);
+        assert_eq!(child.budget(), &parent_budget);
+        assert_eq!(child.price, enabled.price);
+        assert_eq!(child.policy_digest, enabled.policy_digest);
+        assert_eq!(child.fallbacks, enabled.fallbacks);
+        assert!(
+            !child.allows_delegation(),
+            "depth-1 delegation by construction"
+        );
+        assert!(!child.memory().enabled);
+        assert!(!child.skills().enabled);
+        assert!(child.deliverables().deliverables.is_empty());
+        assert!(!child.eval().is_declared());
+        assert!(!child.plan_first());
+        assert!(!child.checkpoint.enabled);
+        assert!(!child.conversation.enabled);
+
+        // Widening any budget dimension beyond the parent's is refused —
+        // the caller clamps, the constructor is defense in depth.
+        let mut wider = parent_budget.clone();
+        wider.max_turns += 1;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_cost_usd += 0.01;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_input_tokens += 1;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_output_tokens += 1;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_wall_clock_secs += std::time::Duration::from_secs(1);
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+
+        // A narrowed budget derives cleanly.
+        let mut narrower = parent_budget.clone();
+        narrower.max_turns = (parent_budget.max_turns / 2).max(1);
+        narrower.max_cost_usd = parent_budget.max_cost_usd / 2.0;
+        narrower.max_wall_clock_secs = parent_budget.max_wall_clock_secs / 2;
+        assert!(enabled.derive_sub_contract("t", narrower).is_ok());
     }
 }

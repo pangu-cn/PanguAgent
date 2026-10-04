@@ -164,6 +164,13 @@ pub struct GoalContract {
     /// F5: the declared evaluation profile. Undeclared keeps historical digests.
     #[serde(default)]
     pub eval: ContractEval,
+    /// D1: whether the model may delegate bounded subtasks to restricted
+    /// sub-agents. Default off keeps historical digests unchanged. The child
+    /// contract is derived from this one (never wider) and the child budget
+    /// is clamped to the parent's remaining budget by the run loop — the
+    /// model can only narrow, never widen.
+    #[serde(default)]
+    pub allow_delegation: bool,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
@@ -215,6 +222,7 @@ impl GoalContract {
             skills: ContractSkills::default(),
             deliverables: ContractDeliverables::default(),
             eval: ContractEval::default(),
+            allow_delegation: false,
             extra_readonly_commands: Vec::new(),
             checkpoint: CheckpointSection::default(),
             conversation: ConversationSection::default(),
@@ -334,6 +342,7 @@ impl GoalContract {
                 profile: config.eval.profile.clone(),
                 issue_path: config.eval.issue_path.clone(),
             },
+            allow_delegation: config.boundary.allow_delegation,
             memory: ContractMemory {
                 enabled: config.memory.enabled,
                 max_pending: config.memory.max_pending,
@@ -420,6 +429,83 @@ impl GoalContract {
     /// F5: the declared evaluation profile.
     pub fn eval(&self) -> &ContractEval {
         &self.eval
+    }
+
+    /// D1: whether delegation is enabled for this run.
+    pub fn allows_delegation(&self) -> bool {
+        self.allow_delegation
+    }
+
+    /// D1: derive a restricted sub-agent contract from this (parent)
+    /// contract. Every enforcement field is copied from the parent — the
+    /// sandbox, policy, approval mode, network rules, and limits are the
+    /// parent's, so the child can never exceed them — while the run-scoped
+    /// features (plan-first, memory, skills, deliverables, eval,
+    /// checkpointing, conversation, delegation itself) are stripped: the
+    /// child is a bounded worker, and a sub-agent can never spawn its own
+    /// sub-agents.
+    ///
+    /// The budget must already be clamped by the caller to the parent's
+    /// remaining budget; this constructor refuses any dimension wider than
+    /// the parent's as defense in depth. Delegation is thus an intersection
+    /// by construction: child ⊆ parent on every axis.
+    pub fn derive_sub_contract(&self, task: impl Into<String>, budget: Budget) -> Result<Self> {
+        budget.validate()?;
+        if budget.max_turns > self.budget.max_turns {
+            return Err(Error::Config(
+                "sub-contract budget.max_turns exceeds the parent contract".into(),
+            ));
+        }
+        if budget.max_input_tokens > self.budget.max_input_tokens {
+            return Err(Error::Config(
+                "sub-contract budget.max_input_tokens exceeds the parent contract".into(),
+            ));
+        }
+        if budget.max_output_tokens > self.budget.max_output_tokens {
+            return Err(Error::Config(
+                "sub-contract budget.max_output_tokens exceeds the parent contract".into(),
+            ));
+        }
+        if budget.max_cost_usd > self.budget.max_cost_usd {
+            return Err(Error::Config(
+                "sub-contract budget.max_cost_usd exceeds the parent contract".into(),
+            ));
+        }
+        if budget.max_wall_clock_secs > self.budget.max_wall_clock_secs {
+            return Err(Error::Config(
+                "sub-contract budget.max_wall_clock_secs exceeds the parent contract".into(),
+            ));
+        }
+        let mut child = Self::new(format!("[delegated subtask] {}", task.into()));
+        child.workspace = self.workspace.clone();
+        child.readable_roots = self.readable_roots.clone();
+        child.writable_roots = self.writable_roots.clone();
+        child.forbidden_globs = self.forbidden_globs.clone();
+        child.approval_mode = self.approval_mode;
+        child.budget = budget;
+        child.system_prompt = self.system_prompt.clone();
+        child.unattended = self.unattended;
+        child.config_files = self.config_files.clone();
+        child.network_egress = self.network_egress.clone();
+        child.allow_localhost = self.allow_localhost;
+        child.env_allow = self.env_allow.clone();
+        child.max_tool_output_bytes = self.max_tool_output_bytes;
+        child.max_arg_bytes = self.max_arg_bytes;
+        child.subprocess_timeout_secs = self.subprocess_timeout_secs;
+        child.subprocess_output_limit = self.subprocess_output_limit;
+        child.max_write_bytes = self.max_write_bytes;
+        child.max_paths_per_action = self.max_paths_per_action;
+        child.verify_command = self.verify_command.clone();
+        child.extra_readonly_commands = self.extra_readonly_commands.clone();
+        child.require_evidence = self.require_evidence;
+        child.min_successful_tool_calls = self.min_successful_tool_calls;
+        child.price = self.price;
+        child.policy_digest = self.policy_digest.clone();
+        // B5: the child keeps the parent's declared fallback chain so a
+        // subtask survives a provider failure exactly as the parent would.
+        child.fallbacks = self.fallbacks.clone();
+        // allow_delegation stays false: depth-1 delegation by construction.
+        Ok(child)
     }
 
     /// C5: the declared execution backend.
@@ -532,6 +618,13 @@ impl GoalContract {
                     "eval".into(),
                     serde_json::to_value(&self.eval).unwrap_or(serde_json::Value::Null),
                 );
+            }
+        }
+        // D1: only a delegation-enabled run changes the digest; the default
+        // keeps historical digests stable.
+        if self.allow_delegation {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("allow_delegation".into(), serde_json::json!(true));
             }
         }
         // B2: only an enabled skill registry changes the digest; disabled

@@ -61,6 +61,12 @@ extra_readonly_commands = []
 # profile = "issue-fix"
 # issue_path = "issues/001.md"
 
+# D1: 受限子 Agent。默认 false = 无 delegate_task 工具、digest 不变。开启
+# 后模型可把子任务交给受限子 Agent：子 contract 由父 contract 派生（预算
+# 钳到父级剩余，拒绝任何加宽），子事件进同一 Journal、花费聚合进父级账
+# 本，深度 1（子不能再委派）。
+# allow_delegation = true
+
 [skills]
 enabled = false
 verify_key = ""

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pangu_agent::{Agent, Provider};
+use pangu_agent::{Agent, Provider, ToolExecutor};
 use pangu_boundary::{
     ApprovalMode, Config, FallbackCandidate, GoalContract, Policy, Rule, Sandbox, ScriptedApproval,
 };
@@ -46,6 +46,10 @@ impl Provider for ScriptedProvider {
             .pop_front()
             .expect("scripted provider response"))
     }
+}
+
+fn finish_call() -> Vec<ToolCall> {
+    vec![ToolCall::new("finish", json!({"status": "complete"}))]
 }
 
 fn temp_root(label: &str) -> PathBuf {
@@ -2126,5 +2130,292 @@ async fn eval_context_captures_the_run_facts() {
         .records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].id, record.id);
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+// ---- D1: restricted sub-agent delegation ----------------------------------
+
+/// D1: builds the restricted executor each sub-agent runs with — a fresh
+/// toolkit with the contract-frozen verify command and nothing else.
+struct FreshToolkitTestFactory;
+
+impl pangu_agent::SubtoolFactory for FreshToolkitTestFactory {
+    fn build(&self, verify_command: Vec<String>) -> Result<Arc<dyn ToolExecutor>> {
+        Ok(Arc::new(Toolkit::with_verify_command(verify_command)))
+    }
+}
+
+fn build_delegation_agent(
+    root: &Path,
+    provider: Arc<dyn Provider>,
+    allow: bool,
+    max_cost_usd: f64,
+) -> (Agent, Arc<MemSink>) {
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.boundary.allow_delegation = allow;
+    config.budget.max_cost_usd = max_cost_usd;
+    config.budget.max_input_tokens = 4_000_000;
+    config.budget.max_output_tokens = 4_000_000;
+    config.model.input_usd_per_mtok = Some(1.0);
+    config.model.output_usd_per_mtok = Some(1.0);
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    let contract = GoalContract::from_config("d1 test", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let sink = Arc::new(MemSink::default());
+    let mut agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new()),
+        approval,
+        sink.clone(),
+    )
+    .expect("agent");
+    if allow {
+        agent = agent.with_delegation(Arc::new(FreshToolkitTestFactory));
+    }
+    (agent, sink)
+}
+
+#[tokio::test]
+async fn parent_delegates_and_child_spend_is_aggregated() {
+    let root = temp_root("d1-aggregate");
+    std::fs::write(root.join("notes.txt"), "the subtask evidence\n").expect("notes");
+    // One shared scripted provider serves both the parent turns and the
+    // child turns, in call order: parent delegates, child reads, child
+    // finishes complete, parent finishes complete.
+    let provider = Arc::new(ScriptedProvider {
+        responses: Mutex::new(
+            vec![
+                response_with_usage(
+                    vec![ToolCall::new(
+                        "delegate_task",
+                        json!({"task": "Read notes.txt and report its contents.", "max_turns": 4}),
+                    )],
+                    200_000,
+                ),
+                response_with_usage(
+                    vec![ToolCall::new("read_file", json!({"path": "notes.txt"}))],
+                    200_000,
+                ),
+                response_with_usage(finish_call(), 200_000),
+                response_with_usage(finish_call(), 200_000),
+            ]
+            .into(),
+        ),
+    });
+    let (agent, sink) = build_delegation_agent(&root, provider, true, 10.0);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+
+    // Aggregation: 4 responses x 200k input tokens x 1.0 USD/MTok = 0.8 USD
+    // total. The parent alone produced only 2 of those responses — the other
+    // 0.4 USD is the child's spend, merged into the parent's ledger.
+    assert_eq!(
+        outcome.cost_usd,
+        Some(0.8),
+        "child spend must be aggregated"
+    );
+    let kinds = sink.kinds();
+    assert!(
+        kinds.contains(&EventKind::TaskDelegated),
+        "delegation must be audited: {kinds:?}"
+    );
+    // Central journal: both the parent and the child run in the same sink.
+    let run_starts = kinds
+        .iter()
+        .filter(|kind| **kind == EventKind::RunStarted)
+        .count();
+    assert!(
+        run_starts >= 2,
+        "child run must share the journal: {kinds:?}"
+    );
+    // Evidence: the delegation itself is recorded.
+    assert!(
+        outcome
+            .evidence
+            .iter()
+            .any(|item| item.starts_with("delegate: ")),
+        "evidence: {:?}",
+        outcome.evidence
+    );
+    // The event records the clamped grant and the task by digest only.
+    let delegated = sink
+        .snapshot()
+        .into_iter()
+        .find(|event| event.kind == EventKind::TaskDelegated)
+        .expect("TaskDelegated event");
+    let payload = delegated.payload.expect("payload");
+    assert_eq!(payload["sub_max_turns"], 4);
+    assert!(
+        payload["task_sha256"].as_str().is_some(),
+        "task travels by digest, never raw"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn child_cannot_delegate_further() {
+    let root = temp_root("d1-depth");
+    // The child tries to re-delegate: its contract has allow_delegation
+    // stripped, so the tool is not advertised and the call is blocked. The
+    // child then honestly reports failure; the parent completes.
+    let provider = Arc::new(ScriptedProvider {
+        responses: Mutex::new(
+            vec![
+                response(vec![ToolCall::new(
+                    "delegate_task",
+                    json!({"task": "outer task"}),
+                )]),
+                response(vec![ToolCall::new(
+                    "delegate_task",
+                    json!({"task": "inner task"}),
+                )]),
+                response(vec![ToolCall::new("finish", json!({"status": "failed"}))]),
+                finish_response(),
+            ]
+            .into(),
+        ),
+    });
+    let (agent, sink) = build_delegation_agent(&root, provider, true, 10.0);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    // Exactly one delegation happened: the parent's. The child's attempt
+    // was blocked.
+    let delegated = sink
+        .kinds()
+        .into_iter()
+        .filter(|kind| *kind == EventKind::TaskDelegated)
+        .count();
+    assert_eq!(delegated, 1, "depth-1 delegation only: {delegated}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn delegation_disabled_keeps_the_tool_absent() {
+    let root = temp_root("d1-off");
+    // Delegation is default-off: the tool is never advertised, so the call
+    // is refused like any unknown tool.
+    let provider = Arc::new(ScriptedProvider {
+        responses: Mutex::new(
+            vec![
+                response(vec![ToolCall::new(
+                    "delegate_task",
+                    json!({"task": "nope"}),
+                )]),
+                response(vec![ToolCall::new("finish", json!({"status": "failed"}))]),
+            ]
+            .into(),
+        ),
+    });
+    let (agent, sink) = build_delegation_agent(&root, provider, false, 10.0);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Failed);
+    let kinds = sink.kinds();
+    assert!(!kinds.contains(&EventKind::TaskDelegated));
+    let blocked = sink.snapshot().into_iter().any(|event| {
+        event.kind == EventKind::ToolBlocked && event.tool.as_deref() == Some("delegate_task")
+    });
+    assert!(blocked, "the call must be refused as unadvertised");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn cost_clamp_bounds_the_child_and_its_spend_still_aggregates() {
+    let root = temp_root("d1-clamp");
+    std::fs::write(
+        root.join("notes.txt"),
+        "evidence
+",
+    )
+    .expect("notes");
+    // The model asks for a $0.05 cost cap; each response costs $0.20. The
+    // clamped child therefore dies of its own budget on its first response,
+    // returns budget_exhausted honestly, and its $0.20 still lands in the
+    // parent's ledger.
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.boundary.allow_delegation = true;
+    config.budget.max_cost_usd = 1.0;
+    config.budget.max_input_tokens = 4_000_000;
+    config.budget.max_output_tokens = 4_000_000;
+    config.model.input_usd_per_mtok = Some(1.0);
+    config.model.output_usd_per_mtok = Some(1.0);
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    let contract = GoalContract::from_config("d1 clamp", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let sink = Arc::new(MemSink::default());
+    let provider = Arc::new(ScriptedProvider {
+        responses: Mutex::new(
+            vec![
+                response_with_usage(
+                    vec![ToolCall::new(
+                        "delegate_task",
+                        json!({"task": "bounded work", "max_cost_usd": 0.05}),
+                    )],
+                    200_000,
+                ),
+                response_with_usage(
+                    vec![ToolCall::new("read_file", json!({"path": "notes.txt"}))],
+                    200_000,
+                ),
+                response_with_usage(
+                    vec![ToolCall::new("read_file", json!({"path": "notes.txt"}))],
+                    200_000,
+                ),
+                response_with_usage(finish_call(), 200_000),
+            ]
+            .into(),
+        ),
+    });
+    let agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new()),
+        approval,
+        sink.clone(),
+    )
+    .expect("agent")
+    .with_delegation(Arc::new(FreshToolkitTestFactory));
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    // $0.20 (delegate turn) + $0.20 (child) + $0.20 (evidence) + $0.20
+    // (finish) = $0.80. The child's spend is in the parent's ledger even
+    // though the child itself hit its clamped budget.
+    assert_eq!(outcome.cost_usd, Some(0.8));
+    assert!(
+        outcome
+            .evidence
+            .iter()
+            .any(|item| item.contains("-> budget_exhausted")),
+        "the child's terminal status is reported honestly: {:?}",
+        outcome.evidence
+    );
+    // The recorded grant is the clamped cost cap the model asked for.
+    let delegated = sink
+        .snapshot()
+        .into_iter()
+        .find(|event| event.kind == EventKind::TaskDelegated)
+        .expect("TaskDelegated event");
+    assert_eq!(
+        delegated.payload.expect("payload")["sub_max_cost_usd"],
+        0.05
+    );
     std::fs::remove_dir_all(root).expect("cleanup");
 }

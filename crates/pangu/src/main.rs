@@ -1939,6 +1939,19 @@ fn build_skills_registry(
     )?)))
 }
 
+/// D1: builds the restricted executor each sub-agent runs with: a fresh
+/// toolkit with the contract-frozen verify command and nothing else — no
+/// memory queue, no skills, no delegation. The child contract is checked
+/// against whatever this returns, so a wider factory is refused, not
+/// silently honored.
+struct FreshToolkitFactory;
+
+impl pangu_agent::SubtoolFactory for FreshToolkitFactory {
+    fn build(&self, verify_command: Vec<String>) -> Result<Arc<dyn pangu_agent::ToolExecutor>> {
+        Ok(Arc::new(Toolkit::with_verify_command(verify_command)))
+    }
+}
+
 /// D3/D4: build the deliverable registry when the contract declares
 /// deliverables. The registry lives under `<workspace>/.pangu/deliverables/`
 /// (tool-forbidden); the run's finish gate records into it, and the
@@ -2075,6 +2088,11 @@ async fn execute_goal(
     }
     if let Some(store) = &deliverables {
         agent = agent.with_deliverables(store.clone());
+    }
+    // D1: attach the sub-agent factory when the contract enables
+    // delegation; the child tool surface is a fresh toolkit (verify only).
+    if config.boundary.allow_delegation {
+        agent = agent.with_delegation(Arc::new(FreshToolkitFactory));
     }
     let outcome = agent.run().await?;
     eprintln!("journal: {}", journal_path.display());

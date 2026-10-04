@@ -200,6 +200,15 @@ issue_path = "issues/001.md"
 
 `pangu eval run` 把 issue 内容 digest、workspace git 版本、contract digest、终态、成本、`verify:` 证据计数和 patch 交付物快照固定成一条可复现实验记录（`.pangu/eval/`）。记录没有 score 字段——机器事实不断言"修好了"，验收 = 测试证据 + 人工签收。
 
+受限子 Agent（D1，详见 `docs/adr/0010-restricted-sub-agent.md`）：
+
+```toml
+[boundary]
+allow_delegation = true   # 默认 false
+```
+
+开启后模型可用 `delegate_task` 把子任务交给受限子 Agent：子 contract 由父 contract 派生（预算钳到父级剩余，拒绝任何加宽），子事件进同一 Journal、花费聚合进父级账本，深度 1（子不能再委派）。委派失败对父 run 永不致命。
+
 ## 配置与 CLI
 
 默认配置编译在 `config/boundary.toml`。`pangu` 还会按以下顺序加载一个用户配置：`--config`、`PANGU_CONFIG`、当前目录 `pangu.toml`、用户目录的 `~/.config/pangu/boundary.toml`；未找到时使用 embedded 配置。相对 roots 会按有效 workspace 解析。

@@ -109,6 +109,8 @@ pub enum StreamKind {
     MemoryProposed,
     /// D3/D4: a declared deliverable was recorded (digest only).
     DeliverableRecorded,
+    /// D1: a bounded subtask was delegated to a restricted sub-agent.
+    TaskDelegated,
 }
 
 impl StreamKind {
@@ -167,6 +169,7 @@ impl StreamKind {
             Self::ProviderSwitched,
             Self::MemoryProposed,
             Self::DeliverableRecorded,
+            Self::TaskDelegated,
         ]
     }
 
@@ -205,6 +208,7 @@ impl StreamKind {
             EventKind::ProviderSwitched => Self::ProviderSwitched,
             EventKind::MemoryProposed => Self::MemoryProposed,
             EventKind::DeliverableRecorded => Self::DeliverableRecorded,
+            EventKind::TaskDelegated => Self::TaskDelegated,
         })
     }
 }
@@ -775,6 +779,7 @@ mod tests {
                 StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
                 StreamKind::MemoryProposed => EventKind::MemoryProposed,
                 StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
+                StreamKind::TaskDelegated => EventKind::TaskDelegated,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -821,6 +826,7 @@ mod tests {
                     StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
                     StreamKind::ContextAssembled => EventKind::ContextAssembled,
                     StreamKind::PhaseChanged => EventKind::PhaseChanged,
+                    StreamKind::TaskDelegated => EventKind::TaskDelegated,
                     StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
                     StreamKind::MemoryProposed => EventKind::MemoryProposed,
                     StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,

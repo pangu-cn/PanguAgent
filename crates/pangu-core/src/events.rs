@@ -44,6 +44,11 @@ pub enum EventKind {
     /// and was recorded into the registry (path, SHA-256, bytes) when the
     /// run completed. Human acceptance happens outside the run via the CLI.
     DeliverableRecorded,
+    /// D1: the run delegated a bounded subtask to a restricted sub-agent.
+    /// The child contract is derived from the parent's (never wider), the
+    /// child writes into the same central journal, and the event carries the
+    /// task digest and clamped budgets — never the raw task text.
+    TaskDelegated,
     CheckpointCreated,
     CheckpointFailed,
     RollbackRequested,

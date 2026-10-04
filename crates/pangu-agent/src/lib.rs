@@ -331,6 +331,15 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, action: &VerifiedAction) -> Result<ToolOutput>;
 }
 
+/// D1: builds the tool executor a restricted sub-agent will use. Called by
+/// the parent run once per delegation. The factory is operator wiring (the
+/// CLI builds a fresh toolkit); whatever it returns is checked against the
+/// derived child contract like any other executor, so a factory cannot
+/// smuggle capabilities the child contract does not declare.
+pub trait SubtoolFactory: Send + Sync {
+    fn build(&self, verify_command: Vec<String>) -> Result<std::sync::Arc<dyn ToolExecutor>>;
+}
+
 /// Capability token for one already-approved, already-validated action.
 pub struct VerifiedAction {
     call: ToolCall,
@@ -387,6 +396,10 @@ pub struct Agent {
     /// declares deliverables; `complete` runs the acceptance checks against
     /// it and finished runs record their delivery snapshots into it.
     deliverables: Option<Arc<DeliverableStore>>,
+    /// D1: the sub-agent tool factory. Attached only when the contract
+    /// enables delegation; builds the restricted executor each child runs
+    /// with.
+    delegation: Option<Arc<dyn SubtoolFactory>>,
 }
 
 impl Agent {
@@ -490,6 +503,7 @@ impl Agent {
             fallbacks: fallback_iter.collect(),
             tools,
             approval,
+            delegation: None,
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
@@ -521,6 +535,14 @@ impl Agent {
     /// the contract declares deliverables but no registry was attached.
     pub fn with_deliverables(mut self, store: Arc<DeliverableStore>) -> Self {
         self.deliverables = Some(store);
+        self
+    }
+
+    /// D1: attach the sub-agent tool factory. The `delegate_task` tool
+    /// exists only when the contract enables delegation AND a factory is
+    /// attached; run_inner refuses a contract/attachment mismatch.
+    pub fn with_delegation(mut self, factory: Arc<dyn SubtoolFactory>) -> Self {
+        self.delegation = Some(factory);
         self
     }
 
@@ -1466,6 +1488,14 @@ impl Agent {
                 "GoalContract declares deliverables but no deliverable registry was attached;                  build the agent with `with_deliverables`"
             ));
         }
+        // D1: a delegation-enabled contract without its factory is a broken
+        // freeze — refuse before the first turn (fail-fast, like the
+        // deliverables registry check).
+        if self.contract.allow_delegation && self.delegation.is_none() {
+            return Err(anyhow!(
+                "GoalContract enables delegation but no sub-tool factory was attached; build the                  agent with `with_delegation`"
+            ));
+        }
         self.check_skills_binding().await?;
         let started = Instant::now();
         let mut usage = Usage::default();
@@ -1558,6 +1588,42 @@ impl Agent {
         // agent-owned (like `finish`): it executes nothing and passes no gate,
         // it just ends the read-only phase.
         let mut specs = self.tools.specs();
+        // D1: the agent-owned `delegate_task` control tool exists only in
+        // delegation-enabled runs. The child contract is derived from the
+        // parent at call time; the model can only narrow it.
+        if self.contract.allow_delegation {
+            specs.push(pangu_core::ToolSpec::new(
+                "delegate_task",
+                "Delegate one bounded subtask to a restricted sub-agent. The sub-agent gets a \
+                     fresh context, the same workspace/sandbox/policy as this run, and a budget \
+                     clamped to this run's remaining budget (it can never exceed them). It \
+                     cannot delegate further. Arguments: task (required string), max_turns and \
+                     max_cost_usd (optional narrowing). Returns the sub-agent's final summary \
+                     and its status; its spend counts against this run's budget.",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["task"],
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Self-contained instructions for the sub-agent."
+                        },
+                        "max_turns": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional tighter turn cap for the sub-agent."
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": "Optional tighter cost cap for the sub-agent."
+                        }
+                    }
+                }),
+            ));
+        }
         if self.contract.plan_first() {
             specs.push(pangu_core::ToolSpec::new(
                 "begin_act",
@@ -1871,6 +1937,38 @@ impl Agent {
                             .await?;
                         }
                     }
+                } else if call.name == "delegate_task" {
+                    // D1 control call: the parent run itself derives the
+                    // child contract, spawns the restricted sub-agent, and
+                    // merges the child's spend into its own ledger. The
+                    // model supplied only the task text and optional
+                    // narrowing; every budget is clamped here.
+                    if let Err(error) = self
+                        .handle_delegation(
+                            &call,
+                            turn,
+                            started,
+                            spent,
+                            &mut usage,
+                            &mut spent,
+                            &mut evidence,
+                            &mut history,
+                        )
+                        .await
+                    {
+                        let context = FailureContext::from_call(&call);
+                        self.record_tool_error_with_context(
+                            &mut history,
+                            &call,
+                            turn,
+                            EventKind::ToolBlocked,
+                            error,
+                            checkpoint_state.as_ref(),
+                            &context,
+                            FailureClass::InvalidToolCall,
+                        )
+                        .await?;
+                    }
                 } else if let Some(status) = self
                     .process_tool(
                         &mut history,
@@ -1942,6 +2040,211 @@ impl Agent {
             turns: last_turn,
             cost_usd: if spent.is_finite() { Some(spent) } else { None },
         })
+    }
+
+    /// D1: execute the agent-owned `delegate_task` control call. The child
+    /// contract is derived from this run's contract (never wider), the child
+    /// budget is clamped to the parent's remaining budget, and the child
+    /// writes into the same central journal through the same sink. The
+    /// child's tokens and cost are merged into the parent's ledger, so a
+    /// delegation can never be used to escape the parent's budget. Any
+    /// failure here is a tool error the parent model sees — delegation is
+    /// never fatal to the parent run.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_delegation(
+        &self,
+        call: &ToolCall,
+        turn: u32,
+        started: Instant,
+        spent_now: f64,
+        usage: &mut Usage,
+        spent: &mut f64,
+        evidence: &mut Vec<String>,
+        history: &mut Vec<Message>,
+    ) -> Result<()> {
+        let object = call
+            .args
+            .as_object()
+            .ok_or_else(|| anyhow!("delegate_task arguments must be an object"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "task" | "max_turns" | "max_cost_usd"))
+        {
+            return Err(anyhow!(
+                "delegate_task accepts only task, max_turns, and max_cost_usd"
+            ));
+        }
+        let task = call
+            .args
+            .get("task")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("delegate_task requires a string task"))?;
+        if task.trim().is_empty() {
+            return Err(anyhow!("delegate_task task must not be empty"));
+        }
+        if task.len() > 16_384 {
+            return Err(anyhow!(
+                "delegate_task task is {} bytes; the limit is 16384 bytes",
+                task.len()
+            ));
+        }
+        let grant_turns = match call.args.get("max_turns") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("max_turns must be an integer"))?
+                    .try_into()
+                    .map_err(|_| anyhow!("max_turns must fit in u32"))?,
+            ),
+        };
+        let grant_cost = match call.args.get("max_cost_usd") {
+            None => None,
+            Some(value) => {
+                let cost = value
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("max_cost_usd must be a number"))?;
+                if !cost.is_finite() || cost < 0.0 {
+                    return Err(anyhow!("max_cost_usd must be finite and >= 0"));
+                }
+                Some(cost)
+            }
+        };
+
+        // The grant is clamped to what this run still has left. The model
+        // can narrow; it can never widen — and it cannot grant what the
+        // parent no longer has.
+        let remaining_turns = self.contract.budget.max_turns.saturating_sub(turn);
+        if remaining_turns == 0 {
+            return Err(anyhow!(
+                "delegation refused: no remaining turns to grant (this is the parent run's last \
+                 turn)"
+            ));
+        }
+        if !spent_now.is_finite() {
+            return Err(anyhow!(
+                "delegation refused: cost accounting is unavailable (unpriced run)"
+            ));
+        }
+        let remaining_cost = self.contract.budget.max_cost_usd - spent_now;
+        if remaining_cost <= 0.0 {
+            return Err(anyhow!("delegation refused: no remaining cost budget"));
+        }
+        let remaining_wall = self
+            .contract
+            .budget
+            .max_wall_clock_secs
+            .checked_sub(started.elapsed())
+            .unwrap_or_default();
+        if remaining_wall.is_zero() {
+            return Err(anyhow!(
+                "delegation refused: no remaining wall-clock budget"
+            ));
+        }
+        let child_budget = pangu_boundary::Budget {
+            max_turns: grant_turns.unwrap_or(remaining_turns).min(remaining_turns),
+            max_input_tokens: self.contract.budget.max_input_tokens,
+            max_output_tokens: self.contract.budget.max_output_tokens,
+            max_cost_usd: match grant_cost {
+                Some(cost) => cost.min(remaining_cost),
+                None => remaining_cost,
+            },
+            max_wall_clock_secs: remaining_wall,
+        };
+        let sub_max_turns = child_budget.max_turns;
+        let sub_max_cost_usd = child_budget.max_cost_usd;
+        let sub_max_wall_clock_secs = child_budget.max_wall_clock_secs.as_secs();
+        let task_digest = pangu_core::hex_sha256(task);
+        let child_contract = self
+            .contract
+            .derive_sub_contract(task, child_budget)
+            .map_err(|error| anyhow!("delegation refused: {error}"))?;
+        let factory = self
+            .delegation
+            .as_ref()
+            .ok_or_else(|| anyhow!("delegation refused: no sub-tool factory attached"))?;
+        let child_tools = factory.build(self.contract.verify_command.clone())?;
+        let mut providers = vec![self.provider.clone()];
+        providers.extend(self.fallbacks.iter().cloned());
+        let child = Agent::with_chain(
+            child_contract.clone(),
+            self.policy.clone(),
+            self.sandbox.clone(),
+            providers,
+            child_tools,
+            self.approval.clone(),
+            self.event_sink.clone(),
+        )?;
+
+        self.emit(
+            self.event(
+                EventKind::TaskDelegated,
+                turn,
+                format!(
+                    "subtask delegated (task digest {}); child contract {}",
+                    &task_digest[..12],
+                    &child_contract.digest()[..12]
+                ),
+            )
+            .tool("delegate_task")
+            .call_id(&call.id)
+            .payload(serde_json::json!({
+                "task_sha256": task_digest,
+                "task_bytes": task.len(),
+                "sub_contract_digest": child_contract.digest(),
+                "sub_max_turns": sub_max_turns,
+                "sub_max_cost_usd": sub_max_cost_usd,
+                "sub_max_wall_clock_secs": sub_max_wall_clock_secs,
+            })),
+        )
+        .await?;
+
+        // The child writes into the same journal and approval surface as
+        // the parent; nothing about the delegation bypasses the gates.
+        // Boxed because a parent run containing a child run is (bounded)
+        // structural recursion.
+        let outcome = Box::pin(child.run()).await?;
+        usage.merge(&outcome.usage);
+        if let Some(cost) = outcome.cost_usd {
+            *spent += cost;
+        }
+        evidence.push(format!(
+            "delegate: {} -> {} (turns={})",
+            &task_digest[..12],
+            outcome.status.as_str(),
+            outcome.turns
+        ));
+        let summary = outcome
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::Assistant { content, .. } if !content.trim().is_empty() => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .map(|content| truncate_middle(&redact_text(&content), 4000))
+            .unwrap_or_else(|| "(no final assistant message)".to_string());
+        let cost_text = match outcome.cost_usd {
+            Some(cost) => format!("${cost:.4}"),
+            None => "unpriced".to_string(),
+        };
+        history.push(Message::tool_result(
+            &call.id,
+            "delegate_task",
+            format!(
+                "subtask {} finished: {} (turns={}, tokens in={}, out={}, cost={})\n\n{}",
+                &task_digest[..12],
+                outcome.status.as_str(),
+                outcome.turns,
+                outcome.usage.input_tokens,
+                outcome.usage.output_tokens,
+                cost_text,
+                summary
+            ),
+        ));
+        Ok(())
     }
 
     async fn process_tool(
