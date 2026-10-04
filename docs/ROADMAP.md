@@ -440,8 +440,15 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 - [ ] **D1 受限子 Agent**：借鉴 Hermes/WorkBuddy/DeepSeek Harness/OpenHands/Cline；子 Agent 只有父任务授予的 capability budget，不能扩大权限。
 - [ ] **D2 并行任务 DAG**：借鉴 OpenHands/Cline teams；每个节点独立预算、取消、超时、重试和终态，禁止无界 fan-out。
-- [ ] **D3 Artifact + Evidence 管线**：借鉴 WorkBuddy 的产物导向、Aider 的 Git diff 和 Cline 的 checkpoint；支持报告、代码补丁、表格等结构化产物。
-- [ ] **D4 产物验收器**：定义 schema、测试、引用、数据版本和人工签收；借鉴 Aider 的 lint/test loop 与 Cline 的 diff/checkpoint；没有验收证据不能标记完成。
+- [x] **D3 Artifact + Evidence 管线（已做）**：借鉴 WorkBuddy 的产物导向、Aider 的 Git diff 和 Cline 的 checkpoint；支持报告、代码补丁、表格等结构化产物。与 D4 一并实现，设计详见 [`docs/adr/0008-deliverable-acceptance.md`](adr/0008-deliverable-acceptance.md)。
+  - 交付物在目标里声明（`[[goal.deliverable]]`：name/path/kind/acceptor/min_bytes），冻结进 contract 并携带进 digest；产物文件本身经 write_file 与 L1–L4 产出，无新工具面。
+  - complete 时把每个交付物快照（路径、SHA-256、字节数、run、时间）登记进 `<workspace>.pangu/deliverables/` 注册表（工具禁区）并 events `DeliverableRecorded`（pangu-stream/1 provisional，digest only）；同产物重复交付追加新记录，历史不改写。
+  - **未包含**：产物内容的事实性校验（签收者责任）、云端产物库。
+- [x] **D4 产物验收器（已做）**：定义 schema、测试、引用、数据版本和人工签收；借鉴 Aider 的 lint/test loop 与 Cline 的 diff/checkpoint；没有验收证据不能标记完成。W-18 对照：数据版本 ✓（SHA-256+时间+run 双链登记）、校验规则 ✓（acceptor）、人工签收 ✓（CLI 单向审计）。
+  - 验收器：`manual`（run 内只登记）、`verify`（复用 F3 验证证据）、`json`/`jsonl`（格式校验）。
+  - complete 闸门：存在性 + min_bytes + acceptor 全过才接受；失败详情回灌给模型（Aider lint-loop），可修复重试或诚实改口 failed；登记失败同样拒绝 complete——未经审计的完成不是完成。
+  - 人工签收：`pangu deliverable list|accept|reject`（run 外、单向、审计）；`complete` ≠ `accepted`（格式正确 ≠ 事实正确）。
+  - **未包含（如实声明）**：完整 JSON Schema 校验（需 jsonschema 依赖，届时另过准入）；产物内引用存在性检查（属内容语义）。
 
 ### E. 连接器和办公工作台
 
@@ -494,9 +501,9 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、F1、F2、F3、F4
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D3、D4、F1、F2、F3、F4
         （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
-第二批：D3、D4、F5
+第二批：F5
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```

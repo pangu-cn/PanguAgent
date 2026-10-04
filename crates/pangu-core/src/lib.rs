@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod assemble;
 pub mod checkpoint;
 pub mod conversation;
+pub mod deliverable;
 pub mod diff;
 pub mod error;
 pub mod events;
@@ -44,6 +45,10 @@ pub use checkpoint::{
 pub use conversation::{
     redact_messages, validate_encoded_size, CompactionRecord, ConversationSnapshot,
     MAX_CONVERSATION_BYTES, MAX_CONVERSATION_MESSAGES,
+};
+pub use deliverable::{
+    Acceptance, Acceptor, CheckOutcome, DeliverableRecord, DeliverableSpec, DeliverableStore,
+    DeliverableTransition, DELIVERABLES_SCHEMA,
 };
 pub use diff::unified_diff;
 pub use error::{Error, Result};

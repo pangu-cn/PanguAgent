@@ -107,6 +107,8 @@ pub enum StreamKind {
     ProviderSwitched,
     /// B3: a memory candidate was proposed (digest only, never content).
     MemoryProposed,
+    /// D3/D4: a declared deliverable was recorded (digest only).
+    DeliverableRecorded,
 }
 
 impl StreamKind {
@@ -164,6 +166,7 @@ impl StreamKind {
             Self::PhaseChanged,
             Self::ProviderSwitched,
             Self::MemoryProposed,
+            Self::DeliverableRecorded,
         ]
     }
 
@@ -201,6 +204,7 @@ impl StreamKind {
             EventKind::PhaseChanged => Self::PhaseChanged,
             EventKind::ProviderSwitched => Self::ProviderSwitched,
             EventKind::MemoryProposed => Self::MemoryProposed,
+            EventKind::DeliverableRecorded => Self::DeliverableRecorded,
         })
     }
 }
@@ -770,6 +774,7 @@ mod tests {
                 StreamKind::PhaseChanged => EventKind::PhaseChanged,
                 StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
                 StreamKind::MemoryProposed => EventKind::MemoryProposed,
+                StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -818,6 +823,7 @@ mod tests {
                     StreamKind::PhaseChanged => EventKind::PhaseChanged,
                     StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
                     StreamKind::MemoryProposed => EventKind::MemoryProposed,
+                    StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
                 },
                 0,
                 "hello",

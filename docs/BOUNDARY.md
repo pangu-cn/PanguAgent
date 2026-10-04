@@ -125,6 +125,15 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 - **无权限**：索引与正文都标注 "carry no permissions"——技能内容对 L1–L4 零影响，是待读的参考材料，不是配置或授权。
 - **冻结与绑定**：启用时 contract 冻结技能集（name/version/package_digest/signed）并携带进 digest；run 启动时与实际 registry 逐位比对，不一致即拒启；被改的技能集不可能带病进入运行。
 
+### 产物管线与验收器（D3/D4）
+
+`[[goal.deliverable]]` 允许操作者在目标里声明交付物（路径、类型、验收器）；`complete` 成为验收闸门。详见 [ADR-0008](adr/0008-deliverable-acceptance.md)。规则：
+
+- **没有验收证据不能标记完成**：声明的每个交付物在 `complete` 时检查（存在、非空、acceptor：manual/verify/json/jsonl）；失败详情**回灌给模型**，可修复重试或诚实改口 failed——没有静默完成。
+- **登记是 complete 的一部分**：通过检查后，产物快照（路径、SHA-256、字节数、run、时间）写入 `<workspace>/.pangu/deliverables/`（工具禁区）并发 `DeliverableRecorded` 事件；登记失败同样拒绝 complete——未经审计的完成不是完成。
+- **签收只能由人做**：`pangu deliverable accept|reject` 是 run 外的独立动作，单向审计（同记忆生命周期）。`complete`（自动检查全过）≠ `accepted`（人认可事实正确）；格式正确也不等于事实正确（W-18）。
+- 产物文件的写入本身仍走 write_file 与 L1–L4；验收器不产生新权限面。
+
 ### 执行后端声明（C5）
 
 `[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
@@ -186,6 +195,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 21. **I-Fallback-Declared-Chain**：仅当声明了 `[[model.fallback]]` 时生效。fallback 只能沿配置声明、冻结进 contract 的有序链进行；每次失败尝试与成功切换都有事件；成本按段用冻结价格计，切换不能低估成本；链耗尽时运行失败，不得静默回到主 provider 或猜测下一个端点。
 22. **I-Memory-Proposal-Only**：仅当 `[memory] enabled` 时生效。模型只能提议记忆候选；写入长期记忆需要操作者经 CLI 明确接受；记忆存储不在任何工具 I/O 路径内；注入的记忆块标注不可信、不承载授权，不能单独或与任何输入组合构成 L1–L4 的豁免。
 23. **I-Skill-Operator-Installed**：仅当 `[skills] enabled` 时生效。技能只能由操作者安装、校验、卸载；运行时逐文件 hash 校验，不匹配即拒载并 audible；脚本没有任何执行原语；技能内容标注无权限，不能单独或与任何输入组合构成 L1–L4 的豁免。
+24. **I-Deliverable-Evidence-Before-Complete**：仅当 goal 声明了交付物时生效。`complete` 必须通过每个交付物的运行时检查，检查失败回灌而非静默；交付快照（digest/时间/run）必须登记成功才算完成；人工签收只存在于 run 外，模型没有任何签收路径；`complete` 与 `accepted` 是两个不同的状态，不得混用。
 
 ## 5. 非目标
 

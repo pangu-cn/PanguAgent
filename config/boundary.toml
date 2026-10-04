@@ -40,6 +40,18 @@ extra_readonly_commands = []
 # 留空 = 不验签（包如实标注 unsigned）。技能清单里的 scripts 只登记和
 # 校验 hash，B2 不提供任何脚本执行原语——模型执行任何命令仍只能走
 # run_command（NeedsHuman + argv 白名单）。
+# D3/D4: 交付物声明。默认空 = 无交付物语义、digest 不变。声明后 complete
+# 成为验收闸门：每个交付物检查（存在/非空/验收器）通过才接受，失败详情
+# 回灌给模型修复重试；完成时产物快照登记进 .pangu/deliverables/（工具禁
+# 区）；人工签收 pangu deliverable accept|reject 只在 run 外，complete 不
+# 等于 accepted。
+# [[goal.deliverable]]
+# name = "migration-report"
+# path = "out/report.md"
+# kind = "report"
+# acceptor = "manual"     # manual | verify | json | jsonl
+# min_bytes = 1
+
 [skills]
 enabled = false
 verify_key = ""

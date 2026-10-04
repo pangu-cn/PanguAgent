@@ -40,6 +40,10 @@ pub enum EventKind {
     /// data until an operator accepts it; events carry the content digest,
     /// never the raw content.
     MemoryProposed,
+    /// D3/D4: a declared deliverable passed its run-time acceptance checks
+    /// and was recorded into the registry (path, SHA-256, bytes) when the
+    /// run completed. Human acceptance happens outside the run via the CLI.
+    DeliverableRecorded,
     CheckpointCreated,
     CheckpointFailed,
     RollbackRequested,

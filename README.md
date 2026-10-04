@@ -177,6 +177,19 @@ verify_key = "<ed25519 公钥 hex>"   # 可选；留空则包如实标注 unsign
 - 操作者 `pangu skills keygen|install|list|verify|remove` 管理技能包；安装即生成逐文件 SHA-256 的 lock（SBOM-lite），运行时每次加载重算 hash，被改的包拒载并发 `Note` 事件——绝不静默。
 - 模型只经 `read_skill` 工具读技能说明正文；运行前 system prompt 注入有界技能索引（标注 operator-installed、carry no permissions）。**技能脚本没有执行原语**——清单只登记与校验 hash，模型执行任何命令仍走 `run_command`（NeedsHuman + 白名单）。
 
+产物管线与验收器（D3/D4，详见 `docs/adr/0008-deliverable-acceptance.md`）：
+
+```toml
+[[goal.deliverable]]
+name = "migration-report"
+path = "out/report.md"
+kind = "report"
+acceptor = "manual"      # manual | verify | json | jsonl
+```
+
+- 声明的交付物使 `complete` 成为验收闸门：文件存在、非空、验收器通过才接受；失败详情**回灌给模型**修复重试——没有静默完成。
+- 完成时产物快照（SHA-256/字节/时间/run）登记进 `<workspace>/.pangu/deliverables/` 并发事件；人工签收 `pangu deliverable list|accept|reject` 只发生在 run 外——`complete`（自动检查过）≠ `accepted`（人认可事实正确）。
+
 ## 配置与 CLI
 
 默认配置编译在 `config/boundary.toml`。`pangu` 还会按以下顺序加载一个用户配置：`--config`、`PANGU_CONFIG`、当前目录 `pangu.toml`、用户目录的 `~/.config/pangu/boundary.toml`；未找到时使用 embedded 配置。相对 roots 会按有效 workspace 解析。

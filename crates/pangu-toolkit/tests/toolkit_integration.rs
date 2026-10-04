@@ -11,7 +11,10 @@ use pangu_boundary::{
     ApprovalMode, Config, FallbackCandidate, GoalContract, Policy, Rule, Sandbox, ScriptedApproval,
 };
 use pangu_core::{ChatResponse, EventKind, MemSink, Message, ToolCall, ToolSpec, Usage};
-use pangu_core::{MemoryLimits, MemoryStatus, MemoryStore, SkillLimits, SkillLock, SkillRegistry};
+use pangu_core::{
+    DeliverableSpec, DeliverableStore, MemoryLimits, MemoryStatus, MemoryStore, SkillLimits,
+    SkillLock, SkillRegistry,
+};
 use pangu_toolkit::Toolkit;
 use serde_json::json;
 
@@ -1871,5 +1874,169 @@ async fn skills_disabled_refuses_an_advertising_toolkit() {
             .contains("read_skill advertisement does not match"),
         "{error}"
     );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+// ---- D3/D4: deliverable pipeline and acceptance ---------------------------
+
+/// A memory/skills-style builder: contract declares one deliverable, the
+/// registry is attached, provider is scripted.
+fn build_deliverable_agent(
+    root: &Path,
+    store: Arc<DeliverableStore>,
+    provider: Arc<dyn Provider>,
+    declare: bool,
+) -> (Agent, Arc<MemSink>) {
+    let mut config = Config::embedded().expect("embedded config");
+    config.boundary.workspace = root.to_path_buf();
+    config.boundary.readable_roots = vec![root.to_path_buf()];
+    config.boundary.writable_roots = vec![root.to_path_buf()];
+    config.rules = vec![Rule::allow("allow-tools", "*", "test tools")];
+    config.model.input_usd_per_mtok = Some(0.0);
+    config.model.output_usd_per_mtok = Some(0.0);
+    if declare {
+        config.goal.deliverable = vec![DeliverableSpec {
+            name: "report".into(),
+            path: "out/report.md".into(),
+            kind: "report".into(),
+            acceptor: pangu_core::Acceptor::Json,
+            min_bytes: 1,
+        }];
+    }
+    let contract = GoalContract::from_config("d4 test", &config).expect("goal contract");
+    let policy = Arc::new(Policy::new(config.rules.clone()).expect("policy"));
+    let sandbox = Arc::new(Sandbox::from_config(&config.boundary).expect("sandbox"));
+    let approval = Arc::new(ScriptedApproval::allow_all(
+        ApprovalMode::DestructiveAndAbove,
+    ));
+    let sink = Arc::new(MemSink::default());
+    let mut agent = Agent::with_chain(
+        contract,
+        policy,
+        sandbox,
+        vec![provider],
+        Arc::new(Toolkit::new()),
+        approval,
+        sink.clone(),
+    )
+    .expect("agent");
+    if declare {
+        agent = agent.with_deliverables(store);
+    }
+    (agent, sink)
+}
+
+#[tokio::test]
+async fn complete_without_the_deliverable_is_refused_and_fed_back() {
+    let root = temp_root("d4-refuse");
+    let store =
+        Arc::new(DeliverableStore::open(&root.join(".pangu").join("deliverables")).expect("store"));
+    // Turn 1: write an unrelated file (satisfies the evidence floor),
+    // turn 2: finish(complete) with the declared artifact missing - the
+    // refusal is fed back as a tool error -, turn 3: the model gives up
+    // with finish(failed).
+    let seed = response_with_usage(
+        vec![ToolCall::new(
+            "write_file",
+            json!({"path": "other.txt", "content": "x"}),
+        )],
+        0,
+    );
+    let give_up = response_with_usage(
+        vec![ToolCall::new("finish", json!({"status": "failed"}))],
+        0,
+    );
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(vec![seed, finish_response(), give_up].into()),
+    });
+    let (agent, sink) = build_deliverable_agent(&root, store.clone(), provider, true);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Failed);
+
+    // The complete was audibly refused with a model-readable reason ...
+    let blocked = sink
+        .snapshot()
+        .into_iter()
+        .find(|event| {
+            event.kind == EventKind::ToolBlocked && event.tool.as_deref() == Some("finish")
+        })
+        .expect("finish must be audibly blocked");
+    assert!(
+        blocked.message.contains("deliverable acceptance failed"),
+        "{}",
+        blocked.message
+    );
+    assert!(
+        blocked.message.contains("write it with write_file first"),
+        "the failure detail must be model-readable: {}",
+        blocked.message
+    );
+    // ... and nothing is recorded on refusal.
+    assert!(store.records().is_empty(), "nothing is recorded on refusal");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn complete_records_audited_deliverables_after_checks_pass() {
+    let root = temp_root("d4-record");
+    let store =
+        Arc::new(DeliverableStore::open(&root.join(".pangu").join("deliverables")).expect("store"));
+    std::fs::create_dir_all(root.join("out")).expect("out dir");
+    std::fs::write(root.join("out/report.md"), "{\"status\": \"done\"}").expect("artifact");
+
+    // Turn 1: read the artifact (satisfies evidence), turn 2: finish.
+    let read = response_with_usage(
+        vec![ToolCall::new("read_file", json!({"path": "out/report.md"}))],
+        0,
+    );
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(vec![read, finish_response()].into()),
+    });
+    let (agent, sink) = build_deliverable_agent(&root, store.clone(), provider, true);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+
+    // The registry holds the audited snapshot: path, SHA-256, byte count.
+    let records = store.records();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.name, "report");
+    assert_eq!(record.path, "out/report.md");
+    assert_eq!(record.bytes, "{\"status\": \"done\"}".len() as u64);
+    assert_eq!(record.acceptance, pangu_core::Acceptance::Pending);
+    assert_eq!(record.sha256.len(), 64);
+
+    // The run audited the recording.
+    let recorded = sink
+        .snapshot()
+        .into_iter()
+        .find(|event| event.kind == EventKind::DeliverableRecorded)
+        .expect("DeliverableRecorded event");
+    let payload = recorded.payload.expect("payload");
+    assert_eq!(payload["name"], "report");
+    assert_eq!(payload["sha256"], record.sha256);
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn no_declared_deliverables_keeps_finish_semantics_unchanged() {
+    let root = temp_root("d4-undeclared");
+    std::fs::write(root.join("note.txt"), "data\n").expect("seed");
+    let store =
+        Arc::new(DeliverableStore::open(&root.join(".pangu").join("deliverables")).expect("store"));
+    let read = response_with_usage(
+        vec![ToolCall::new("read_file", json!({"path": "note.txt"}))],
+        0,
+    );
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(vec![read, finish_response()].into()),
+    });
+    // declare = false: no deliverable semantics at all.
+    let (agent, _sink) = build_deliverable_agent(&root, store, provider, false);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
     std::fs::remove_dir_all(root).expect("cleanup");
 }

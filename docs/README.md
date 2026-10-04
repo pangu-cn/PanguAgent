@@ -9,7 +9,7 @@
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 实现结构、状态机、事件与 Journal、Artifact store、不变量测试矩阵 | 随实现更新 |
 | [`ROADMAP.md`](ROADMAP.md) | 竞品勘察、特性候选菜单（A/B/C/D/E/F）、分阶段验收门 | 草案，持续推进 |
 | [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) | F7 checkpoint/rollback 的 operator 恢复手册、drill 与验收清单 | 实验性 opt-in |
-| [`adr/`](adr/) | 设计决策记录 0001–0007，每项含背景、决策、准入模板与非目标 | 各自标注状态 |
+| [`adr/`](adr/) | 设计决策记录 0001–0008，每项含背景、决策、准入模板与非目标 | 各自标注状态 |
 | [`evidence/`](evidence/) | operator drill 跨平台报告（CI 产物转录），schema 见该目录 README | 只追加 |
 
 ## 约定

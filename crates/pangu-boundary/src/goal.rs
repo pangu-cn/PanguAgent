@@ -40,6 +40,38 @@ pub struct ContractSkills {
     pub skills: Vec<ContractSkill>,
 }
 
+/// D3/D4: one declared deliverable, frozen into the contract. The acceptor
+/// semantics and the minimum size are part of what `complete` must pass, so
+/// they ride with the digest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContractDeliverable {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub acceptor: pangu_core::Acceptor,
+    pub min_bytes: u64,
+}
+
+impl From<&ContractDeliverable> for pangu_core::DeliverableSpec {
+    fn from(frozen: &ContractDeliverable) -> Self {
+        pangu_core::DeliverableSpec {
+            name: frozen.name.clone(),
+            path: frozen.path.clone(),
+            kind: frozen.kind.clone(),
+            acceptor: frozen.acceptor,
+            min_bytes: frozen.min_bytes,
+        }
+    }
+}
+
+/// D3/D4: the frozen deliverable set. Empty = no deliverable semantics; runs
+/// keep their historical digests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ContractDeliverables {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverables: Vec<ContractDeliverable>,
+}
+
 /// B3: the controlled memory queue, frozen into the contract. The bounds ride
 /// with the contract so an injected store cannot quietly widen them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -110,6 +142,9 @@ pub struct GoalContract {
     /// and runs unchanged.
     #[serde(default)]
     pub skills: ContractSkills,
+    /// D3/D4: the frozen deliverable set. Empty keeps historical digests.
+    #[serde(default)]
+    pub deliverables: ContractDeliverables,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
@@ -159,6 +194,7 @@ impl GoalContract {
             verify_command: Vec::new(),
             memory: ContractMemory::default(),
             skills: ContractSkills::default(),
+            deliverables: ContractDeliverables::default(),
             extra_readonly_commands: Vec::new(),
             checkpoint: CheckpointSection::default(),
             conversation: ConversationSection::default(),
@@ -260,6 +296,20 @@ impl GoalContract {
             max_paths_per_action: config.boundary.max_paths_per_action,
             verify_command: config.verify.command.clone(),
             skills,
+            deliverables: ContractDeliverables {
+                deliverables: config
+                    .goal
+                    .deliverable
+                    .iter()
+                    .map(|spec| ContractDeliverable {
+                        name: spec.name.clone(),
+                        path: spec.path.clone(),
+                        kind: spec.kind.clone(),
+                        acceptor: spec.acceptor,
+                        min_bytes: spec.min_bytes,
+                    })
+                    .collect(),
+            },
             memory: ContractMemory {
                 enabled: config.memory.enabled,
                 max_pending: config.memory.max_pending,
@@ -336,6 +386,11 @@ impl GoalContract {
     /// B2: the frozen skill set.
     pub fn skills(&self) -> &ContractSkills {
         &self.skills
+    }
+
+    /// D3/D4: the frozen deliverable set.
+    pub fn deliverables(&self) -> &ContractDeliverables {
+        &self.deliverables
     }
 
     /// C5: the declared execution backend.
@@ -427,6 +482,16 @@ impl GoalContract {
                 object.insert(
                     "memory".into(),
                     serde_json::to_value(&self.memory).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        // D3/D4: only declared deliverables change the digest; undeclared
+        // runs keep their historical digest.
+        if !self.deliverables.deliverables.is_empty() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "deliverables".into(),
+                    serde_json::to_value(&self.deliverables).unwrap_or(serde_json::Value::Null),
                 );
             }
         }

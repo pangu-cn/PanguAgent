@@ -138,7 +138,7 @@ RollbackSkippedAlreadyApplied, RollbackFailed, FailedPathRecorded,
 ContextAssembled, PhaseChanged, ProviderSwitched, MemoryProposed
 ```
 
-（B2 的技能拒载不发新 kind：复用 `Note`，理由见 ADR-0007——被拒包是运维事实而非运行语义。）
+（B2 的技能拒载不发新 kind：复用 `Note`，理由见 ADR-0007——被拒包是运维事实而非运行语义。）DeliverableRecorded 为 D3/D4 的交付登记（provisional，digest only）。
 
 启用 checkpoint 的运行使用 `pangu-journal/v2`；禁用时保留 v1。v2 写入时封存 `schema`、连续 `seq`、`prev_sha`、内容 `sha` 和 `evt_<sha256>` 稳定 ID。`EventSink::emit` 保持兼容，内部 receipt 路径使用 `emit_with_receipt`；TeeSink 比较多个 durable sink 的 receipt，不一致则失败。Journal replay 只校验和索引，不恢复文件、不重放副作用。
 
@@ -259,6 +259,7 @@ B4 的 provider 注册表（`pangu-boundary::registry`）是静态配置数据�
 | I-Fallback-Declared-Chain | `pangu-boundary/src/config.rs`, `pangu-agent/src/lib.rs` (`with_chain`, `chat_with_fallback`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | fallback 只沿 contract 冻结链进行；切换与失败有事件；按段计价不低估成本；链耗尽即失败 |
 | I-Memory-Proposal-Only | `pangu-core/src/memory.rs`, `pangu-toolkit/src/lib.rs` (`propose_memory`), `pangu-agent/src/lib.rs` (`with_memory`, 注入), `crates/pangu-toolkit/tests/toolkit_integration.rs` | 模型只入队；accept 仅 CLI；`.pangu` 禁区 + internal I/O 语义；注入块标注 UNTRUSTED/no authorization |
 | I-Skill-Operator-Installed | `pangu-core/src/skills.rs`, `pangu-toolkit/src/lib.rs` (`read_skill`), `pangu-agent/src/lib.rs` (`with_skills`, 冻结比对), `crates/pangu-toolkit/tests/toolkit_integration.rs` | 技能仅操作者安装；hash 校验拒载 audible；脚本零执行原语；索引/正文标注无权限 |
+| I-Deliverable-Evidence-Before-Complete | `pangu-core/src/deliverable.rs`, `pangu-agent/src/lib.rs` (`finish_status`, `record_deliverables`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | complete 过验收闸门（失败回灌）；登记是 complete 一部分；签收仅 run 外 CLI；complete ≠ accepted |
 
 ## 已知边界
 

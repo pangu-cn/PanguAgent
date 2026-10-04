@@ -14,8 +14,8 @@ use pangu_boundary::{
     Risk, Sandbox, StdinApproval, Unattended,
 };
 use pangu_core::{
-    ChatResponse, Journal, MemoryLimits, MemoryStore, Message, RollbackRequest, SkillRegistry,
-    TeeSink, ToolCall, Usage,
+    ChatResponse, DeliverableStore, Journal, MemoryLimits, MemoryStore, Message, RollbackRequest,
+    SkillRegistry, TeeSink, ToolCall, Usage,
 };
 use pangu_provider::OpenAiCompatibleProvider;
 use pangu_toolkit::Toolkit;
@@ -153,6 +153,42 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         action: SkillsCommands,
+    },
+    /// D3/D4: operator acceptance for declared deliverables. The run can
+    /// only record a delivery snapshot; accepting or rejecting it is a
+    /// human decision made here.
+    Deliverable {
+        #[command(subcommand)]
+        action: DeliverableCommands,
+    },
+}
+
+/// D3/D4: deliverable acceptance lifecycle (operator-only).
+#[derive(Clone, Debug, Subcommand)]
+enum DeliverableCommands {
+    /// List recorded delivery snapshots and their acceptance status.
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Only show records still awaiting acceptance.
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Accept the latest pending record of one deliverable.
+    Accept {
+        name: String,
+        #[arg(long, default_value = "cli")]
+        by: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Reject the latest pending record of one deliverable.
+    Reject {
+        name: String,
+        #[arg(long, default_value = "cli")]
+        by: String,
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -448,6 +484,15 @@ async fn main() -> Result<()> {
             SkillsCommands::List { json } => skills_list(&args, json),
             SkillsCommands::Verify { name } => skills_verify(&args, name.as_deref()),
             SkillsCommands::Remove { name } => skills_remove(&args, &name),
+        },
+        Some(Commands::Deliverable { action }) => match action {
+            DeliverableCommands::List { json, pending } => deliverable_list(&args, json, pending),
+            DeliverableCommands::Accept { name, by, note } => {
+                deliverable_decide(&args, "accept", &name, &by, note)
+            }
+            DeliverableCommands::Reject { name, by, note } => {
+                deliverable_decide(&args, "reject", &name, &by, note)
+            }
         },
         Some(Commands::Repo { action }) => match action {
             RepoCommands::Map { root, budget, json } => repo_map(root, budget, json),
@@ -1191,6 +1236,89 @@ fn skills_remove(args: &Cli, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// D3/D4: open the operator-side deliverable registry.
+fn deliverables_cli(config: &Config) -> Result<DeliverableStore> {
+    let workspace = config.workspace_abs();
+    Ok(DeliverableStore::open(
+        &workspace.join(".pangu").join("deliverables"),
+    )?)
+}
+
+/// D3/D4: list recorded delivery snapshots.
+fn deliverable_list(args: &Cli, json: bool, pending_only: bool) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let store = deliverables_cli(&config)?;
+    let records = store.records();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": pangu_core::DELIVERABLES_SCHEMA,
+                "records": records,
+                "derived": true,
+                "authoritative": false,
+            }))?
+        );
+        return Ok(());
+    }
+    let shown: Vec<_> = records
+        .iter()
+        .filter(|record| !pending_only || record.acceptance == pangu_core::Acceptance::Pending)
+        .collect();
+    if shown.is_empty() {
+        println!("no deliverable records");
+        return Ok(());
+    }
+    for record in shown {
+        println!(
+            "{} [{}] {} {} sha256={} bytes={}",
+            record.name,
+            record.kind,
+            record.acceptance.as_str(),
+            record.path,
+            &record.sha256[..12],
+            record.bytes,
+        );
+        if let Some(run) = &record.run {
+            println!("  run: {run}");
+        }
+        println!("  recorded: {}", record.recorded_at);
+        for transition in &record.transitions {
+            println!(
+                "  {}: at {} by {}{}",
+                transition.action,
+                transition.at,
+                transition.by,
+                transition
+                    .note
+                    .as_deref()
+                    .map(|note| format!(" ({note})"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// D3/D4: one operator acceptance transition.
+fn deliverable_decide(
+    args: &Cli,
+    action: &str,
+    name: &str,
+    by: &str,
+    note: Option<String>,
+) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let store = deliverables_cli(&config)?;
+    match action {
+        "accept" => store.accept(name, by, note)?,
+        "reject" => store.reject(name, by, note)?,
+        other => bail!("unknown deliverable action {other}"),
+    }
+    println!("{action}ed deliverable `{name}`");
+    Ok(())
+}
+
 /// B2: load the operator-side registry handle.
 fn skills_registry(config: &Config) -> Result<SkillRegistry> {
     let workspace = config.workspace_abs();
@@ -1468,6 +1596,7 @@ async fn rollback_command(
         &format!("run-{}", unix_nanos()),
     )?;
     let skills = build_skills_registry(&config, contract.workspace())?;
+    let deliverables = build_deliverables_registry(&config, contract.workspace())?;
     let toolkit = {
         let base = Toolkit::with_verify_command(config.verify.command.clone());
         let base = match &memory {
@@ -1496,6 +1625,9 @@ async fn rollback_command(
     }
     if let Some(registry) = skills {
         agent = agent.with_skills(registry);
+    }
+    if let Some(store) = deliverables {
+        agent = agent.with_deliverables(store);
     }
     let result = agent.rollback(request).await?;
     println!(
@@ -1610,6 +1742,22 @@ fn build_skills_registry(
     )?)))
 }
 
+/// D3/D4: build the deliverable registry when the contract declares
+/// deliverables. The registry lives under `<workspace>/.pangu/deliverables/`
+/// (tool-forbidden); the run's finish gate records into it, and the
+/// operator's accept/reject decisions live there.
+fn build_deliverables_registry(
+    config: &Config,
+    workspace: &std::path::Path,
+) -> Result<Option<Arc<DeliverableStore>>> {
+    if config.goal.deliverable.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(DeliverableStore::open(
+        &workspace.join(".pangu").join("deliverables"),
+    )?)))
+}
+
 fn build_provider_chain(config: &Config) -> Result<ProviderChain> {
     let resolved = config.resolve_provider()?;
     let model = resolved
@@ -1691,6 +1839,9 @@ async fn execute_goal(
     // registry backs the toolkit's `read_skill` tool and the agent's
     // contract-frozen skill-set comparison.
     let skills = build_skills_registry(&config, contract.workspace())?;
+    // D3/D4: attach the deliverable registry when the contract declares
+    // deliverables; the finish gate and the recording step share it.
+    let deliverables = build_deliverables_registry(&config, contract.workspace())?;
     let toolkit = {
         let base = Toolkit::with_verify_command(config.verify.command.clone());
         let base = match &memory {
@@ -1711,6 +1862,9 @@ async fn execute_goal(
     }
     if let Some(registry) = skills {
         agent = agent.with_skills(registry);
+    }
+    if let Some(store) = deliverables {
+        agent = agent.with_deliverables(store);
     }
     let outcome = agent.run().await?;
     eprintln!("journal: {}", journal_path.display());

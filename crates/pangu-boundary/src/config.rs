@@ -548,6 +548,10 @@ pub struct GoalSection {
     pub require_evidence: bool,
     pub min_successful_tool_calls: u32,
     pub system_prompt: String,
+    /// D3/D4: declared deliverables. Empty = no deliverable semantics, runs
+    /// behave exactly as before.
+    #[serde(default)]
+    pub deliverable: Vec<pangu_core::DeliverableSpec>,
     /// F4: when true, the run starts in a read-only plan phase; the model's
     /// `begin_act` control call is the only way into the act phase, where
     /// every mutating action is still individually approved. Default false:
@@ -562,6 +566,7 @@ impl Default for GoalSection {
             min_successful_tool_calls: 1,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             plan_first: false,
+            deliverable: Vec::new(),
         }
     }
 }
@@ -745,6 +750,41 @@ impl Config {
                 ));
             }
             pangu_core::Glob::new(pattern)?;
+        }
+        // D3/D4: deliverable declarations must be well-formed and unique.
+        let mut deliverable_names = std::collections::HashSet::new();
+        for deliverable in &self.goal.deliverable {
+            if deliverable.name.is_empty()
+                || deliverable.name.len() > 64
+                || !deliverable
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(Error::Config(format!(
+                    "goal.deliverable name `{}` is invalid (lowercase letters, digits, hyphen; 1-64 chars)",
+                    deliverable.name
+                )));
+            }
+            if !deliverable_names.insert(deliverable.name.as_str()) {
+                return Err(Error::Config(format!(
+                    "goal.deliverable name `{}` is declared twice",
+                    deliverable.name
+                )));
+            }
+            pangu_core::deliverable::validate_relative_path(&deliverable.path)?;
+            if deliverable.kind.trim().is_empty() || deliverable.kind.len() > 32 {
+                return Err(Error::Config(format!(
+                    "goal.deliverable `{}` kind must be 1-32 chars",
+                    deliverable.name
+                )));
+            }
+            if deliverable.min_bytes == 0 || deliverable.min_bytes > 16_777_216 {
+                return Err(Error::Config(format!(
+                    "goal.deliverable `{}` min_bytes must be between 1 and 16777216",
+                    deliverable.name
+                )));
+            }
         }
         // B2: bounded skill registry behavior + a well-formed pinned key.
         let skills = &self.skills;
@@ -2075,6 +2115,52 @@ control"
         assert!(enabled.memory().enabled);
         assert_eq!(enabled.memory().max_pending, 7);
         assert_ne!(disabled.digest(), enabled.digest());
+    }
+
+    /// D3/D4: declared deliverables change the digest; bad declarations
+    /// fail at config time.
+    #[test]
+    fn deliverables_freeze_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        let plain = crate::goal::GoalContract::from_config("no deliverables", &base).unwrap();
+        assert!(plain.deliverables().deliverables.is_empty());
+
+        let mut declared = base.clone();
+        declared.goal.deliverable = vec![pangu_core::DeliverableSpec {
+            name: "report".into(),
+            path: "out/report.md".into(),
+            kind: "report".into(),
+            acceptor: pangu_core::Acceptor::Manual,
+            min_bytes: 1,
+        }];
+        declared.validate().expect("valid declaration");
+        let with_deliverable =
+            crate::goal::GoalContract::from_config("with deliverable", &declared).unwrap();
+        assert_eq!(with_deliverable.deliverables().deliverables.len(), 1);
+        assert_ne!(plain.digest(), with_deliverable.digest());
+
+        // Duplicate names and unsafe paths fail at config time.
+        declared.goal.deliverable.push(pangu_core::DeliverableSpec {
+            name: "report".into(),
+            path: "out/other.md".into(),
+            kind: "report".into(),
+            acceptor: pangu_core::Acceptor::Manual,
+            min_bytes: 1,
+        });
+        let error = declared.validate().expect_err("duplicate name");
+        assert!(error.to_string().contains("twice"), "{error}");
+
+        declared.goal.deliverable[1].name = "other".into();
+        declared.goal.deliverable[1].path = "../escape.md".into();
+        let error = declared.validate().expect_err("path escape");
+        assert!(
+            error.to_string().contains("safe workspace-relative"),
+            "{error}"
+        );
+
+        declared.goal.deliverable[1].path = ".pangu/x.md".into();
+        let error = declared.validate().expect_err(".pangu path");
+        assert!(error.to_string().contains(".pangu"), "{error}");
     }
 
     /// B2: skills enabled changes the digest and freezes the loaded set.

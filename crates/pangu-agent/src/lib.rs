@@ -21,10 +21,10 @@ use pangu_boundary::{
     ValidatedResources,
 };
 use pangu_core::{
-    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event,
-    EventKind, EventSink, FailureClass, JournalMeta, MemoryStore, Message, RestoreDisposition,
-    RollbackOperation, RollbackRequest, SkillRegistry, ToolCall, ToolSpec, Usage, Value,
-    JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
+    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact,
+    DeliverableStore, Event, EventKind, EventSink, FailureClass, JournalMeta, MemoryStore, Message,
+    RestoreDisposition, RollbackOperation, RollbackRequest, SkillRegistry, ToolCall, ToolSpec,
+    Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
 };
 
 pub mod capability;
@@ -383,6 +383,10 @@ pub struct Agent {
     /// B2: the skill registry. Attached only when the contract enables the
     /// registry; used to inject the skill index and to pin the readable set.
     skills: Option<Arc<SkillRegistry>>,
+    /// D3/D4: the deliverable registry. Attached only when the contract
+    /// declares deliverables; `complete` runs the acceptance checks against
+    /// it and finished runs record their delivery snapshots into it.
+    deliverables: Option<Arc<DeliverableStore>>,
 }
 
 impl Agent {
@@ -492,6 +496,7 @@ impl Agent {
             resume_from: None,
             memory: None,
             skills: None,
+            deliverables: None,
         })
     }
 
@@ -509,6 +514,13 @@ impl Agent {
     /// loaded set diverges from the contract-frozen one.
     pub fn with_skills(mut self, registry: Arc<SkillRegistry>) -> Self {
         self.skills = Some(registry);
+        self
+    }
+
+    /// D3/D4: attach the deliverable registry. The run refuses to start if
+    /// the contract declares deliverables but no registry was attached.
+    pub fn with_deliverables(mut self, store: Arc<DeliverableStore>) -> Self {
+        self.deliverables = Some(store);
         self
     }
 
@@ -1447,6 +1459,13 @@ impl Agent {
     }
 
     async fn run_inner(&self) -> Result<Outcome> {
+        // D3/D4: declared deliverables require the registry; undeclared
+        // deliverables make the registry irrelevant.
+        if !self.contract.deliverables.deliverables.is_empty() && self.deliverables.is_none() {
+            return Err(anyhow!(
+                "GoalContract declares deliverables but no deliverable registry was attached;                  build the agent with `with_deliverables`"
+            ));
+        }
         self.check_skills_binding().await?;
         let started = Instant::now();
         let mut usage = Usage::default();
@@ -1802,8 +1821,28 @@ impl Agent {
                         ));
                     }
                 } else if call.name == "finish" {
-                    match self.finish_status(&call, evidence.len()) {
+                    match self.finish_status(&call, &evidence) {
                         Ok(status) => {
+                            if status == GoalStatus::Complete {
+                                // D3/D4: record the delivery snapshots before
+                                // the run ends; a registry failure refuses
+                                // the completion.
+                                if let Err(error) = self.record_deliverables(turn).await {
+                                    let context = FailureContext::from_call(&call);
+                                    self.record_tool_error_with_context(
+                                        &mut history,
+                                        &call,
+                                        turn,
+                                        EventKind::ToolBlocked,
+                                        error,
+                                        checkpoint_state.as_ref(),
+                                        &context,
+                                        FailureClass::InvalidToolCall,
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
                             self.emit(
                                 self.event(
                                     EventKind::FinishRequested,
@@ -2578,7 +2617,8 @@ impl Agent {
         Ok(())
     }
 
-    fn finish_status(&self, call: &ToolCall, evidence_count: usize) -> Result<GoalStatus> {
+    fn finish_status(&self, call: &ToolCall, evidence: &[String]) -> Result<GoalStatus> {
+        let evidence_count = evidence.len();
         let object = call
             .args
             .as_object()
@@ -2600,7 +2640,84 @@ impl Agent {
         {
             return Ok(GoalStatus::Failed);
         }
+        // D3/D4: a `complete` over declared deliverables must pass every
+        // acceptance check. Failures come back as a tool error so the model
+        // can repair the artifact and retry - an Aider-style verify loop at
+        // the finish gate.
+        if status == GoalStatus::Complete && !self.contract.deliverables.deliverables.is_empty() {
+            let has_verify_evidence = evidence.iter().any(|item| item.starts_with("verify:"));
+            let mut failures = Vec::new();
+            for frozen in &self.contract.deliverables.deliverables {
+                let spec = pangu_core::DeliverableSpec::from(frozen);
+                let outcome = pangu_core::deliverable::check_spec(
+                    &spec,
+                    self.contract.workspace(),
+                    has_verify_evidence,
+                );
+                if !outcome.passed {
+                    failures.push(format!("  - {}: {}", spec.name, outcome.detail));
+                }
+            }
+            if !failures.is_empty() {
+                return Err(anyhow!(
+                    "deliverable acceptance failed ({} of {}); fix and call finish again:\n{}",
+                    failures.len(),
+                    self.contract.deliverables.deliverables.len(),
+                    failures.join("\n")
+                ));
+            }
+        }
         Ok(status)
+    }
+
+    /// D3/D4: record every declared deliverable into the registry and emit
+    /// one `DeliverableRecorded` event per artifact. Called only after all
+    /// acceptance checks passed; a registry failure refuses the `complete`
+    /// the same way a failed check does - an unaudited completion is not a
+    /// completion.
+    async fn record_deliverables(&self, turn: u32) -> Result<()> {
+        let Some(store) = self.deliverables.as_ref() else {
+            return Ok(());
+        };
+        for frozen in &self.contract.deliverables.deliverables {
+            let spec = pangu_core::DeliverableSpec::from(frozen);
+            let outcome =
+                pangu_core::deliverable::check_spec(&spec, self.contract.workspace(), false);
+            let sha256 = outcome.sha256.ok_or_else(|| {
+                anyhow!(
+                    "deliverable `{}` disappeared between the finish check and recording",
+                    spec.name
+                )
+            })?;
+            let bytes = outcome.bytes.unwrap_or(0);
+            store
+                .record(&spec, &sha256, bytes, None)
+                .map_err(|error| anyhow!("deliverable registry: {error}"))?;
+            self.emit(
+                self.event(
+                    EventKind::DeliverableRecorded,
+                    turn,
+                    format!(
+                        "deliverable `{}` recorded: {} bytes={} sha256={}",
+                        spec.name,
+                        spec.path,
+                        bytes,
+                        &sha256[..12]
+                    ),
+                )
+                .tool("finish")
+                .payload(serde_json::json!({
+                    "name": spec.name,
+                    "path": spec.path,
+                    "kind": spec.kind,
+                    "acceptor": spec.acceptor.as_str(),
+                    "sha256": sha256,
+                    "bytes": bytes,
+                })),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn budget_breaches(
