@@ -72,6 +72,22 @@ pub struct ContractDeliverables {
     pub deliverables: Vec<ContractDeliverable>,
 }
 
+/// F5: the declared evaluation profile, frozen into the contract. The issue
+/// *path* rides with the digest; the issue *content* is pinned by the digest
+/// recorded in the evaluation record at run start. Empty profile = no
+/// evaluation semantics; runs keep their historical digests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ContractEval {
+    pub profile: String,
+    pub issue_path: String,
+}
+
+impl ContractEval {
+    pub fn is_declared(&self) -> bool {
+        !self.profile.is_empty()
+    }
+}
+
 /// B3: the controlled memory queue, frozen into the contract. The bounds ride
 /// with the contract so an injected store cannot quietly widen them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -145,6 +161,9 @@ pub struct GoalContract {
     /// D3/D4: the frozen deliverable set. Empty keeps historical digests.
     #[serde(default)]
     pub deliverables: ContractDeliverables,
+    /// F5: the declared evaluation profile. Undeclared keeps historical digests.
+    #[serde(default)]
+    pub eval: ContractEval,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
@@ -195,6 +214,7 @@ impl GoalContract {
             memory: ContractMemory::default(),
             skills: ContractSkills::default(),
             deliverables: ContractDeliverables::default(),
+            eval: ContractEval::default(),
             extra_readonly_commands: Vec::new(),
             checkpoint: CheckpointSection::default(),
             conversation: ConversationSection::default(),
@@ -310,6 +330,10 @@ impl GoalContract {
                     })
                     .collect(),
             },
+            eval: ContractEval {
+                profile: config.eval.profile.clone(),
+                issue_path: config.eval.issue_path.clone(),
+            },
             memory: ContractMemory {
                 enabled: config.memory.enabled,
                 max_pending: config.memory.max_pending,
@@ -391,6 +415,11 @@ impl GoalContract {
     /// D3/D4: the frozen deliverable set.
     pub fn deliverables(&self) -> &ContractDeliverables {
         &self.deliverables
+    }
+
+    /// F5: the declared evaluation profile.
+    pub fn eval(&self) -> &ContractEval {
+        &self.eval
     }
 
     /// C5: the declared execution backend.
@@ -492,6 +521,16 @@ impl GoalContract {
                 object.insert(
                     "deliverables".into(),
                     serde_json::to_value(&self.deliverables).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        // F5: only a declared evaluation profile changes the digest;
+        // undeclared runs keep their historical digest.
+        if self.eval.is_declared() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "eval".into(),
+                    serde_json::to_value(&self.eval).unwrap_or(serde_json::Value::Null),
                 );
             }
         }

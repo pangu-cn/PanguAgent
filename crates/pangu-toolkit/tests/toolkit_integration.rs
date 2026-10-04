@@ -2040,3 +2040,91 @@ async fn no_declared_deliverables_keeps_finish_semantics_unchanged() {
     assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
     std::fs::remove_dir_all(root).expect("cleanup");
 }
+
+// ---- F5: issue-to-patch evaluation record ---------------------------------
+
+#[tokio::test]
+async fn eval_context_captures_the_run_facts() {
+    let root = temp_root("f5-eval");
+    let store =
+        Arc::new(DeliverableStore::open(&root.join(".pangu").join("deliverables")).expect("store"));
+    let eval_dir = root.join(".pangu").join("eval");
+    let eval_store = pangu_core::EvalStore::open(&eval_dir).expect("eval store");
+    std::fs::create_dir_all(root.join("out")).expect("out dir");
+    let patch_body =
+        "{\"diff\": \"--- a/lib.rs\\n+++ b/lib.rs\", \"summary\": \"swap old for new\"}";
+    std::fs::write(root.join("out/report.md"), patch_body).expect("patch");
+
+    // The run reads the workspace (evidence), then finishes complete.
+    let read = response_with_usage(
+        vec![ToolCall::new("read_file", json!({"path": "out/report.md"}))],
+        0,
+    );
+    let provider = Arc::new(NamedScriptedProvider {
+        model: "toolkit-integration-test-model".into(),
+        responses: Mutex::new(vec![read, finish_response()].into()),
+    });
+    let (agent, _sink) = build_deliverable_agent(&root, store.clone(), provider, true);
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+
+    // F5: the outcome now carries the trajectory/cost summary.
+    assert!(outcome.turns >= 2, "turns: {}", outcome.turns);
+    assert_eq!(
+        outcome.cost_usd,
+        Some(0.0),
+        "test config declares zero prices"
+    );
+
+    // Assemble the evaluation record from the run's facts.
+    let deliverables = store
+        .records()
+        .into_iter()
+        .map(|record| pangu_core::EvalDeliverable {
+            name: record.name,
+            path: record.path,
+            sha256: record.sha256,
+            bytes: record.bytes,
+            acceptance: record.acceptance.as_str().to_string(),
+        })
+        .collect();
+    let context = pangu_core::EvalContext {
+        profile: "issue-fix".into(),
+        issue: pangu_core::EvalIssue {
+            path: "issues/001.md".into(),
+            sha256: "a".repeat(64),
+        },
+        workspace_version: "unknown".into(),
+        contract_digest: "c".repeat(64),
+        started_at: pangu_core::now_rfc3339(),
+        store: eval_store,
+    };
+    let facts = pangu_core::EvalRunFacts {
+        status: outcome.status.as_str().to_string(),
+        turns: outcome.turns,
+        usage: outcome.usage,
+        cost_usd: outcome.cost_usd,
+        evidence: outcome.evidence.clone(),
+    };
+    let record = context
+        .finish(&facts, deliverables, "journal-run-test.jsonl")
+        .expect("eval record");
+    assert_eq!(record.status, "complete");
+    assert_eq!(record.turns, outcome.turns);
+    assert_eq!(record.cost_usd, Some(0.0));
+    assert_eq!(record.deliverables.len(), 1);
+    assert_eq!(record.deliverables[0].name, "report");
+    assert_eq!(record.verify_evidence, 0, "no verify command in this run");
+    // The disclaimer travels with every record.
+    assert!(record
+        .notes
+        .iter()
+        .any(|note| note.contains("do not assert the issue is fixed")));
+    // And the registry holds it.
+    let records = pangu_core::EvalStore::open(&eval_dir)
+        .expect("reopen")
+        .records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, record.id);
+    std::fs::remove_dir_all(root).expect("cleanup");
+}

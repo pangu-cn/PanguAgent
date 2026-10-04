@@ -1939,6 +1939,8 @@ impl Agent {
             messages: history,
             usage,
             evidence,
+            turns: last_turn,
+            cost_usd: if spent.is_finite() { Some(spent) } else { None },
         })
     }
 
@@ -2970,6 +2972,11 @@ pub struct Outcome {
     pub messages: Vec<Message>,
     pub usage: Usage,
     pub evidence: Vec<String>,
+    /// F5: number of the last turn executed (trajectory summary).
+    pub turns: u32,
+    /// F5: total priced cost of the run; `None` when the primary model has
+    /// no declared price. Unpriced is distinguishable from free.
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

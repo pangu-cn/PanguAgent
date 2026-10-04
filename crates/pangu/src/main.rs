@@ -14,8 +14,8 @@ use pangu_boundary::{
     Risk, Sandbox, StdinApproval, Unattended,
 };
 use pangu_core::{
-    ChatResponse, DeliverableStore, Journal, MemoryLimits, MemoryStore, Message, RollbackRequest,
-    SkillRegistry, TeeSink, ToolCall, Usage,
+    ChatResponse, DeliverableStore, EvalContext, EvalDeliverable, EvalIssue, EvalStore, Journal,
+    MemoryLimits, MemoryStore, Message, RollbackRequest, SkillRegistry, TeeSink, ToolCall, Usage,
 };
 use pangu_provider::OpenAiCompatibleProvider;
 use pangu_toolkit::Toolkit;
@@ -160,6 +160,26 @@ enum Commands {
     Deliverable {
         #[command(subcommand)]
         action: DeliverableCommands,
+    },
+    /// F5: issue-to-patch evaluation profile. One run becomes a reproducible
+    /// experiment: issue digest, workspace version, frozen contract, patch
+    /// deliverables, trajectory pointer and cost. Scores never replace
+    /// acceptance.
+    Eval {
+        #[command(subcommand)]
+        action: EvalCommands,
+    },
+}
+
+/// F5: evaluation lifecycle.
+#[derive(Clone, Debug, Subcommand)]
+enum EvalCommands {
+    /// Run one evaluation: pin the issue, execute the goal, record the facts.
+    Run,
+    /// List recorded evaluations (machine facts, not acceptance verdicts).
+    List {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -484,6 +504,10 @@ async fn main() -> Result<()> {
             SkillsCommands::List { json } => skills_list(&args, json),
             SkillsCommands::Verify { name } => skills_verify(&args, name.as_deref()),
             SkillsCommands::Remove { name } => skills_remove(&args, &name),
+        },
+        Some(Commands::Eval { action }) => match action {
+            EvalCommands::Run => eval_run(&args).await,
+            EvalCommands::List { json } => eval_list(&args, json),
         },
         Some(Commands::Deliverable { action }) => match action {
             DeliverableCommands::List { json, pending } => deliverable_list(&args, json, pending),
@@ -1236,6 +1260,178 @@ fn skills_remove(args: &Cli, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// F5: probe the workspace's git version. An observation of the operator
+/// environment, recorded so an evaluation can be reproduced against the same
+/// checkout; failures degrade honestly to `unknown`.
+fn probe_workspace_version(workspace: &std::path::Path) -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// F5: run one issue-to-patch evaluation. The issue document is pinned by
+/// content digest at run start and becomes the goal text (with its source
+/// labeled); the run proceeds through the exact same boundary chain as
+/// `pangu run`, and its machine-fact outcome is appended to
+/// `<workspace>/.pangu/eval/records.json`. A run that errors before a
+/// terminal state is audited in the journal only.
+async fn eval_run(args: &Cli) -> Result<()> {
+    let (mut config, files) = Config::load(args.config.as_deref())?;
+    if !config.eval.is_declared() {
+        bail!(
+            "no evaluation profile declared; set [eval] profile and issue_path in the config \
+             (see `pangu config`)"
+        );
+    }
+    let overrides = CliOverrides {
+        workspace: args.workspace.clone(),
+        max_turns: args.max_turns,
+        max_cost_usd: args.max_cost_usd,
+        unattended: args.unattended,
+        checkpoint_enabled: if args.checkpoint {
+            Some(true)
+        } else if args.no_checkpoint {
+            Some(false)
+        } else {
+            None
+        },
+        ..Default::default()
+    };
+    config = config.apply(&overrides)?;
+    if args.unattended {
+        eprintln!("WARNING: unattended mode disables human approval; this is not a safety mode");
+    }
+    let workspace = config.workspace_abs();
+    let issue_path = workspace.join(
+        config
+            .eval
+            .issue_path
+            .replace('/', std::path::MAIN_SEPARATOR_STR),
+    );
+    let issue_meta = std::fs::metadata(&issue_path)
+        .map_err(|error| anyhow!("issue document {}: {error}", issue_path.display()))?;
+    if !issue_meta.is_file() {
+        bail!(
+            "issue document {} is not a regular file",
+            issue_path.display()
+        );
+    }
+    if issue_meta.len() > 262_144 {
+        bail!(
+            "issue document {} is {} bytes; the evaluation input limit is 262144 bytes",
+            issue_path.display(),
+            issue_meta.len()
+        );
+    }
+    let issue_content = std::fs::read_to_string(&issue_path)
+        .map_err(|error| anyhow!("reading issue document {}: {error}", issue_path.display()))?;
+    let issue = EvalIssue {
+        path: config.eval.issue_path.clone(),
+        sha256: pangu_core::hex_sha256(&issue_content),
+    };
+    let workspace_version = probe_workspace_version(&workspace);
+    let store = EvalStore::open(&workspace.join(".pangu").join("eval"))?;
+    let context = EvalContext {
+        profile: config.eval.profile.clone(),
+        issue: issue.clone(),
+        workspace_version: workspace_version.clone(),
+        contract_digest: String::new(),
+        started_at: pangu_core::now_rfc3339(),
+        store,
+    };
+    // The goal text embeds the issue with its source labeled: the model sees
+    // where the task came from, and the digest pins exactly which version.
+    let goal = format!(
+        "Fix the issue below.\n\nIssue source: {} (sha256:{})\nWorkspace version: {}\n\n---\n{}",
+        issue.path, issue.sha256, workspace_version, issue_content
+    );
+    let (primary, fallbacks) = build_provider_chain(&config)?;
+    let status = execute_goal(
+        config,
+        files,
+        goal,
+        primary,
+        fallbacks,
+        false,
+        Some(context),
+    )
+    .await?;
+    if !status.is_success() {
+        bail!("evaluation run ended with status {status}");
+    }
+    Ok(())
+}
+
+/// F5: list recorded evaluations. Every record carries the fixed disclaimer:
+/// these are machine facts about runs, not acceptance verdicts.
+fn eval_list(args: &Cli, json: bool) -> Result<()> {
+    let (config, _) = Config::load(args.config.as_deref())?;
+    let workspace = config.workspace_abs();
+    let store = EvalStore::open(&workspace.join(".pangu").join("eval"))?;
+    let records = store.records();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": pangu_core::EVAL_SCHEMA,
+                "records": records,
+                "derived": true,
+                "authoritative": false,
+            }))?
+        );
+        return Ok(());
+    }
+    if records.is_empty() {
+        println!("no evaluation records");
+        return Ok(());
+    }
+    for record in records {
+        let cost = record
+            .cost_usd
+            .map(|cost| format!("${cost:.4}"))
+            .unwrap_or_else(|| "unpriced".to_string());
+        println!(
+            "{} [{}] profile={} status={} turns={} verify_evidence={} cost={}",
+            record.id,
+            record.finished_at,
+            record.profile,
+            record.status,
+            record.turns,
+            record.verify_evidence,
+            cost
+        );
+        println!(
+            "  issue: {} (sha256:{})",
+            record.issue.path,
+            &record.issue.sha256[..12]
+        );
+        println!("  workspace_version: {}", record.workspace_version);
+        println!("  contract: {}", &record.contract_digest[..12]);
+        println!(
+            "  usage: {} in / {} out tokens",
+            record.input_tokens, record.output_tokens
+        );
+        println!("  journal: {}", record.journal);
+        for deliverable in &record.deliverables {
+            println!(
+                "  deliverable {} [{}] bytes={} sha256={} acceptance={}",
+                deliverable.name,
+                deliverable.path,
+                deliverable.bytes,
+                &deliverable.sha256[..12],
+                deliverable.acceptance
+            );
+        }
+    }
+    Ok(())
+}
+
 /// D3/D4: open the operator-side deliverable registry.
 fn deliverables_cli(config: &Config) -> Result<DeliverableStore> {
     let workspace = config.workspace_abs();
@@ -1517,7 +1713,7 @@ async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
         return Ok(());
     }
     let (primary, fallbacks) = build_provider_chain(&config)?;
-    let status = execute_goal(config, files, goal, primary, fallbacks, false).await?;
+    let status = execute_goal(config, files, goal, primary, fallbacks, false, None).await?;
     if !status.is_success() {
         bail!("agent ended with status {status}");
     }
@@ -1678,6 +1874,7 @@ async fn demo(args: &Cli) -> Result<()> {
         provider,
         Vec::new(),
         true,
+        None,
     )
     .await?;
     if !status.is_success() {
@@ -1800,12 +1997,21 @@ async fn execute_goal(
     primary: Arc<dyn Provider>,
     fallbacks: Vec<Arc<dyn Provider>>,
     use_unattended: bool,
+    eval: Option<EvalContext>,
 ) -> Result<pangu_boundary::GoalStatus> {
     let mut contract = GoalContract::from_config(goal, &config)?;
     contract.config_files = files
         .iter()
         .map(|path| path.display().to_string())
         .collect();
+    // F5: pin the frozen contract into the evaluation context before the
+    // agent is built (the contract is moved into it). The digest does not
+    // include the goal text; the issue content is pinned separately by its
+    // own digest in the evaluation record.
+    let eval = eval.map(|mut context| {
+        context.contract_digest = contract.digest().to_string();
+        context
+    });
     let policy = Arc::new(Policy::new(config.rules.clone())?);
     let sandbox = Arc::new(Sandbox::from_config(&config.boundary)?);
     let run_label = format!("run-{}", unix_nanos());
@@ -1842,6 +2048,10 @@ async fn execute_goal(
     // D3/D4: attach the deliverable registry when the contract declares
     // deliverables; the finish gate and the recording step share it.
     let deliverables = build_deliverables_registry(&config, contract.workspace())?;
+    let deliverables_before = deliverables
+        .as_ref()
+        .map(|store| store.records().len())
+        .unwrap_or(0);
     let toolkit = {
         let base = Toolkit::with_verify_command(config.verify.command.clone());
         let base = match &memory {
@@ -1863,8 +2073,8 @@ async fn execute_goal(
     if let Some(registry) = skills {
         agent = agent.with_skills(registry);
     }
-    if let Some(store) = deliverables {
-        agent = agent.with_deliverables(store);
+    if let Some(store) = &deliverables {
+        agent = agent.with_deliverables(store.clone());
     }
     let outcome = agent.run().await?;
     eprintln!("journal: {}", journal_path.display());
@@ -1874,6 +2084,48 @@ async fn execute_goal(
         outcome.usage.total(),
         outcome.evidence.len()
     );
+    // F5: append the evaluation record when a profile is active. Only runs
+    // that reach a terminal state are recorded here; a run that errors
+    // earlier is audited in the journal alone. The deliverables captured are
+    // exactly the ones this run registered (records appended after the
+    // pre-run snapshot).
+    if let Some(context) = eval {
+        let deliverables = deliverables
+            .as_ref()
+            .map(|store| {
+                store
+                    .records()
+                    .into_iter()
+                    .skip(deliverables_before)
+                    .map(|record| EvalDeliverable {
+                        name: record.name,
+                        path: record.path,
+                        sha256: record.sha256,
+                        bytes: record.bytes,
+                        acceptance: record.acceptance.as_str().to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let journal_file = journal_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let facts = pangu_core::EvalRunFacts {
+            status: outcome.status.as_str().to_string(),
+            turns: outcome.turns,
+            usage: outcome.usage,
+            cost_usd: outcome.cost_usd,
+            evidence: outcome.evidence.clone(),
+        };
+        let record = context.finish(&facts, deliverables, &journal_file)?;
+        eprintln!(
+            "eval record: {} (profile `{}`, {} deliverable(s))",
+            record.id,
+            record.profile,
+            record.deliverables.len()
+        );
+    }
     Ok(outcome.status)
 }
 

@@ -52,6 +52,15 @@ extra_readonly_commands = []
 # acceptor = "manual"     # manual | verify | json | jsonl
 # min_bytes = 1
 
+# F5: 评测 profile。默认空 = 无评测语义、digest 不变。声明后 `pangu eval
+# run` 会把 issue 内容 digest（run 开始时钉取）、workspace git 版本、
+# contract digest、终态、成本、verify 证据计数和交付物快照固定成一条
+# pangu-eval/1 记录（.pangu/eval/records.json）。记录没有 score 字段——
+# 机器事实不断言修复；验收 = verify 证据 + 人工签收。
+# [eval]
+# profile = "issue-fix"
+# issue_path = "issues/001.md"
+
 [skills]
 enabled = false
 verify_key = ""

@@ -260,6 +260,7 @@ B4 的 provider 注册表（`pangu-boundary::registry`）是静态配置数据�
 | I-Memory-Proposal-Only | `pangu-core/src/memory.rs`, `pangu-toolkit/src/lib.rs` (`propose_memory`), `pangu-agent/src/lib.rs` (`with_memory`, 注入), `crates/pangu-toolkit/tests/toolkit_integration.rs` | 模型只入队；accept 仅 CLI；`.pangu` 禁区 + internal I/O 语义；注入块标注 UNTRUSTED/no authorization |
 | I-Skill-Operator-Installed | `pangu-core/src/skills.rs`, `pangu-toolkit/src/lib.rs` (`read_skill`), `pangu-agent/src/lib.rs` (`with_skills`, 冻结比对), `crates/pangu-toolkit/tests/toolkit_integration.rs` | 技能仅操作者安装；hash 校验拒载 audible；脚本零执行原语；索引/正文标注无权限 |
 | I-Deliverable-Evidence-Before-Complete | `pangu-core/src/deliverable.rs`, `pangu-agent/src/lib.rs` (`finish_status`, `record_deliverables`), `crates/pangu-toolkit/tests/toolkit_integration.rs` | complete 过验收闸门（失败回灌）；登记是 complete 一部分；签收仅 run 外 CLI；complete ≠ accepted |
+| I-Eval-Record-Not-Acceptance | `pangu-core/src/eval.rs`, `pangu-boundary/src/config.rs` (`[eval]`), `crates/pangu/src/main.rs` (`pangu eval run|list`) | 评测记录只含机器事实、无 score 字段、免责声明随记录；验收 = verify evidence + 人工签收 |
 
 ## 已知边界
 

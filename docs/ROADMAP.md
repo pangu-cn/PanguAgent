@@ -478,7 +478,12 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - 逐项展示：`write_file` 审批请求携带有界（8 KiB）、脱敏的 unified diff（`pangu-core::diff::unified_diff`，确定性 LCS + 上下文行，超界时明确说明而非静默截断/伪造）；命令与网络/读写范围展示沿用 A3 的 `ApprovalImpact`。diff 无法内联时（非 UTF-8、过大、不可读）说明原因，不伪造 "new file"。
   - 兼容性：`plan_first`/`diffs` 均为新增可选字段；digest 仅在 plan_first 启用时携带该键，默认运行 digest 不变；事件流新增 provisional kind 属契约"只增"演进。
   - **未包含（有意排除）**：人工切换相位的 UI 开关（模型提名过渡 + 逐项人工审批已满足边界；纯 UI 交互归 C1）；多相位计划文档与计划持久化；`--plan-only` 旗标（用 plan_first + `Never` 审批模式即可达到只读运行）。
-- [ ] **F5 Issue-to-patch 评测 profile**：借鉴 SWE-agent，把 issue、仓库版本、测试、patch、trajectory 和成本固定为可复现实验；benchmark 分数不替代验收。
+- [x] **F5 Issue-to-patch 评测 profile（已做）**：借鉴 SWE-agent，把 issue、仓库版本、测试、patch、trajectory 和成本固定为可复现实验；benchmark 分数不替代验收。设计详见 [`docs/adr/0009-issue-to-patch-eval.md`](adr/0009-issue-to-patch-eval.md)。
+  - `[eval]` 声明（profile + issue_path）；`pangu eval run` 在 run 开始钉取 issue 内容 SHA-256、探测 workspace git 版本（unknown 如实记录）、合成带来源标注的 goal 文本，然后走与 `pangu run` 完全相同的边界管线——评测不是新执行模式，对模型不可见。
+  - `pangu-eval/1` 记录（`.pangu/eval/records.json`，追加式/原子写/损坏硬错误）：输入三元组（issue digest + workspace_version + contract digest）、终态、turns、token、成本（未定价记 None 不是 0）、`verify:` 证据计数、本 run 登记的 deliverable 快照、Journal 指针。
+  - **没有 score 字段**：每条记录携带固定免责声明（机器事实不断言修复；验收 = verify evidence + 人工 deliverable 签收）；`complete` ≠ 修复正确（W-31）。
+  - `pangu eval list [--json]`；不声明 `[eval]` 时行为与 digest 完全不变。
+  - **未包含（有意排除）**：批处理 runner（多 issue 批量归 F6/C4）；内建 benchmark 判定 harness（属外部工具）；非终态 run 的 eval 记录（Journal 兜底）。
 - [ ] **F6 控制平面与 backend/automation profile**：借鉴 OpenHands Agent Canvas，支持本地、Docker、VM、远程 backend 和计划/webhook 任务；每个 backend 和任务都独立认证、限额、幂等和审计。
 - [x] **F7 Pangu Artifact 检查点与受限回退（需求已确认；ADR 已批准；阶段二实现已存在；默认关闭、实验性 opt-in、未正式激活）**：已实现成功 VerifiedAction 后的工作区快照、稳定事件指针、session node、operation ledger、typed rollback、failed-path/effect ledger、Journal v2 receipt 和 CLI 子命令；回退只恢复文件系统/会话状态，不回退外部副作用；默认不自动 commit。详细实现边界见 [`docs/adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md) 和 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)。当前不得把它描述为默认支持。
 
@@ -501,9 +506,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D3、D4、F1、F2、F3、F4
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D3、D4、F1、F2、F3、F4、F5
         （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
-第二批：F5
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```

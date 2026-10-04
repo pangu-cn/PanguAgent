@@ -50,6 +50,10 @@ pub struct Config {
     /// B2: the skill registry. Disabled by default: nothing loads.
     #[serde(default)]
     pub skills: SkillsSection,
+    /// F5: the evaluation profile. Undeclared by default: no eval semantics,
+    /// no digest change.
+    #[serde(default)]
+    pub eval: EvalSection,
 }
 
 /// B3: controlled memory candidate queue configuration. Disabled by default:
@@ -108,6 +112,29 @@ impl Default for SkillsSection {
             max_index_skills: 48,
             max_index_bytes: 8_192,
         }
+    }
+}
+
+/// F5: issue-to-patch evaluation profile. An empty `profile` means no
+/// evaluation semantics: nothing is frozen, nothing is recorded, digests and
+/// runs are exactly as before. A declared profile pins the issue document
+/// (by path; the content digest is taken at run start) so one run can be
+/// reproduced and audited as an experiment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EvalSection {
+    /// Profile name (lowercase letters, digits, hyphen; 1-64 chars). Empty =
+    /// evaluation not declared.
+    pub profile: String,
+    /// Workspace-relative path of the issue document. Must be a safe
+    /// workspace-relative path and must not live under `.pangu`.
+    pub issue_path: String,
+}
+
+impl EvalSection {
+    /// F5: whether an evaluation profile is declared.
+    pub fn is_declared(&self) -> bool {
+        !self.profile.trim().is_empty()
     }
 }
 
@@ -786,6 +813,34 @@ impl Config {
                 )));
             }
         }
+        // F5: a declared evaluation profile must name its issue document;
+        // an undeclared profile must not carry a stray issue path.
+        let eval = &self.eval;
+        if eval.is_declared() {
+            if eval.profile.len() > 64
+                || !eval
+                    .profile
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(Error::Config(
+                    "eval.profile is invalid (lowercase letters, digits, hyphen; 1-64 chars)"
+                        .into(),
+                ));
+            }
+            if eval.issue_path.trim().is_empty() {
+                return Err(Error::Config(
+                    "eval.issue_path must be set when eval.profile is declared".into(),
+                ));
+            }
+            pangu_core::deliverable::validate_relative_path(&eval.issue_path)
+                .map_err(|error| Error::Config(format!("eval.issue_path: {error}")))?;
+        } else if !eval.issue_path.trim().is_empty() {
+            return Err(Error::Config(
+                "eval.issue_path is set but eval.profile is empty (half-declared evaluation)"
+                    .into(),
+            ));
+        }
         // B2: bounded skill registry behavior + a well-formed pinned key.
         let skills = &self.skills;
         if skills.enabled {
@@ -1342,6 +1397,14 @@ impl Config {
         } else {
             String::new()
         };
+        let eval_line = if self.eval.is_declared() {
+            format!(
+                "eval           : profile `{}` — issue `{}`; records under .pangu/eval; scores never replace acceptance\n",
+                self.eval.profile, self.eval.issue_path
+            )
+        } else {
+            String::new()
+        };
         let skills_line = if self.skills.enabled {
             let key = if self.skills.verify_key.trim().is_empty() {
                 "no pinned key (unsigned/signed-unverified only)"
@@ -1353,7 +1416,7 @@ impl Config {
             String::new()
         };
         format!(
-            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{memory_line}{skills_line}\nrules:\n{}\n",
+            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{memory_line}{skills_line}{eval_line}\nrules:\n{}\n",
             self.boundary_digest(),
             self.workspace_abs().display(),
             self.boundary.writable_roots,
@@ -2115,6 +2178,46 @@ control"
         assert!(enabled.memory().enabled);
         assert_eq!(enabled.memory().max_pending, 7);
         assert_ne!(disabled.digest(), enabled.digest());
+    }
+
+    /// F5: a declared eval profile freezes into the contract and changes the
+    /// digest; half-declared profiles fail at config time.
+    #[test]
+    fn eval_profile_freezes_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        assert!(!base.eval.is_declared());
+        let plain = crate::goal::GoalContract::from_config("no eval", &base).unwrap();
+        assert!(!plain.eval().is_declared());
+
+        let mut declared = base.clone();
+        declared.eval.profile = "issue-fix".into();
+        declared.eval.issue_path = "issues/001.md".into();
+        declared.validate().expect("valid eval declaration");
+        let with_eval = crate::goal::GoalContract::from_config("with eval", &declared).unwrap();
+        assert_eq!(with_eval.eval().profile, "issue-fix");
+        assert_ne!(plain.digest(), with_eval.digest());
+
+        // Half-declared: issue path without a profile name.
+        let mut stray = base.clone();
+        stray.eval.issue_path = "issues/001.md".into();
+        let error = stray.validate().expect_err("stray issue path");
+        assert!(error.to_string().contains("half-declared"), "{error}");
+
+        // Missing issue path with a declared profile.
+        let mut no_issue = base.clone();
+        no_issue.eval.profile = "issue-fix".into();
+        let error = no_issue.validate().expect_err("missing issue path");
+        assert!(
+            error.to_string().contains("issue_path must be set"),
+            "{error}"
+        );
+
+        // Unsafe issue path.
+        let mut escape = base.clone();
+        escape.eval.profile = "issue-fix".into();
+        escape.eval.issue_path = ".pangu/issue.md".into();
+        let error = escape.validate().expect_err(".pangu issue path");
+        assert!(error.to_string().contains("eval.issue_path"), "{error}");
     }
 
     /// D3/D4: declared deliverables change the digest; bad declarations

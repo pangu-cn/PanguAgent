@@ -11,6 +11,7 @@ pub mod conversation;
 pub mod deliverable;
 pub mod diff;
 pub mod error;
+pub mod eval;
 pub mod events;
 pub mod export;
 pub mod glob;
@@ -52,6 +53,10 @@ pub use deliverable::{
 };
 pub use diff::unified_diff;
 pub use error::{Error, Result};
+pub use eval::{
+    EvalContext, EvalDeliverable, EvalIssue, EvalRecord, EvalRunFacts, EvalStore,
+    EVAL_NOT_ACCEPTANCE, EVAL_SCHEMA,
+};
 pub use events::{
     redact_event, redact_text, redact_value, Event, EventKind, EventSink, JournalMeta, MemSink,
     NullSink, Price, TeeSink, Usage, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,

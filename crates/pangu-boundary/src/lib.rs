@@ -19,14 +19,14 @@ pub use approval::{
 pub use budget::{Breach, Budget};
 pub use config::{
     BoundaryConfig, BoundarySection, CheckpointBackend, CheckpointFailurePolicy, CheckpointSection,
-    CliOverrides, Config, EnvSection, FallbackCandidate, MemorySection, SkillsSection,
+    CliOverrides, Config, EnvSection, EvalSection, FallbackCandidate, MemorySection, SkillsSection,
 };
 pub use execution::{ExecutionProfile, ExecutionSection};
 pub use explain::{
     explain_action, DeadRule, ExplainContext, ExplainReport, ExplainRequest, Layer, LayerOutcome,
     LayerReport, Projection, RuleStatus, RuleTrace, EXPLAIN_SCHEMA,
 };
-pub use goal::{GoalContract, GoalStatus};
+pub use goal::{ContractEval, GoalContract, GoalStatus};
 pub use policy::{ActionRequest, Decision, Effect, Policy, Rule};
 pub use registry::{
     preset, preset_model, presets, FieldSource, PriceSource, ProviderPreset, RegistryModel,

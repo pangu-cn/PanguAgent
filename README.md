@@ -190,6 +190,16 @@ acceptor = "manual"      # manual | verify | json | jsonl
 - 声明的交付物使 `complete` 成为验收闸门：文件存在、非空、验收器通过才接受；失败详情**回灌给模型**修复重试——没有静默完成。
 - 完成时产物快照（SHA-256/字节/时间/run）登记进 `<workspace>/.pangu/deliverables/` 并发事件；人工签收 `pangu deliverable list|accept|reject` 只发生在 run 外——`complete`（自动检查过）≠ `accepted`（人认可事实正确）。
 
+评测 profile（F5，详见 `docs/adr/0009-issue-to-patch-eval.md`）：
+
+```toml
+[eval]
+profile = "issue-fix"
+issue_path = "issues/001.md"
+```
+
+`pangu eval run` 把 issue 内容 digest、workspace git 版本、contract digest、终态、成本、`verify:` 证据计数和 patch 交付物快照固定成一条可复现实验记录（`.pangu/eval/`）。记录没有 score 字段——机器事实不断言"修好了"，验收 = 测试证据 + 人工签收。
+
 ## 配置与 CLI
 
 默认配置编译在 `config/boundary.toml`。`pangu` 还会按以下顺序加载一个用户配置：`--config`、`PANGU_CONFIG`、当前目录 `pangu.toml`、用户目录的 `~/.config/pangu/boundary.toml`；未找到时使用 embedded 配置。相对 roots 会按有效 workspace 解析。

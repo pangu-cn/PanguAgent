@@ -134,6 +134,15 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 - **签收只能由人做**：`pangu deliverable accept|reject` 是 run 外的独立动作，单向审计（同记忆生命周期）。`complete`（自动检查全过）≠ `accepted`（人认可事实正确）；格式正确也不等于事实正确（W-18）。
 - 产物文件的写入本身仍走 write_file 与 L1–L4；验收器不产生新权限面。
 
+### Issue-to-patch 评测 profile（F5）
+
+`[eval]` 声明把一次 run 固定成一个可复现实验。详见 [ADR-0009](adr/0009-issue-to-patch-eval.md)。规则：
+
+- **评测不是新执行模式**：`pangu eval run` 走与 `pangu run` 完全相同的 contract/policy/sandbox/approval 管线；对模型不可见（除 goal 文本内嵌 issue）。
+- **输入三元组落盘**：issue 内容 digest（run 开始时钉取）、workspace git 版本（环境观察，非验证事实）、contract digest；产物、成本（未定价记 None 不是 0）、`verify:` 证据计数、Journal 指针同录。
+- **没有 score 字段**：run 终态与证据计数是机器事实，不断言 issue 已修复；验收 = 测试证据（F3）+ 人工签收（D4），benchmark 分数不替代验收（W-31）。
+- 记录追加式、原子写、损坏硬错误；issue 文本是外部输入，goal 内标注来源与 digest（W-38）。
+
 ### 执行后端声明（C5）
 
 `[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
@@ -196,6 +205,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 22. **I-Memory-Proposal-Only**：仅当 `[memory] enabled` 时生效。模型只能提议记忆候选；写入长期记忆需要操作者经 CLI 明确接受；记忆存储不在任何工具 I/O 路径内；注入的记忆块标注不可信、不承载授权，不能单独或与任何输入组合构成 L1–L4 的豁免。
 23. **I-Skill-Operator-Installed**：仅当 `[skills] enabled` 时生效。技能只能由操作者安装、校验、卸载；运行时逐文件 hash 校验，不匹配即拒载并 audible；脚本没有任何执行原语；技能内容标注无权限，不能单独或与任何输入组合构成 L1–L4 的豁免。
 24. **I-Deliverable-Evidence-Before-Complete**：仅当 goal 声明了交付物时生效。`complete` 必须通过每个交付物的运行时检查，检查失败回灌而非静默；交付快照（digest/时间/run）必须登记成功才算完成；人工签收只存在于 run 外，模型没有任何签收路径；`complete` 与 `accepted` 是两个不同的状态，不得混用。
+25. **I-Eval-Record-Not-Acceptance**：仅当 `[eval]` 已声明时生效。评测记录只含机器事实（终态、token、成本、证据计数、产物 digest），**没有 score 字段**，每条记录携带固定免责声明；记录中的状态不断言 issue 已修复；验收仍然只由 verify evidence 与人工签收构成；不声明 `[eval]` 时行为与 digest 完全不变。
 
 ## 5. 非目标
 
