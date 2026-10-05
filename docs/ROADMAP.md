@@ -333,14 +333,23 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - **“恢复不携带授权”的端到端证据**：provider 实际收到**恰好 6 条**已存消息（重新 seed 会是 8 条）；首轮获批写入 `one`，恢复后无审批、规则为 `ask`，工作区仍是 `one`，事件流里有 `ToolBlocked`、**无** `ToolFinished`；恢复后第二轮脚本调用 `finish {"status":"complete"}`，运行仍报 `failed`、evidence 为空。
   - **接进循环后抓到的真问题**：① 快照 id 曾用未脱敏的 goal 文本（journal 对 goal 做了 `redact_text`，放进**路径**等于撤销该规则），改为 `short_hash(redact_text(...))`；② `max_turns=1` 的运行会**丢弃模型第一条响应**（`Breach::Turns` 在响应并入 history 之前就判定超预算）——既有行为，本次未改，记此备忘。
   - **纠正一处早期夸大**：`SessionNode.history_digest` 那个死字段**至今仍无任何非 None 赋值**。被真正赋值的是 `ConversationSnapshot.history_digest`——一个新结构上的新字段，不是同一个字段。两者要打通，接入 agent 运行循环是前提（已完成），还需会话树本身（见下方未完成项）。
+    - **已修（2026-10-05）**：`SessionNode.history_digest` 不再是死字段。运行时在提交每个 session node 时赋值（`pangu-agent/src/checkpoint.rs::commit_after_success`）。
+    - **取值必须描述"这个节点所属的会话状态"，而不是随手一个哈希**：digest 由 `ConversationSnapshot::new` 生成——与 `ConversationRuntime::save` 写快照用的**同一个构造器**（含同一步脱敏）。另起一套编码会得到一个永远匹配不上任何快照的哈希，那比没有更糟：它看起来像证据。
+    - **时序是对的，不是巧合**：tool result 在提交 checkpoint 之后才 push 进 history，所以 digest 在 `history.push` **之前**用"即将落地的那条 tool result"投影计算（`history_digest_after_tool_result`）。用 push 前的 history 算，会让节点指向一个会话**从未处于**的状态，`session replay` 随后报出的 digest 匹配不上任何快照。
+    - **节点 digest 与 replay 输出的 digest 允许不同，这是设计而非缺陷**：一个节点上会记录多个快照（同一节点停留期间逐 turn 存一次 + 终局一次），`replay` 按设计报**最新**那个（"离开该节点前走得最远"），而节点记录的是**创建节点那一刻**的状态。因此不变量是"节点 digest 必须等于存于该节点的**某一个**快照"，不是"等于 replay 的输出"。测试按前者断言。
+    - 覆盖测试：`crates/pangu/tests/session_node_digest.rs`（4 个，跑真实二进制）——字段非空且为 64 位 hex、digest 匹配存于该节点的快照、digest 描述的是含 tool result 的历史、replay 仍工作且报出真实快照。
   - **核心保证**：恢复的历史**只是模型输入**。它不携带任何 `Decision`/`Effect`/已批准记忆；resume 后第一次发起工具调用仍走完整 `Policy → Sandbox → Approval`。不提供任何到判定的转换。
   - **安全边界**：存储前脱敏（`redact_text`/`redact_value`）、内容 digest 读时校验（篡改即拒）、空历史**拒绝恢复**（否则等于静默重开会话）、**缺 system 轮的快照拒绝恢复**（否则是恢复进一个从没被告知边界的上下文）、快照不可变（保护压缩出处链可解）、压缩必须非空摘要且必须真的丢弃内容、压缩必须用新 `snapshot_id`。
   - **第三阶段已完成（树导航与每节点回放）**：`session::SessionTree`（`roots`/`children`/`ancestors`/`common_ancestor`/`by_checkpoint`/`render`）、`ArtifactStore::list_session_nodes`（解析失败即报错，静默丢分支会让"这里发生过什么"答错）、`ConversationRuntime::at_node`/`replay_at`、CLI `pangu session tree|replay`。
   - **补上了一个静默的接线缺口**：`ConversationRuntime::save` 一直收 `session_node_id`，而 `run_inner` 两处都传 `None`——对话快照从来没有真正挂到节点上。已接上 `checkpoint_state.session_node_id`。
   - **环与孤儿是按损坏账本处理的，不是按正常情况**：`ancestors()` 双重限界（visited 集合 + 步数上限），账本被手改后 `parent` 指回祖先会让朴素遍历**永久挂死**；缺失 parent **不提升为 root**，否则一次停在缺口上的遍历看起来和走到历史开头完全一样。
-  - **发现一个真实结构缺口：运行根节点从不落盘。** `SessionNode` 只在提交检查点时入账本，`node_root_…` 只在内存里，所以每次普通运行的树恰好有一个孤儿。**不影响 rollback**（`rollback_transition_node_id` 是输入的确定性哈希，不查账本）。**修不了**：`EventRef.event_id` 是写 Journal 时才分配的，给根节点编一个就是在可审计结构里塞假值。现在如实报告 + CLI 警告 + `replay` 拒绝。**待决**：接受"运行起点不可回溯"，或改 F7 让 event_id 在事件发出时就分配。
+  - **发现一个真实结构缺口：运行根节点从不落盘。** `SessionNode` 只在提交检查点时入账本，`node_root_…` 只在内存里，所以每次普通运行的树恰好有一个孤儿。**不影响 rollback**（`rollback_transition_node_id` 是输入的确定性哈希，不查账本）。**修不了**：`EventRef.event_id` 是写 Journal 时才分配的，给根节点编一个就是在可审计结构里塞假值。**待决**：接受"运行起点不可回溯"，或改 F7 让 event_id 在事件发出时就分配。**已决，见下条。**
+    - **已决（2026-10-05）：接受"运行起点不可回溯"，并把"预期缺口"与"账本损坏"分开报告。** 复核了"改 F7 提前分配 event_id"这条路：**不可行**。`event_id = evt_sha256(prev_sha, "event-id:{seq}:{canonical}")`（`journal.rs:177`），依赖 `state.seq` 与 `state.prev_sha`，两者都是 Journal 写入时的状态；提前编一个 id 必然与 Journal 事后算出的值冲突，等于**把一处诚实的缺失换成一条会被验证拒绝的假记录**。故不采纳。
+    - 落地：新增 `ROOT_NODE_PREFIX`（`pangu-core::checkpoint`）作为单一定义源，`SessionTree` 新增 `run_root_gaps()` / `unexplained_orphans()`，`ensure_complete()` 只在**存在非 root 缺口**时拒绝。理由：每次运行都会产生这一种孤儿，把它叫作"损坏"等于训练操作者忽略真正重要的告警——那正是真缺口被漏掉的方式。
+    - 报告未减弱：缺口仍在 `orphans()` 里、仍在 `tree.render()` 里标注、`session tree --json` 新增 `run_root_gaps` 与 `unexplained_orphans` 两个字段、CLI 用 note 明说"这是本版本的工作方式，不是损坏"。`session replay` 仍对**未解释**缺口拒绝；对预期缺口放行（它不说明目标节点自身的history 是否可走）。
+    - 不变量测试相应更新：`invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden` 现在断言**披露**（仍命名缺失 parent、仍被分类、仍渲染）而非"必须拒绝导航"，与其自身文档注释一致。
+  - **未包含（有意排除）**：branch/fork；**fork 的工作区隔离完全未解决**（两条分支共享同一工作区必然互相覆盖）；跨机器同步、协作编辑。`SessionNode.history_digest` 已不再是死字段（见下条），现由运行时在每次提交节点时赋值。
   - **当时顺带发现的两个既有 bug 现已修复（详见 ADR-0004 §7）**：① `demo()` 未应用 `--checkpoint`/`--no-checkpoint`——现在 demo 同样应用 `CliOverrides`，`pangu --checkpoint --demo` 正常开启检查点；② 当时记为“自定义相对 `checkpoint.artifact_root` 导致 `--demo` 报 `checkpoint creation failed`”的描述**本身是错的**，已纠正：真实原因是快照遍历整个工作区、默认 `forbidden_globs` 不排除构建产物，与 `artifact_root` 相对/绝对无关；修法是新增 `checkpoint.exclude_roots` 并让超限错误指出具体越界文件（已用自定义相对 `artifact_root` 的 `--demo` 复测通过）。
-  - **未包含（有意排除）**：branch/fork；**fork 的工作区隔离完全未解决**（两条分支共享同一工作区必然互相覆盖）；跨机器同步、协作编辑。`SessionNode.history_digest` 仍是死字段——现在有真实节点与对话可供它记录，赋值待做。
 - [x] **A2 结构化事件兼容层**：在现有 Journal 之外提供稳定的 JSONL/NDJSON 事件流、事件版本和迁移器；借鉴 Pi JSON/RPC、ZCode 协议层、DeepSeek Harness 的 SessionEvent、OpenHands Agent Server 和 Cline headless 模式。
   - 已有：Journal（`pangu-journal/v1`、`/v2`），带 `prev_sha`/`sha` 哈希链与 `event_id` 回执（v2）。但这是**内部存储格式**，18 个 `Option` 字段 + `deny_unknown_fields`，外部工具要么绑死内部结构、要么把审计链当数据流读。
   - 已完成（ADR-0003）：独立的 `pangu-stream/1` 契约——闭集 `StreamEvent`（非 `Value`）、`EventMigrator`、`StreamWriter`（`EventSink` 实现）、`read_stream`、CLI `pangu events read|contract`。

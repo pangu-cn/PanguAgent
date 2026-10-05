@@ -41,7 +41,8 @@ pub use assemble::{
 pub use checkpoint::{
     ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
     ExternalEffectSummary, FailedPathRecord, FailedPathStatus, FailureClass, RollbackRequest,
-    SessionNode, CHECKPOINT_SCHEMA_VERSION, FAILED_PATH_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+    SessionNode, CHECKPOINT_SCHEMA_VERSION, FAILED_PATH_SCHEMA_VERSION, ROOT_NODE_PREFIX,
+    SESSION_SCHEMA_VERSION,
 };
 pub use conversation::{
     redact_messages, validate_encoded_size, CompactionRecord, ConversationSnapshot,

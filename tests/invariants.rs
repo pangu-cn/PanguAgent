@@ -1813,18 +1813,26 @@ async fn invariant_i_a_saved_conversation_names_a_session_node_that_exists() {
     std::fs::remove_dir_all(root).ok();
 }
 
-/// An **incomplete** session tree must be reported as incomplete.
+/// An **unexpected** gap in the session tree must be reported, not hidden.
 ///
 /// This is not a synthetic case. A checkpointed run produces exactly one gap:
 /// the first committed node names `node_root_…` as its parent, and that root
 /// exists only in the run's memory — the ledger has no entry for it. So every
-/// ordinary run's tree is incomplete, and the navigation layer's job is to say
-/// so rather than let a walk that stops at the missing link look like one that
-/// reached the beginning of history.
+/// ordinary run's tree has this gap, and the navigation layer's job is to
+/// disclose it rather than let a walk that stops at the missing link look like
+/// one that reached the beginning of history.
 ///
-/// The gap is recorded, not papered over: fabricating an `EventRef` for the
-/// root would put an invented event id into an auditable structure, and
-/// `Event::event_id` is only assigned when the journal is written.
+/// What must *not* happen is disguising it: the node keeps naming a parent the
+/// ledger lacks, and that stays visible to any caller. Fabricating an
+/// `EventRef` for the root would put an invented event id into an auditable
+/// structure, and `Event::event_id` is only assigned when the journal is
+/// written.
+///
+/// The expected run-root gap and real ledger damage are reported separately.
+/// A gap that is *not* the run root still refuses navigation
+/// (`an_unknown_gap_is_still_damage_even_next_to_an_expected_one` in
+/// `pangu-core::session`); this test covers the expected shape, which must be
+/// disclosed without being mistaken for corruption.
 #[tokio::test]
 async fn invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden() {
     let root = temp_path("session-tree-gap");
@@ -1855,13 +1863,39 @@ async fn invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden()
     let store = pangu_core::ArtifactStore::open(root.join(".pangu/checkpoints")).expect("store");
     let tree = pangu_core::session::SessionTree::load(&store).expect("tree");
     assert_eq!(tree.orphans().len(), 1, "exactly the un-persisted run root");
-    let error = tree
-        .ensure_complete()
-        .expect_err("a tree with a missing parent must not present as whole");
-    assert!(
-        error.to_string().contains("incomplete"),
-        "the error must say the history is incomplete, got: {error}"
+
+    // The gap must be *reported*, which is what this invariant is about — not
+    // hidden by promoting the node to a root, and not silently dropped. It is
+    // reported in `orphans()` and in the rendered output below.
+    //
+    // It is deliberately *not* reported as corruption. This is the one shape
+    // every ordinary run produces, so calling it damage would train an operator
+    // to ignore the message that has to matter when a gap is real. Only an
+    // unexplained gap refuses navigation (see `session.rs` tests); the run-root
+    // gap is disclosed as what it is.
+    assert_eq!(
+        tree.run_root_gaps().len(),
+        1,
+        "the un-persisted run root must be classified as the expected gap"
     );
+    assert!(
+        tree.unexplained_orphans().is_empty(),
+        "this run has exactly one gap and it is the known one"
+    );
+    assert!(
+        tree.ensure_complete().is_ok(),
+        "the expected run-root gap is how this version works; refusing here would \
+         make every ordinary run look like a corrupt store"
+    );
+
+    // Reporting is the invariant: the node still names a parent the ledger does
+    // not have, and that fact is still visible to a caller.
+    let (node, parent) = &tree.orphans()[0];
+    assert!(
+        parent.starts_with(pangu_core::ROOT_NODE_PREFIX),
+        "the missing parent must be the run root, got `{parent}` for `{node}`"
+    );
+
     // Rendering still terminates and still labels the gap.
     let rendered = tree.render();
     assert!(rendered.contains("orphan"), "rendered: {rendered}");

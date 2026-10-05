@@ -14,6 +14,18 @@ use crate::{now_rfc3339, Error, Result};
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
 pub const FAILED_PATH_SCHEMA_VERSION: u32 = 1;
+
+/// Prefix of a run's starting session node id.
+///
+/// The root node names the run's first parent but is never committed, because
+/// its `EventRef` cannot be sealed before the Journal writes the event (the id
+/// is derived from the journal sequence and the predecessor's `sha`). Every
+/// ordinary run therefore leaves exactly one node whose parent is absent, and
+/// [`crate::session::SessionTree::ensure_complete`] must be able to tell that
+/// expected gap apart from real ledger damage. Both sites use this constant so
+/// they cannot drift apart.
+pub const ROOT_NODE_PREFIX: &str = "node_root_";
+
 pub const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_SNAPSHOT_FILES: usize = 100_000;
 pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 64 * 1024 * 1024;

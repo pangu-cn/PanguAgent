@@ -2716,6 +2716,15 @@ impl Agent {
                     }
                 }
                 let mut checkpoint_error: Option<(&'static str, anyhow::Error)> = None;
+                let mut completed_checkpoint: Option<checkpoint::CheckpointCommit> = None;
+                // The node must record the conversation as it will stand once
+                // this tool result is in it. Computing it from the pre-push
+                // history would make the node point at a state the conversation
+                // never held, and `pangu session replay` would then report a
+                // digest that matches no snapshot.
+                let history_digest = Self::history_digest_after_tool_result(
+                    history, &call.id, &call.name, &content,
+                )?;
                 if let (Some(runtime), Some(state)) =
                     (self.checkpoint.as_ref(), checkpoint_state.as_mut())
                 {
@@ -2724,36 +2733,13 @@ impl Agent {
                         .await
                     {
                         Ok(()) => {
-                            match runtime.commit_after_success(state, &finished_event, effect) {
-                                Ok(commit) => {
-                                    self.emit(
-                                    Event::new_v2(
-                                        EventKind::CheckpointCreated,
-                                        turn,
-                                        "checkpoint created",
-                                    )
-                                    .tool("checkpoint")
-                                    .call_id(&commit.artifact.session_node_id)
-                                    .effect_scope("session")
-                                    .reversibility("reversible")
-                                    .action_digest(pangu_core::hex_sha256(&format!(
-                                        "checkpoint:{}",
-                                        commit.artifact.event_ref.event_id
-                                    )))
-                                    .external_mutation(false)
-                                    .payload(serde_json::json!({
-                                        "checkpoint_id": commit.artifact.checkpoint_id,
-                                        "session_node_id": commit.artifact.session_node_id,
-                                        "event_ref": commit.artifact.event_ref,
-                                        "snapshot_digest": commit.artifact.snapshot_digest,
-                                        "workspace_digest": commit.artifact.workspace_digest,
-                                        "contract_digest": commit.artifact.contract_digest,
-                                        "policy_digest": commit.artifact.policy_digest,
-                                        "parent_checkpoint_id": commit.artifact.parent_checkpoint_id,
-                                    })),
-                                )
-                                .await?;
-                                }
+                            match runtime.commit_after_success(
+                                state,
+                                &finished_event,
+                                effect,
+                                history_digest.as_deref(),
+                            ) {
+                                Ok(commit) => completed_checkpoint = Some(commit),
                                 Err(error) => checkpoint_error = Some(("snapshot", error)),
                             }
                         }
@@ -2771,6 +2757,31 @@ impl Agent {
                     .map(|message| format!("{content}\n[checkpoint failed: {message}]"))
                     .unwrap_or(content);
                 history.push(Message::tool_result(&call.id, &call.name, history_content));
+                if let Some(commit) = completed_checkpoint {
+                    self.emit(
+                        Event::new_v2(EventKind::CheckpointCreated, turn, "checkpoint created")
+                            .tool("checkpoint")
+                            .call_id(&commit.artifact.session_node_id)
+                            .effect_scope("session")
+                            .reversibility("reversible")
+                            .action_digest(pangu_core::hex_sha256(&format!(
+                                "checkpoint:{}",
+                                commit.artifact.event_ref.event_id
+                            )))
+                            .external_mutation(false)
+                            .payload(serde_json::json!({
+                                "checkpoint_id": commit.artifact.checkpoint_id,
+                                "session_node_id": commit.artifact.session_node_id,
+                                "event_ref": commit.artifact.event_ref,
+                                "snapshot_digest": commit.artifact.snapshot_digest,
+                                "workspace_digest": commit.artifact.workspace_digest,
+                                "contract_digest": commit.artifact.contract_digest,
+                                "policy_digest": commit.artifact.policy_digest,
+                                "parent_checkpoint_id": commit.artifact.parent_checkpoint_id,
+                            })),
+                    )
+                    .await?;
+                }
                 if let Some((failure_stage, error)) = checkpoint_error {
                     let safe_error = truncate_middle(
                         &redact_text(&error.to_string()),
@@ -3169,6 +3180,29 @@ impl Agent {
             .as_ref()
             .map(|runtime| runtime.failure_policy())
             .unwrap_or(CheckpointFailurePolicy::FailRun)
+    }
+
+    /// The conversation digest as it will stand once this tool result lands.
+    ///
+    /// Computed through `ConversationSnapshot::new`, which is the same
+    /// constructor `ConversationRuntime::save` uses — including its redaction
+    /// step. Reimplementing the encoding here would produce a digest that can
+    /// never match a stored snapshot, which is worse than no digest at all: it
+    /// would look like evidence.
+    ///
+    /// Works whether or not the caller's history is already redacted, because
+    /// redaction is idempotent for the values this stores.
+    fn history_digest_after_tool_result(
+        history: &[Message],
+        call_id: &str,
+        tool: &str,
+        content: &str,
+    ) -> Result<Option<String>> {
+        let mut projected = history.to_vec();
+        projected.push(Message::tool_result(call_id, tool, content));
+        let snapshot =
+            pangu_core::ConversationSnapshot::new("node-digest-projection", "", projected)?;
+        Ok(Some(snapshot.history_digest))
     }
 }
 
