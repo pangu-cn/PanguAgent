@@ -2,6 +2,16 @@
 
 本目录存放 F7 checkpoint/rollback operator drill 的跨平台报告。内容只来自真实运行（CI 产物或本机实测），由 [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) §8.1 引用；不存放推测或计划中的结果。
 
+现有报告：
+
+| 文件 | 来源 | 提交 | 结果 |
+|------|------|------|------|
+| `f7-drills-windows.jsonl` | GitHub Actions `windows-latest` | `1b0245d` | 7 pass |
+| `f7-drills-ubuntu.jsonl` | GitHub Actions `ubuntu-latest` | `1b0245d` | 6 pass + 1 not-applicable（`replace-backup`，POSIX 无 hand-off） |
+| `f7-drills-windows-10.0.19045.jsonl` | 本机实测 Windows 10.0.19045 / rustc 1.98.1 | `3aa11da` | 7 pass |
+
+`f7-drills-windows-10.0.19045.jsonl` 是**本机**记录，不是 CI 结论，也**不构成** §9.1 要求的"目标部署平台"验收——它只证明该套 drill 在该提交上可复现。条目格式仍严格遵循下面的 schema。
+
 每行一条 JSON 记录，schema 为 `pangu-f7-drill/1`：
 
 | 字段 | 含义 |

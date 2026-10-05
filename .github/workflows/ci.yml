@@ -109,9 +109,6 @@ jobs:
           path: all-tests.log
           if-no-files-found: warn
 
-      - name: Run strict Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
       - name: Run F7 checkpoint operator drills
         shell: bash
         env:

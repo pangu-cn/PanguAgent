@@ -207,17 +207,17 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 
 ## 8. 激活前验收清单
 
-在考虑把该能力从“实验性 opt-in”升级为正式激活前，部署者应保存以下证据。已具备机器化手段和本地实测的项标为 `[x]`，仍需部署环境或人工签署的项保持 `[ ]`：
+在考虑把该能力从“实验性 opt-in”升级为正式激活前，部署者应保存以下证据。已具备机器化手段和本地实测的项标为 `[x]`，仍需部署环境或人工签署的项保持 `[ ]`。**每个 `[ ]` 项对应的操作程序见第 9 节**，留证要求在那里写死；没有证据的勾选不算勾选。
 
 - [x] stale lock、failed operation、CAS drift、Windows replacement backup 有可重复的 operator drill（第 6 节），且 replacement hand-off 与无锁并发 writer 的限制已写成本手册第 4、7 节。
 - [x] 只读证据检查有工具（`pangu artifact inspect`）并有“不修改任何字节”的独立断言。
-- [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。（依赖部署环境）
-- [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。（需部署者书面确认）
+- [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。（依赖部署环境）→ **见 §9.3**
+- [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。（需部署者书面确认）→ **见 §9.2**
 - [x] 配置、CLI、Journal、Artifact schema、inspection schema 和恢复手册版本相互匹配，并在 ADR/ROADMAP/README 中一致标为实验性 opt-in。
 - [x] 默认配置仍关闭 checkpoint，Git backend 仍明确未实现。
 - [x] Ubuntu 与 Windows CI 完成 `cargo fmt --check`、`cargo check/test/clippy --workspace --all-targets --all-features` 并保存跨平台 drill 报告（run 36210280753，提交 `1b0245d`，见 8.1）。
-- [ ] **目标部署平台**单独通过 snapshot/restore、symlink、权限测试。（Windows 与 Ubuntu 已有 CI 证据；replacement hand-off 只在 Windows 成立，POSIX 上该 drill 为 `not-applicable`，见 8.1）
-- [ ] 由 operator/发布负责人明确批准激活；未批准前继续保持实验性 opt-in。
+- [ ] **目标部署平台**单独通过 snapshot/restore、symlink、权限测试。（Windows 与 Ubuntu 已有 CI 证据；replacement hand-off 只在 Windows 成立，POSIX 上该 drill 为 `not-applicable`，见 8.1）→ **见 §9.1**
+- [ ] 由 operator/发布负责人明确批准激活；未批准前继续保持实验性 opt-in。→ **见 §9.4**
 
 ### 8.1 跨平台验收记录
 
@@ -228,8 +228,13 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 | Windows（GitHub runner） | `dtolnay/rust-toolchain@stable` | `1b0245d` | 通过 | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows.jsonl`](evidence/f7-drills-windows.jsonl) |
 | Ubuntu（GitHub runner） | `dtolnay/rust-toolchain@stable` | `1b0245d` | 通过 | 0 error / 0 warning | 6 pass + 1 not-applicable | [`evidence/f7-drills-ubuntu.jsonl`](evidence/f7-drills-ubuntu.jsonl) |
 | Windows 10.0.26200 x86_64（本机） | rustc 1.98.0 | `1b0245d` | 通过（142 项，0 失败） | 0 error / 0 warning | 7 pass | 同上（同一 commit） |
+| Windows 10.0.19045 x86_64（本机） | rustc 1.98.1 | `3aa11da` | 通过（373 项，0 失败） | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-10.0.19045.jsonl`](evidence/f7-drills-windows-10.0.19045.jsonl) |
+
+> 最后一行是 **2026-10-05 本机实测**，不是 CI 结论，也**不满足 §9.1**：它仍属"CI 已覆盖的两个平台"，不是目标部署平台。它的作用是证明该 drill 在当前提交上仍可复现，按 §9.1 的判读规则全部为 `pass`（本平台存在 replacement hand-off 机制，故无 `not-applicable`）。
 
 本机记录（2026-09-25，Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features`（142 项，0 失败）与 7 个 drill 全部通过。
+
+本机记录（2026-10-05，Windows 10.0.19045 / x86_64 / rustc 1.98.1，提交 `3aa11da`）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --all-targets --no-fail-fast`（373 项，0 失败）与 7 个 drill 全部通过；drill 报告转录见 [`evidence/f7-drills-windows-10.0.19045.jsonl`](evidence/f7-drills-windows-10.0.19045.jsonl)。
 
 CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/runs/36210280753)，2026-09-26，提交 `1b0245d`）：`ubuntu-latest` 与 `windows-latest` 两个 job 全部步骤通过。`docs/evidence/` 下的两份报告是从该 run 的 drill 步骤产出的原始内容转录（GitHub artifact 下载需认证，CI 同时把每行发成可公开读取的注解）。
 
@@ -242,5 +247,96 @@ CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/run
 - 该演练在以 root 运行的账户上记为 `skipped`（root 绕过目录权限）。CI runner 不是 root。
 - drill 证明 fail closed 与证据存在，**不证明** Pangu 能自动完成恢复；并发 writer、无人工输入、外部副作用的处置仍需部署者按第 4 节人工裁决。
 - 本机没有 Linux 环境，Ubuntu 侧的一切结论均以 CI 为准，本机运行不作为补充证据。
+
+## 9. 激活门逐项操作程序
+
+第 8 节列出"还缺什么"，本节给出"**怎么才算补齐**"。每一项都要求留证：没有证据的勾选不算勾选。
+
+顺序不能颠倒：**9.2 的停止策略必须先书面定下来**，否则一次不可中断的 drill（9.1）或一次真实恢复（9.3）遇上并发 writer 时，operator 没有事先约定的处置依据，现场只能靠临场判断——那正是本手册 §1 要避免的东西。
+
+### 9.1 目标部署平台自身的 snapshot/restore、symlink、权限验证
+
+**为什么不能靠 CI 代替**：CI 的 Windows/Ubuntu runner 不是目标部署平台。§7 已记录平台差异（Unix 无 replacement hand-off、目录权限计入 digest），这些差异在目标平台上可能又不一样。
+
+**怎么做**：
+
+```bash
+# 在目标平台、用目标工具链，把仓库自身的演练跑一遍并留证。
+# 报告必须是绝对路径（cargo test 在包目录运行测试二进制）。
+PANGU_DRILL_REPORT="/绝对路径/f7-drill-$(hostname)-$(date +%Y%m%d).jsonl" \
+PANGU_DRILL_COMMIT="$(git rev-parse HEAD)" \
+  cargo test -p pangu --test operator_drills -- --nocapture
+```
+
+**判读规则（照抄 §6 的平台差异章节，不要"统一"成通过）**：
+
+| 结果 | 含义 |
+|------|------|
+| `pass` | 该分支在目标平台被演练到 |
+| `not-applicable` | 机制在该平台不存在（如 POSIX 的 replace-backup）。**不是通过**，也不构成对其它平台该保护的验证 |
+| `skipped` | 未能演练（如以 root 运行导致权限机制失效）。**不是通过**；换成非特权账户重跑 |
+
+**留证**：把 jsonl 转录到 [`docs/evidence/`](evidence/)（格式见该目录 README），并在 §8.1 表格加一行。任何一个 drill 为 `not-applicable` 或 `skipped` 时，必须在该行注明原因，不能只写"通过"。
+
+### 9.2 并发 writer、外部 effect、无人工输入时的停止策略（需部署者书面确认）
+
+这是**唯一的纯人的决定**，无法用测试替代：它约束的是 Pangu 之外的世界。
+
+必须在书面确认中明确回答：
+
+1. **谁在写同一个 workspace**：Pangu 之外是否有编辑器、构建、同步盘（OneDrive/Dropbox）、CI 或其它 agent 在写同一目录？
+2. **如何确保恢复期间没有 writer**：靠什么手段（停进程、卸载盘、独占锁）？§1 要求"先停止 writer"，但**没有工具能强制**它——Pangu 只会靠最终 digest/CAS 检测漂移，检测到即拒绝（§4.4）。**检测不是预防。**
+3. **checkpoint 之后发生外部不可逆副作用时怎么办**：Pangu 会阻断整次 rollback 且不做外部补偿（§4.5）。谁负责手工补偿？谁批准？
+4. **无人工输入时**：`--dangerously-unattended` 与 rollback 不兼容；无人值守下 rollback 一律 fail closed。确认部署中**不会**出现期望"无人值守自动回滚"的流程。
+5. **升级路径**：出事时第一个联系谁、多久内响应（决定 §4 各分支能停多久）。
+
+**留证**：一份带日期、部署环境标识和签署人的书面记录（变更单或仓库内文档均可），并在 §8.1 下方引用其位置。
+
+### 9.3 恢复期间的备份与独立审计可用性（依赖部署环境）
+
+在**真正需要恢复之前**验证，不是出事时才发现备份不可用。
+
+**怎么做**：在目标平台造一次真实的 checkpoint，然后：
+
+```bash
+# 1. 留一份恢复前的只读副本与校验记录（Artifact root + workspace + Journal）。
+pangu artifact inspect --root <artifact_root> --json > inspect-before.json
+
+# 2. 执行一次真实 rollback（走完整 L1-L4，含人工批准）。
+
+# 3. 再检查一次，确认 store 仍为 verified。
+pangu artifact inspect --root <artifact_root> --json > inspect-after.json
+```
+
+**要确认的三件事**：
+
+1. **备份可读**：副本能在**不依赖原机**的情况下打开，且 `artifact inspect` 在其上仍报 `verified`。
+2. **审计独立于工作机**：Journal 与报告存到了工作机之外的位置。若两者都在同一块盘上，介质故障会同时带走恢复点和审计链——那等于没有审计。
+3. **保留期**：§5 要求"不要删除历史记录来清理状态"。确认保留期长于事故响应窗口，且**不会被日志轮转或清理策略自动删掉**。
+
+**留证**：三次 `artifact inspect --json` 的输出（before / after / 副本），加上备份位置与保留期的书面说明。
+
+### 9.4 签署
+
+前三项齐备后，由 operator/发布负责人明确批准。**未签署前继续标为实验性 opt-in**，README/BOUNDARY/ROADMAP 三处措辞不得提前改动（那是边界漂移）。
+
+签署须同时更新：
+
+- §8 的 `[ ]` → `[x]`，并在 §8.1 表格补齐平台行；
+- `README.md` 的"实验性 Checkpoint / Rollback"小节（当前明确写"默认关闭，仍是实验性 opt-in"）；
+- [`BOUNDARY.md`](BOUNDARY.md) §7 末段与第 4.1 节的适用范围说明；
+- [`ROADMAP.md`](ROADMAP.md) F7 条目与 §0 的状态描述。
+
+这四处是**同一个事实**的四种表述，必须一起改；只改一处即为边界漂移（BOUNDARY §7）。
+
+## 10. 已知覆盖边界（不因激活而消失）
+
+激活改变的是"默认开关与支持声明"，**不改变**以下事实，激活后仍须如实陈述：
+
+- 应用层限制，不是 OS 级隔离；不承诺抵御蓄意恶意代码或内核权限对手。
+- 不持有 Artifact lock 的并发 writer 只能被 digest/CAS **检测**，不能被阻止。
+- rollback 不执行外部补偿、Git、网络、子进程或连接器。
+- Windows replacement hand-off 与 stale lock 仍需 operator 介入，不自动猜测。
+- Git backend 未实现；不会隐式创建 commit/branch/tag/stash 或改 index。
 
 相关设计边界见 [`BOUNDARY.md`](BOUNDARY.md)、[`ARCHITECTURE.md`](ARCHITECTURE.md) 和 [`adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md)。

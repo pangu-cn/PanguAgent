@@ -514,6 +514,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - **事件契约**：已加入 checkpoint、rollback、failed-path 事件和稳定 v2 event receipt；旧 Journal 不重写，v1 读取兼容保留。
 - **测试门**：已覆盖外部副作用、幂等、快照损坏、失败路径阻断、wall-clock budget、TeeSink receipt、真实 CLI 子进程、stale lock 和配置/事件兼容；operator 事故分支（stale lock、failed operation、CAS drift、外部 mutation、Windows replacement backup、只读性、CLI 退出码）另有 `crates/pangu/tests/operator_drills.rs` 可重复演练，并按平台记录机制差异。
 - **正式激活门**：operator recovery 运行手册已补充，证据收集与四个事故分支已有只读工具（`pangu artifact inspect`）和可重复 drill，**跨平台 CI 已通过**（run 36210280753，提交 `1b0245d`，Ubuntu 与 Windows 的 drill 原始报告已转录到 `docs/evidence/`）；仍缺目标部署平台自身的验证、恢复期间的备份/审计可用性、无人工输入与并发 writer 的停止策略确认，以及 operator/发布负责人签署；在此之前不把 F7 描述为默认支持。详见 [`docs/CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
+  - **四个剩余项已各自落成可执行程序（2026-10-05）**：见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) §9——§9.1 目标平台 drill（含 `not-applicable`/`skipped` 的判读规则）、§9.2 停止策略书面确认清单（5 个必答问题）、§9.3 备份与独立审计验证（`artifact inspect` 前后对照）、§9.4 签署与四处文档同步。§8 的每个 `[ ]` 都指向对应小节，留证要求写死在那里。
+  - 同日新增本机 drill 记录（Windows 10.0.19045 / rustc 1.98.1 / 提交 `3aa11da`，7 pass，转录见 `docs/evidence/`）。**它不满足 §9.1**——本机仍属 CI 已覆盖的平台，不是目标部署平台；它只证明 drill 在该提交上可复现。
 
 ### 选择建议
 
