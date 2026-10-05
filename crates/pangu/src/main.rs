@@ -414,6 +414,11 @@ enum EventsCommands {
         /// Print only records of this kind.
         #[arg(long = "kind")]
         kind: Option<String>,
+        /// Recompute the journal hash chain and refuse a damaged or tampered
+        /// file. Without this the projection reports the `sha` it read back,
+        /// which is not the same claim as "the chain checks out".
+        #[arg(long)]
+        verify: bool,
     },
     /// List the contract: supported versions, kinds, and their stability.
     Contract {
@@ -493,7 +498,12 @@ async fn main() -> Result<()> {
             }
         },
         Some(Commands::Events { action }) => match action {
-            EventsCommands::Read { path, json, kind } => events_read(&path, kind, json),
+            EventsCommands::Read {
+                path,
+                json,
+                kind,
+                verify,
+            } => events_read(&path, kind, json, verify),
             EventsCommands::Contract { json } => events_contract(json),
         },
         Some(Commands::Skills { action }) => match action {
@@ -696,7 +706,18 @@ fn doctor(args: &Cli, journal: Option<&std::path::Path>) -> Result<()> {
 ///
 /// Read-only and advisory. This reports what a derived projection says; it
 /// cannot verify a run, and the journal remains the audit authority.
-fn events_read(path: &std::path::Path, kind: Option<String>, json: bool) -> Result<()> {
+///
+/// With `verify` the journal hash chain is recomputed and a damaged or
+/// tampered file is refused. That distinction matters because the projection
+/// otherwise echoes the `sha` it read back — "this sha was in the file" and
+/// "this sha was recomputed and the chain is intact" render identically and
+/// mean very different things to a CI auditor.
+fn events_read(
+    path: &std::path::Path,
+    kind: Option<String>,
+    json: bool,
+    verify: bool,
+) -> Result<()> {
     let summary = pangu_core::read_stream(path)?;
 
     // An unrecognized filter is an error, not an empty result. A typo in
@@ -720,6 +741,13 @@ fn events_read(path: &std::path::Path, kind: Option<String>, json: bool) -> Resu
         ),
     };
 
+    // Recompute the hash chain before printing anything, so a caller piping
+    // this into a report cannot get partial output from a tampered file.
+    let integrity = if verify {
+        Some(verify_chain(path, &summary)?)
+    } else {
+        None
+    };
     let events: Vec<&pangu_core::StreamEvent> = summary
         .events
         .iter()
@@ -729,11 +757,15 @@ fn events_read(path: &std::path::Path, kind: Option<String>, json: bool) -> Resu
     if json {
         let payload = serde_json::json!({
             "summary": summary,
+            "integrity": integrity.as_ref().map(|report| &report.integrity),
             "matched": events,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         print!("{}", summary.render());
+        if let Some(integrity) = &integrity {
+            println!("  {}", integrity.render());
+        }
         for event in &events {
             println!(
                 "  [{:>3}] {:<32} {} {}",
@@ -757,6 +789,50 @@ fn events_read(path: &std::path::Path, kind: Option<String>, json: bool) -> Resu
         ));
     }
     Ok(())
+}
+
+/// Render the outcome of a real hash-chain verification, as opposed to a raw
+/// read-back. `JournalIntegrity` already serializes itself for `--json`.
+struct ChainReport {
+    integrity: pangu_core::replay::JournalIntegrity,
+}
+
+impl ChainReport {
+    fn render(&self) -> String {
+        let format = self.integrity.journal_format.as_deref().unwrap_or("-");
+        if self.integrity.events_verified == 0 {
+            return format!(
+                "hash chain verified: 0 event(s) ({format}); nothing to check, so this is not \
+                 evidence that the file was ever written"
+            );
+        }
+        format!(
+            "hash chain verified: {} event(s) ({format}), head sha {} matches the recomputed chain",
+            self.integrity.events_verified,
+            pangu_core::short_hash(&self.integrity.head_sha)
+        )
+    }
+}
+
+/// Recompute the journal hash chain, refusing anything that does not check out.
+///
+/// Fails closed on a non-journal input instead of reporting a vacuous success:
+/// a `pangu-stream/*` projection carries no hash chain, so "verified" would be
+/// a claim about a check that never happened.
+fn verify_chain(
+    path: &std::path::Path,
+    summary: &pangu_core::StreamSummary,
+) -> Result<ChainReport> {
+    if !summary.migrated_from_journal {
+        return Err(anyhow::anyhow!(
+            "{} is a pangu-stream projection, which carries no hash chain to verify; point \
+             --verify at the journal file itself (the audit authority)",
+            path.display()
+        ));
+    }
+    let (_events, integrity) = pangu_core::replay::verify_journal(path)
+        .map_err(|error| anyhow::anyhow!("journal {} did not verify: {error}", path.display()))?;
+    Ok(ChainReport { integrity })
 }
 
 /// Print the contract: which versions this build reads, and which kinds are
@@ -2228,8 +2304,13 @@ fn session_tree(args: &Cli, json: bool) -> Result<()> {
     let tree = pangu_core::session::SessionTree::load(&store)?;
     // An incomplete tree still renders — the gaps are labelled — but it is not
     // presented as a whole history, because a walk that stops at a missing
-    // parent looks exactly like one that reached the beginning.
+    // parent looks exactly like one that reached the beginning. The expected
+    // run-root gap is reported separately from unexplained holes: warning about
+    // the shape every run produces would train an operator to ignore the one
+    // warning that matters.
     let complete = tree.ensure_complete().is_ok();
+    let run_root_gaps = tree.run_root_gaps();
+    let unexplained = tree.unexplained_orphans();
     if json {
         let roots: Vec<_> = tree
             .roots()
@@ -2248,6 +2329,8 @@ fn session_tree(args: &Cli, json: bool) -> Result<()> {
             "nodes": tree.len(),
             "complete": complete,
             "orphans": tree.orphans(),
+            "unexplained_orphans": unexplained,
+            "run_root_gaps": run_root_gaps,
             "roots": roots,
             "advisory": true,
             "authoritative": false,
@@ -2256,10 +2339,18 @@ fn session_tree(args: &Cli, json: bool) -> Result<()> {
     } else {
         print!("{}", tree.render());
         println!("nodes: {}", tree.len());
-        if !complete {
+        if !unexplained.is_empty() {
             eprintln!(
-                "WARNING: {} node(s) name a parent that is not in the ledger;                  this tree is incomplete",
-                tree.orphans().len()
+                "WARNING: {} node(s) name a parent that is not in the ledger and is not a \
+                 run root; this tree is incomplete",
+                unexplained.len()
+            );
+        }
+        if !run_root_gaps.is_empty() {
+            println!(
+                "note: {} node(s) start a run whose root is not recorded; that is how this \
+                 version works (the start of a run is not written to the ledger), not damage",
+                run_root_gaps.len()
             );
         }
     }
@@ -2271,8 +2362,15 @@ fn session_replay(args: &Cli, node: &str, full: bool, json: bool) -> Result<()> 
     let store = pangu_core::ArtifactStore::open(&contract.checkpoint.artifact_root)?;
     let tree = pangu_core::session::SessionTree::load(&store)?;
     // Navigation is checked before the conversation is read, so a cycle is
-    // reported as a broken tree rather than as a missing conversation.
-    tree.ensure_complete()?;
+    // reported as a broken tree rather than as a missing conversation. Only
+    // unexplained gaps refuse: a run-root gap is expected and says nothing
+    // about whether this specific node's history is walkable.
+    if let Err(error) = tree.ensure_complete() {
+        let unexplained = tree.unexplained_orphans();
+        if !unexplained.is_empty() {
+            return Err(error.into());
+        }
+    }
     tree.node(node)?;
 
     let runtime = pangu_agent::conversation::ConversationRuntime::from_contract(&contract)?

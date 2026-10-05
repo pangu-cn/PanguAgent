@@ -117,6 +117,31 @@ EventMigrator::migrate_line(&str) -> Result<StreamEvent>
 - `origin` 字段回指 journal 的 `seq`/`event_id`/`sha`，供需要回溯的人核对；
 - invariants 断言：`stream` 不是工具名、报告不带可被读成 `Effect` 的字段。
 
+### 4.6 `pangu events read --verify`：把"读回"与"校验"分开（补充，2026-10-05）
+
+§4.5 的派生标记解决了"这条记录是不是权威"，但留下一个更细的歧义：**`origin.journal_sha` 是"文件里写的值"还是"重算通过的值"？**
+
+投影层的实现是前者——它解析 JSON 并把 `sha` 字段原样搬运。于是这两种输出在视觉上完全一致：
+
+```text
+  hash chain verified: 15 event(s), head sha 70940634a7ca1df1 ...
+  origin.journal_sha:  c5487e2894098098a26969be0ba76922...
+```
+
+而 `replay::read` 的实现是后者：它重算 `prev_sha` 链接与每条 `sha`，不匹配即报 `tamper detected at seq N`。
+
+这不是"投影越权"，投影本身符合契约；但 README 把 `pangu events` 推荐给 **CI 审计器**消费，一个审计器仅凭 `events read` 拿不到任何完整性信号：把 journal 里某条记录的 `sha` 改成另一串同样合法的 64 位十六进制，`events read` 依然退出 0，并把这个伪造值当作 `origin.journal_sha` 打印出来。**检测能力存在（`replay::verify`），只是在这个入口上没有接线。**
+
+决策：新增 `--verify`，在该开关下走真正的链校验，**默认行为不变**（保持向后兼容，不把一次只读投影升级成可能失败的校验）。
+
+- 校验通过：正常输出，外加一行 `hash chain verified: N event(s) (pangu-journal/vX), head sha <recomputed>`；JSON 下多一个 `integrity` 对象（`verified` / `events_verified` / `head_sha` / `journal_format`）。
+- 校验失败：非零退出，**且在任何记录被打印之前**失败——一个 CI 管道不能从被篡改的文件里取到半截输出。
+- 对**没有哈希链**的输入（真正的 `pangu-stream/1` 投影）**fail closed**：报"projection 没有链可校验"，而不是报告一次没发生过的成功。这是本 ADR"不制造空洞结论"立场的延续。
+- 不带 `--verify` 时，JSON 的 `integrity` 固定为 `null`，使消费者能区分"没查"与"查过且完好"——两者绝不能长得一样。
+
+`crates/pangu-core/src/replay.rs` 新增 `JournalIntegrity` 与 `verify_journal`：前者是"一次检查的结果"而非"一个声明"，`verified: true` 只在重算发生后才存在；空 journal 会如实报告 `events_verified: 0` 与空 `head_sha`，并明说这**不构成**该文件写过的证据。
+
+
 ## 5. 与"模型输出永远不是授权"的关系
 
 事件流是**单向**的内部→外部投影：只从 `Event` 流出，不回流到任何判定路径。没有写入 API，没有"由事件流驱动的动作"，因此不存在"事件流授权了某个动作"的可能。
@@ -145,6 +170,7 @@ EventMigrator::migrate_line(&str) -> Result<StreamEvent>
 | 派生标记 | 完成 | `derived: true` / `authoritative: false`，`validate()` 拒绝声称权威的记录 |
 | 稳定性分级 | 完成 | 运行生命周期 `stable`；F7 的 checkpoint/rollback `provisional`；`pangu events contract` 可查 |
 | 显式上报截断 | 完成 | `StreamSummary.truncated`；CLI 遇截断返回非零而不是假装完整 |
+| 链校验入口 | 完成（opt-in） | `pangu events read --verify`；`replay::verify_journal` + `JournalIntegrity`；篡改/损坏非零退出、无链输入 fail closed；见 §4.6 |
 
 **实现中发现并修正的两个真问题**（均为本 ADR 设计直接导致的，值得记录）：
 

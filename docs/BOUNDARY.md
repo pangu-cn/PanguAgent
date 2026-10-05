@@ -185,7 +185,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 3. **I-Model-Cannot-Self-Approve**：批准只能来自 L4 外部 handler 或运行前已验证的策略；模型输出永远不是批准。
 4. **I-Budget-Terminates**：预算达到任一上限后，不再发 provider 请求或执行工具，并产生终态事件。
 5. **I-No-Effect-Before-Verdict**：在 policy、sandbox、approval 全部通过前，executor 不得收到 `VerifiedAction`；拒绝事件不能伪装成执行完成。
-6. **I-Append-Only-Journal**：Journal 不覆盖已有文件；事件序号和前向哈希可检测修改、插入和非末尾删除。没有外部封存锚点时，单纯截断末尾事件不能仅靠哈希链证明。
+6. **I-Append-Only-Journal**：Journal 不覆盖已有文件；事件序号和前向哈希可检测修改、插入和非末尾删除。没有外部封存锚点时，单纯截断末尾事件不能仅靠哈希链证明。检测由 `replay` 重算实现；**任何声称"链已校验"的输出都必须在同一次调用中真的重算过**——`pangu events read` 默认只做派生投影（`origin.journal_sha` 是文件里写的值），只有 `--verify` 才重算并通过/拒绝，且对不带链的输入 fail closed，不得报告一次未发生的检查。
 7. **I-Boundary-Binding**：Agent 启动时拒绝与 GoalContract/Sandbox/Policy digest 不一致的配置对象。
 8. **I-Redact-At-Boundary**：secret 在进入事件、错误展示和 provider 日志前被替换或限长。
 9. **I-Honest-Terminal**：没有成功工具 evidence 的 `complete` 自动降级为 `failed`。

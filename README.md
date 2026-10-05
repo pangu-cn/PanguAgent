@@ -221,7 +221,7 @@ pangu config [--file PATH]
 pangu run [--dry-run] "GOAL"
 pangu --demo [--dry-run]
 pangu explain --tool NAME [--arg K=V ...] [--arg0 PROGRAM ...] [--path P ...] [--host H ...] [--risk CLASS] [--json]
-pangu events read PATH [--kind KIND] [--json]      # PATH 也可以是 Journal 文件（自动迁移 forward）
+pangu events read PATH [--kind KIND] [--verify] [--json]   # PATH 也可以是 Journal 文件（自动迁移 forward）
 pangu events contract [--json]
 pangu conversation list
 pangu conversation show [--json]
@@ -240,7 +240,9 @@ pangu run --dangerously-unattended "GOAL"
 
 `pangu artifact inspect` 是只读检查器：它不创建、不修复、不删除、不重试任何东西，只把 Artifact store 的可验证状态和事故证据（stale transaction lock、replacement backup、operation 状态、effect/failed-path 账本、commit marker 与 blob hash 一致性）报成带 `unverifiable.*` / `operator.*` 代码的报告，并在报告为 `verified` 以外时返回非零退出码。完整语义见 [`docs/CHECKPOINT_RECOVERY.md`](docs/CHECKPOINT_RECOVERY.md)。
 
-`pangu events` 是稳定 NDJSON 事件流的只读入口（`pangu-stream/1`），供 UI、Agent Server、CI 审计器等外部工具消费，而不必绑死内部结构。它是**派生投影**，不是权威记录：每条记录固定带 `derived: true` / `authoritative: false`，自身不带哈希链（因此无法自证），只通过 `origin` 回指 Journal 的 `seq`/`sha`/`event_id`。审计权威始终是带哈希链的 Journal。契约只增不改；要改必须发 `pangu-stream/2` 并提供迁移器。未知或未来 schema 一律拒绝而不猜测，损坏行导致整读失败而非返回前缀。`pangu events contract` 列出本版本可读的 schema 与每个 kind 的冻结状态（F7 的 checkpoint/rollback 目前是 `provisional`）。设计与非目标见 [`docs/adr/0003-event-stream-contract.md`](docs/adr/0003-event-stream-contract.md)。
+`pangu events` 是稳定 NDJSON 事件流的只读入口（`pangu-stream/1`），供 UI、Agent Server、CI 审计器等外部工具消费，而不必绑死内部结构。它是**派生投影**，不是权威记录：每条记录固定带 `derived: true` / `authoritative: false`，自身不带哈希链（因此无法自证），只通过 `origin` 回指 Journal 的 `seq`/`sha`/`event_id`。审计权威始终是带哈希链的 Journal。契约只增不改；要改必须发 `pangu-stream/2` 并提供迁移器。未知或未来 schema 一律拒绝而不猜测，损坏行导致整读失败而非返回前缀。`pangu events contract` 列出本版本可读的 schema 与每个 kind 的冻结状态（F7 的 checkpoint/rollback 目前是 `provisional`）。
+
+默认读取只做投影：`origin.journal_sha` 是**文件里写的值**，不是重算过的值——投影不带链，所以它无法区分一条记录是否被改过。需要完整性结论时加 `--verify`：它重算 journal 哈希链，通过则打印重算后的 head sha，失败则**在打印任何记录之前**以非零退出（`tamper detected at seq N`）。对不带链的 `pangu-stream/1` 输入，`--verify` 报错而**不是**报告一次没发生过的成功——"没查"和"查过且完好"在输出里必须能区分（JSON 下未校验时 `integrity` 为 `null`）。设计与非目标见 [`docs/adr/0003-event-stream-contract.md`](docs/adr/0003-event-stream-contract.md)。
 
 `pangu explain` 在不执行任何副作用的前提下回答“**如果发起这个动作，边界会怎么判**”。它把 `Policy → Sandbox → Approval` 三层逐步投影，逐条规则报出 `decided` / `matched_but_refused` / `shadowed` / `no_match` / `not_reached`，并显式区分“规则拒绝”与“路径安全检查拒绝”（含被早先规则遮蔽的死规则分析）。它不执行、不写盘、不发事件、不是授权：`ExplainReport` 永远带 `advisory: true` / `authoritative: false`，且不提供到 `Effect` 的任何转换；真实运行会重新求值一切，两者不一致时以真实运行为准。设计与非目标见 [`docs/adr/0002-explain-policy-simulation.md`](docs/adr/0002-explain-policy-simulation.md)。
 

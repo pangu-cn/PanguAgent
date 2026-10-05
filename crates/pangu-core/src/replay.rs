@@ -1,6 +1,8 @@
 use std::io::Read;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::events::{Event, EventKind, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2};
 use crate::journal::{reject_symlink_components, GENESIS, MAX_JOURNAL_EVENT_LINE_BYTES};
 use crate::{Error, Result};
@@ -108,6 +110,66 @@ pub fn read(path: &Path) -> Result<Vec<Event>> {
         ))
     })?;
     Ok(events)
+}
+
+/// The verified facts about a journal's hash chain.
+///
+/// This is deliberately a *result of a check*, not a claim. It exists so a
+/// caller can print "the chain that was recomputed here is intact" instead of
+/// echoing a `sha` field it merely read back — those two statements look
+/// identical in output and mean different things.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalIntegrity {
+    /// Always true: this value only exists after `verify` recomputed the chain.
+    pub verified: bool,
+    /// The chain is only as long as the events that were checked.
+    pub events_verified: usize,
+    /// The `sha` of the last verified event; empty for an empty journal.
+    pub head_sha: String,
+    /// The journal format marker observed on the records (`pangu-journal/v1`
+    /// or `/v2`), or `None` when there were no events to judge.
+    pub journal_format: Option<String>,
+}
+
+/// Read a journal and report what verification actually established.
+///
+/// Use this when the caller must be able to say the chain was recomputed. It
+/// is stricter than [`read_raw`] (which tolerates a corrupt tail and returns a
+/// damage report) and reports the recomputed state that [`read`] discards.
+pub fn verify_journal(path: &Path) -> Result<(Vec<Event>, JournalIntegrity)> {
+    let events = read(path)?;
+    let integrity = JournalIntegrity {
+        verified: true,
+        events_verified: events.len(),
+        head_sha: events
+            .last()
+            .map(|event| event.sha.clone())
+            .unwrap_or_default(),
+        journal_format: journal_format(&events)?.map(str::to_string),
+    };
+    Ok((events, integrity))
+}
+
+/// The journal format marker shared by every event, or `None` when empty.
+///
+/// Mixed formats are impossible here: [`verify`] already refuses them, so this
+/// only has to report what verification established.
+pub fn journal_format(events: &[Event]) -> Result<Option<&str>> {
+    let mut format = None;
+    for event in events {
+        let event_format = validate_event_schema(event)?;
+        match format {
+            None => format = Some(event_format),
+            Some(seen) if seen == event_format => {}
+            Some(_) => {
+                return Err(Error::Other(
+                    "journal contains mixed v1/v2 event schemas".into(),
+                ))
+            }
+        }
+    }
+    Ok(format)
 }
 
 pub fn verify(events: &[Event]) -> Result<()> {
@@ -413,5 +475,98 @@ mod tests {
         finished.sha = Event::compute_sha(&finished.prev_sha, &finished.canonical());
         events.push(finished);
         assert_eq!(Summary::from_events(&events).tools_ok, 1);
+    }
+
+    fn temp_journal(name: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        let base = std::fs::canonicalize(&base).unwrap_or(base);
+        base.join(format!(
+            "pangu-replay-{name}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    /// `verify_journal` must report the state it recomputed, not the state the
+    /// file claimed. The head digest is the one fact a caller cannot get from
+    /// a plain read, because a plain read only echoes what was stored.
+    #[test]
+    fn verify_journal_reports_the_recomputed_head_and_format() {
+        let path = temp_journal("head");
+        let journal = crate::Journal::create_v2(&path).expect("create");
+        let mut last = String::new();
+        for index in 0..3 {
+            last = journal
+                .record(&Event::new(EK::TurnStarted, index, format!("t{index}")))
+                .expect("record")
+                .sha;
+        }
+        drop(journal);
+
+        let (events, integrity) = verify_journal(&path).expect("verify");
+        assert_eq!(events.len(), 3);
+        assert!(integrity.verified);
+        assert_eq!(integrity.events_verified, 3);
+        assert_eq!(integrity.head_sha, last);
+        assert_eq!(integrity.journal_format.as_deref(), Some(JOURNAL_FORMAT_V2));
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A rewritten digest is well-formed — same length, still hex — so echoing
+    /// it back cannot distinguish it from a real one. Only recomputation can.
+    #[test]
+    fn verify_journal_refuses_a_well_formed_but_wrong_digest() {
+        let path = temp_journal("wrong-digest");
+        let journal = crate::Journal::create_v2(&path).expect("create");
+        for index in 0..3 {
+            journal
+                .record(&Event::new(EK::TurnStarted, index, format!("t{index}")))
+                .expect("record");
+        }
+        drop(journal);
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let zeros = "0".repeat(64);
+        let rewritten: Vec<String> = raw
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 1 {
+                    let start = line.rfind("\"sha\":\"").expect("sha field");
+                    let mut line = line.to_string();
+                    line.replace_range(start + 7..start + 71, &zeros);
+                    line
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        std::fs::write(&path, format!("{}\n", rewritten.join("\n"))).expect("write");
+
+        let error = verify_journal(&path).expect_err("a rewritten digest must be caught");
+        assert!(
+            error.to_string().contains("tamper detected"),
+            "expected a tamper report, got: {error}"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    /// An empty journal has nothing to contradict, so it verifies — but it must
+    /// not report a head digest it never computed.
+    #[test]
+    fn verify_journal_of_an_empty_file_reports_no_head() {
+        let path = temp_journal("empty");
+        std::fs::write(&path, "").expect("write empty");
+
+        let (events, integrity) = verify_journal(&path).expect("verify empty");
+        assert!(events.is_empty());
+        assert!(integrity.verified);
+        assert_eq!(integrity.events_verified, 0);
+        assert!(integrity.head_sha.is_empty());
+        assert!(integrity.journal_format.is_none());
+        std::fs::remove_file(path).ok();
     }
 }
