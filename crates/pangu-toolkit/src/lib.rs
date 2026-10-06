@@ -1487,12 +1487,20 @@ async fn execute_command_tagged(
     // here.
     let launcher = runtime.and_then(|runtime| runtime.launcher());
     let mount = runtime.and_then(|runtime| runtime.workspace_mount());
+    // The workspace as the *host* sees it. Needed because the launcher process —
+    // `docker`, `runsc` — is itself spawned on the host, so `current_dir` must be
+    // a path that exists here. The in-container path (`/workspace`) is not one:
+    // passing it made every sandboxed command fail with an invalid-directory
+    // error before the runtime ever ran.
+    let host_workspace = runtime.map(|runtime| runtime.workspace());
     let mut command = match launcher {
         Some((program, leading)) => {
             let mut command = tokio::process::Command::new(program);
+            // `leading` carries the bind mount, so the workspace the command sees
+            // is the one the operator declared, mounted at the in-container path.
             command.args(leading);
-            // The host path of the workspace is not what the sandbox sees, so
-            // the command runs from the mount point rather than the host cwd.
+            // The command runs inside the sandbox, where `cwd` must be the in-container
+            // mount point rather than the host path.
             command.args(argv).current_dir(mount.unwrap_or("."));
             command
         }
@@ -1505,6 +1513,15 @@ async fn execute_command_tagged(
             command
         }
     };
+    // The launcher process runs on the host, so its own cwd must be a host path;
+    // the in-container path above is what the *command* is told to use. Without
+    // this the spawn fails with an invalid-directory error on a host where
+    // `/workspace` does not exist, and the sandbox never starts.
+    if let Some(host) = host_workspace {
+        if host.is_dir() {
+            command.current_dir(host);
+        }
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1523,10 +1540,14 @@ async fn execute_command_tagged(
         // context would be dropped by `Display` at the event boundary, so the
         // facts go into the message itself.
         anyhow!(
-            "spawn failed: {error} | program={:?} | cwd={} (exists={})",
+            "spawn failed: {error} | launching: {} | host cwd={} (exists={})",
             launcher_program_for_error(launcher, &argv[0]),
-            action.resources().cwd.display(),
-            action.resources().cwd.is_dir(),
+            host_workspace
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| action.resources().cwd.display().to_string()),
+            host_workspace
+                .map(Path::is_dir)
+                .unwrap_or_else(|| action.resources().cwd.is_dir()),
         )
     })?;
     let stdout = child

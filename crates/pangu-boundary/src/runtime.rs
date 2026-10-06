@@ -191,6 +191,9 @@ pub struct Runtime {
     probe: RuntimeProbe,
     launcher: Option<(String, Vec<String>)>,
     workspace_mount: Option<String>,
+    /// The workspace on the host. Kept so a caller that spawns the launcher can
+    /// give it a working directory that exists here.
+    workspace: PathBuf,
 }
 
 /// Configuration for resolving and using a runtime.
@@ -230,6 +233,7 @@ impl RuntimeConfig {
                 probe: RuntimeProbe::NotRequested,
                 launcher: None,
                 workspace_mount: None,
+                workspace: self.workspace.clone(),
             },
             SandboxRuntime::Auto => {
                 let mut reasons: Vec<String> = Vec::new();
@@ -255,6 +259,7 @@ impl RuntimeConfig {
                     },
                     launcher: None,
                     workspace_mount: None,
+                    workspace: self.workspace.clone(),
                 }
             }
             explicit => self.resolve_explicit_with(explicit),
@@ -266,7 +271,21 @@ impl RuntimeConfig {
         let (launcher, workspace_mount) = match &probe {
             RuntimeProbe::Usable { .. } => {
                 let (program, args, mount) = self.build_command(kind);
-                (Some((program, args)), mount)
+                // Pin the absolute path of the launcher now, while the same
+                // `PATH` resolution the probe used is still in effect.
+                //
+                // A real command runs with a *sanitized* environment whose `PATH`
+                // is the operator's allow-list, not the parent's. Reusing the bare
+                // name would let a runtime probe as usable and then fail to
+                // launch: the probe found `docker` because the parent's `PATH`
+                // had it, while the child's does not. Resolving to an absolute
+                // path here makes "the runtime that passed the probe" and "the
+                // runtime that runs the command" the same file by construction
+                // rather than by coincidence.
+                let pinned = find_program(&program)
+                    .map(|found| found.display().to_string())
+                    .unwrap_or(program);
+                (Some((pinned, args)), mount)
             }
             _ => (None, None),
         };
@@ -275,6 +294,7 @@ impl RuntimeConfig {
             probe,
             launcher,
             workspace_mount,
+            workspace: self.workspace.clone(),
         }
     }
 
@@ -500,6 +520,16 @@ impl Runtime {
         self.workspace_mount.as_deref()
     }
 
+    /// The workspace as the **host** sees it.
+    ///
+    /// Distinct from [`Self::workspace_mount`], which is the path inside the
+    /// sandbox. Callers that spawn the launcher process itself need this one:
+    /// `docker` is started on the host, so its working directory has to be a host
+    /// path. Using the in-container path there fails before the runtime runs.
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     /// The error raised when execution is refused.
     pub fn refusal(&self) -> Error {
         let (reason, remedy) = match &self.probe {
@@ -648,6 +678,7 @@ mod tests {
             },
             launcher: None,
             workspace_mount: None,
+            workspace: PathBuf::from("."),
         }
     }
 

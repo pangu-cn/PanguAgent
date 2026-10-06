@@ -125,12 +125,46 @@ cargo test -p pangu-boundary --test browser_cdp -- --ignored
   `runtime`。
 - 探测**不验证隔离是否无法逃逸**：那是运行时自身的属性，启动器无法证明。
 
-### 修复的一个真实缺陷
+### 修复的两个真实缺陷
 
-`[boundary.env] allow` 同时列出了 `PATH`/`SYSTEMROOT`，而 Windows 实际报告的是
-`Path`/`SystemRoot`。原先的精确大小写查找会**静默丢掉这两个变量**，导致每个沙箱
-子进程都没有 `PATH` 和 `SystemRoot`——Windows 加载器需要 `SystemRoot` 才能找到
-系统 DLL，所以命令会以 `os error 2` 失败而不是运行。现在按大小写不敏感匹配。
+第二个是在写 `runtime_dispatch.rs` 的收尾测试时暴露的，它让"声明即强制"在**真实启动
+路径**上根本不成立——探测通过之后命令仍然发不出去：
+
+1. **子进程工作目录用了容器内路径。** `docker` 进程本身是在宿主机上被拉起的，而
+   `current_dir` 被设成了 `/workspace`——那是命令在**沙箱内**看到的路径，在 Windows
+   上不存在。结果是每条沙箱命令都以 `os error 267（目录名称无效）` 失败，运行时从未
+   启动。现在区分两者：启动器进程用宿主机工作区，传给命令的 cwd 才是挂载点。
+
+2. **探测用的 `PATH` 和执行用的 `PATH` 不是同一个。** 探测继承父进程环境，真实执行
+   用的是操作者 allow-list 清洗后的环境。因此一个"探测通过"的运行时可能**根本无法
+   启动**：探测因为父进程 `PATH` 里有 `docker` 而成功，子进程的 `PATH` 里没有。现在
+   在探测时就把启动器解析成**绝对路径**并固定下来，使"通过探测的运行时"和"执行命令
+   的运行时"按构造是同一个文件，而不是碰巧相同。
+
+另外修掉了 `[boundary.env] allow` 的大小写问题：配置同时列出了 `PATH`/`SYSTEMROOT`，
+而 Windows 实际报告 `Path`/`SystemRoot`。原先的精确大小写查找**静默丢掉这两个变量**，
+导致每个沙箱子进程都没有 `PATH` 和 `SystemRoot`——Windows 加载器需要 `SystemRoot` 才能
+找到系统 DLL，所以命令以 `os error 2` 失败而不是运行。现在按大小写不敏感匹配。
+
+### 验证方式：真把命令塞进去，而不是等 Docker
+
+"真拉起执行"这句话在**没有可用容器运行时的机器上**同样必须能被验证。容器运行时二进制
+被一个**记录 argv 的桩**替换（放在 `PATH` 上，走真实的 `find_program` 查找），于是生产
+代码路径一字未改，而以下事实可以逐条断言：探测找到了程序、构造了带隔离标志的 argv、
+执行了它、读回 stdout 并匹配到 token、随后一次**真实工具调用**走了同一套 argv。
+
+实测记录（Windows 10.0.19045，本机 Docker Desktop 的 Linux 引擎不可用）：
+
+```
+RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
+  "--cap-drop=ALL" "--security-opt=no-new-privileges" alpine:3.20 pwd
+```
+
+不声明运行时则记录为 `RAN pangu-local-wrapper`——**没有任何容器包装**，这条反向用例
+防止"把每条命令都塞进运行时"这种改法悄悄通过。
+
+桩**不能**证明、本文档也不声称：Docker 对这些标志的实现真的隔离了什么。那是运行时
+自身的属性，与 `runtime.rs` 里写明的限制是同一条。
 
 ## 2. 持久化执行环境：为什么仍是"声明层"
 
