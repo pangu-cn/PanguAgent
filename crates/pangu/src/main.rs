@@ -2165,15 +2165,23 @@ async fn execute_goal(
     if let Some(store) = &deliverables {
         agent = agent.with_deliverables(store.clone());
     }
+    // Concurrency: every tool call takes a per-path lock, so agents touching
+    // the same file serialise while agents touching different files proceed in
+    // parallel. The wait is bounded so a lock left by a killed process is
+    // reported instead of hanging the run.
+    agent = agent.with_path_locks(
+        config.boundary.workspace_path_locks,
+        std::time::Duration::from_secs(config.boundary.workspace_lock_wait_secs),
+    );
     // D1: attach the sub-agent factory when the contract enables
     // delegation; the child tool surface is a fresh toolkit (verify only).
     if config.boundary.allow_delegation {
         agent = agent.with_delegation(Arc::new(FreshToolkitFactory));
-        // The child shares this run's workspace, so it takes the workspace
-        // write lock while it runs. The wait is bounded so a lock left by a
-        // killed process is reported instead of hanging the run.
+        // The coarse whole-workspace lock is opt-in: the child's own tool calls
+        // already take per-path locks, and excluding the entire workspace would
+        // block unrelated work.
         agent = agent.with_delegation_workspace_lock(
-            true,
+            config.boundary.delegation_workspace_lock,
             std::time::Duration::from_secs(config.boundary.workspace_lock_wait_secs),
         );
     }

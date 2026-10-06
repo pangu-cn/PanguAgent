@@ -2,7 +2,36 @@
 //!
 //! Several agents (a parent run and the sub-agents it delegates to, or two
 //! independent runs pointed at one workspace) can contend for the same files.
-//! This module serialises that access with a file-backed, cross-process lock.
+//! This module serialises that access with file-backed, cross-process locks.
+//!
+//! # Two granularities
+//!
+//! - [`PathLock`] 鈥?a lock per **file path**. Two agents editing different
+//!   files never wait for each other; two agents editing the same file are
+//!   serialised. This is the default for tool calls, because a tool call knows
+//!   exactly which paths it touches.
+//! - [`WorkspaceLock`] 鈥?one lock for the **whole workspace**. Coarser, and
+//!   needed when a caller cannot say which paths it will touch. Delegation
+//!   wraps a child run whose tool calls are not known in advance, so it uses
+//!   this only when explicitly asked to.
+//!
+//! A per-file lock is only sound because the sets of paths a call touches are
+//! known before it runs: see [`PathLock::acquire_all`].
+//!
+//! # Acquiring several paths without deadlocking
+//!
+//! A tool call can touch many paths at once. If each holder took its paths in
+//! the order the tool happened to list them, two holders could each be waiting
+//! on the other:
+//!
+//! ```text
+//! A: holds src/a.rs, wants src/b.rs
+//! B: holds src/b.rs, wants src/a.rs
+//! ```
+//!
+//! So multi-path acquisition sorts its keys and takes them in that single
+//! global order. Waiting is still bounded, so even a lost race reports rather
+//! than hangs.
 //!
 //! # Why this is not `StoreProcessLock`
 //!
@@ -19,7 +48,7 @@
 //! A lock file outlives its creator when the creator dies without running
 //! `Drop` (crash, `SIGKILL`, power loss, container teardown). Nothing will ever
 //! remove such a file: whoever finds it cannot distinguish "holder is working"
-//! from "holder is gone" using the file alone — the recorded `pid` is a hint,
+//! from "holder is gone" using the file alone 鈥?the recorded `pid` is a hint,
 //! not proof, since pids are reused.
 //!
 //! An unbounded wait therefore has no exit for the crashed-holder case: the
@@ -30,8 +59,8 @@
 //!
 //! The deadline expiring is *not* permission to break the lock. Breaking it
 //! would let two writers touch the workspace at once, which is exactly what the
-//! lock exists to prevent, and it would destroy the evidence an operator needs.
-//! Expiry is reported, never acted on.
+//! lock exists to prevent, and it would leave the workspace in a state matching
+//! neither run's recorded actions. Expiry is reported, never acted on.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -46,8 +75,7 @@ use crate::error::{Error, Result};
 /// already Pangu's own storage: it is a forbidden tool-write glob and every
 /// deployment that uses memory, skills, conversations or checkpoints already
 /// creates it. Putting the lock at the workspace root instead would show a user
-/// an untracked dotfile in `git status` for the duration of a delegation —
-/// visible clutter, and something they might wrongly commit or delete. Nothing
+/// an untracked dotfile in `git status` for the duration of a delegation 鈥?/// visible clutter, and something they might wrongly commit or delete. Nothing
 /// about the lock belongs in the user's tracked tree.
 pub const WORKSPACE_LOCK_FILE: &str = "workspace.lock";
 
@@ -65,6 +93,200 @@ fn prepare_lock_dir(workspace: &Path) -> Result<PathBuf> {
     let dir = workspace.join(WORKSPACE_LOCK_DIR);
     fs::create_dir_all(&dir)?;
     Ok(dir.join(WORKSPACE_LOCK_FILE))
+}
+
+/// Create the parent directory of an explicit lock file path.
+fn prepare_parent(path: &Path) -> Result<()> {
+    match path.parent() {
+        Some(parent) => {
+            fs::create_dir_all(parent)?;
+            Ok(())
+        }
+        None => Err(Error::Config(format!(
+            "lock file path has no parent directory: {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Subdirectory of `.pangu/` holding per-path lock files.
+pub const PATH_LOCK_DIR: &str = "locks";
+
+/// Directory holding per-path lock files for a workspace.
+pub fn path_lock_dir(workspace: &Path) -> PathBuf {
+    workspace.join(WORKSPACE_LOCK_DIR).join(PATH_LOCK_DIR)
+}
+
+/// Lock file name for one workspace-relative path.
+///
+/// The name is a hash rather than the path itself: a nested path would need its
+/// directories recreated, and a path can contain characters no filesystem in
+/// general accepts. Hashing also keeps the lock directory flat, so a lock can
+/// be taken for a path whose parent directory does not exist yet (a tool that
+/// creates `src/new/mod.rs` locks that name before `src/new/` exists).
+pub fn path_lock_file(workspace: &Path, relative: &Path) -> PathBuf {
+    let key = relative.to_string_lossy().replace('\\', "/");
+    path_lock_dir(workspace).join(format!("{}.lock", crate::hex_sha256(&key)))
+}
+
+/// A lock covering one file path.
+///
+/// Holders of the same path serialise; holders of different paths do not
+/// interact at all. See [`Self::acquire_all`] for taking several at once.
+#[derive(Debug)]
+pub struct PathLock {
+    guard: WorkspaceLock,
+    /// Workspace-relative path this lock covers, normalised.
+    key: PathBuf,
+}
+
+impl PathLock {
+    /// Acquire the lock for a single workspace-relative path.
+    pub fn acquire(
+        workspace: &Path,
+        relative: &Path,
+        mode: LockMode,
+        deadline: Duration,
+    ) -> Result<Self> {
+        let key = normalise_relative(relative)?;
+        let path = path_lock_file(workspace, &key);
+        // Name the file the user recognises, not the hashed lock name.
+        let described = format!("lock on `{}`", key.display());
+        let guard = WorkspaceLock::acquire_at_with_poll(
+            &path,
+            mode,
+            deadline,
+            Duration::from_millis(25),
+            Some(&described),
+        )?;
+        Ok(Self { guard, key })
+    }
+
+    /// Acquire locks for validated **absolute** paths inside the workspace.
+    ///
+    /// The sandbox resolves action paths to absolute form during validation, so
+    /// this is the entry point the tool path uses. Paths outside the workspace
+    /// are ignored rather than refused: a validated action may legitimately
+    /// touch a readable root that is not the workspace, and this lock only
+    /// exists to serialise *workspace* writes. Refusing would turn an unrelated
+    /// readable root into a failed run.
+    pub fn acquire_for_action(
+        workspace: &Path,
+        read_paths: &[PathBuf],
+        write_paths: &[PathBuf],
+        deadline: Duration,
+    ) -> Result<Vec<Self>> {
+        let to_key = |path: &PathBuf| -> Option<PathBuf> {
+            path.strip_prefix(workspace).ok().map(Path::to_path_buf)
+        };
+        let reads: Vec<PathBuf> = read_paths.iter().filter_map(to_key).collect();
+        let writes: Vec<PathBuf> = write_paths.iter().filter_map(to_key).collect();
+        if reads.is_empty() && writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        Self::acquire_all(workspace, &reads, &writes, deadline)
+    }
+
+    /// Acquire locks for several paths, deadlock-free.
+    ///
+    /// Keys are de-duplicated and sorted before acquisition, so every holder
+    /// takes shared keys in the same global order. Without that, two calls
+    /// touching `{a, b}` and `{b, a}` would each hold one and wait forever for
+    /// the other.
+    ///
+    /// Reads may be requested alongside writes; a path needed for writing is
+    /// taken exclusively, and a path merely read is taken shared. If a path
+    /// appears in both lists it is locked for writing, since that is the
+    /// stronger requirement.
+    ///
+    /// On failure nothing is retained: every lock already taken is released
+    /// before the error is returned, so a caller that gives up cannot leak
+    /// locks the rest of the run would then have to wait on.
+    pub fn acquire_all(
+        workspace: &Path,
+        read_paths: &[PathBuf],
+        write_paths: &[PathBuf],
+        deadline: Duration,
+    ) -> Result<Vec<Self>> {
+        // Collapse to one mode per key, letting a write supersede a read.
+        let mut wanted: std::collections::BTreeMap<PathBuf, LockMode> =
+            std::collections::BTreeMap::new();
+        for path in read_paths {
+            let key = normalise_relative(path)?;
+            wanted.entry(key).or_insert(LockMode::Read);
+        }
+        for path in write_paths {
+            let key = normalise_relative(path)?;
+            // A write need overrides a read need for the same path.
+            wanted.insert(key, LockMode::Write);
+        }
+
+        // BTreeMap iterates in sorted key order, which is the global order that
+        // makes concurrent multi-path acquisition deadlock-free.
+        let mut held = Vec::with_capacity(wanted.len());
+        for (key, mode) in wanted {
+            match Self::acquire(workspace, &key, mode, deadline) {
+                Ok(lock) => held.push(lock),
+                Err(error) => {
+                    drop(held);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(held)
+    }
+
+    /// The workspace-relative path this lock covers.
+    pub fn key(&self) -> &Path {
+        &self.key
+    }
+
+    /// The mode this lock was taken in.
+    pub fn mode(&self) -> LockMode {
+        self.guard.mode()
+    }
+}
+
+/// Reject keys that cannot name a path safely, and normalise separators.
+///
+/// A path escaping the workspace is refused here rather than hashed: two
+/// different spellings of the same outside path would otherwise produce two
+/// different lock names and fail to serialise.
+///
+/// The workspace root itself is a *valid* key: reading `.` is an ordinary
+/// action, so refusing it would fail runs for no reason. It normalises to an
+/// empty relative path, which the caller represents explicitly.
+fn normalise_relative(path: &Path) -> Result<PathBuf> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    // `"."`, `"./"` and `"././x"` all name the same thing as `""` and `"x"`.
+    // Comparing them as strings would give `src/a.rs` and `./src/a.rs` two
+    // different lock names, so two agents editing one file would not serialise.
+    let mut trimmed = text.as_str();
+    loop {
+        let next = trimmed
+            .strip_prefix("./")
+            .or_else(|| trimmed.strip_prefix(".").filter(|rest| rest.is_empty()));
+        match next {
+            Some(rest) => trimmed = rest,
+            None => break,
+        }
+    }
+    for component in Path::new(trimmed).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(Error::Config(format!(
+                    "path lock key must not escape the workspace: {text}"
+                )))
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(Error::Config(format!(
+                    "path lock key must be workspace-relative, not absolute: {text}"
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(PathBuf::from(trimmed))
 }
 
 /// How the caller intends to use the workspace while holding the lock.
@@ -119,18 +341,34 @@ impl WorkspaceLock {
         poll: Duration,
     ) -> Result<Self> {
         let path = prepare_lock_dir(workspace)?;
+        Self::acquire_at_with_poll(&path, mode, deadline, poll, None)
+    }
+
+    /// Acquire an explicit lock file, waiting for a conflicting holder.
+    ///
+    /// Used by [`PathLock`], which owns its own lock file per path and passes a
+    /// description so the wait error names the path rather than a bare digest.
+    pub(crate) fn acquire_at_with_poll(
+        path: &Path,
+        mode: LockMode,
+        deadline: Duration,
+        poll: Duration,
+        describe: Option<&str>,
+    ) -> Result<Self> {
+        prepare_parent(path)?;
+        let what = describe.unwrap_or("workspace lock");
         let started = Instant::now();
 
         loop {
-            match Self::try_acquire(&path, mode) {
+            match Self::try_acquire(path, mode) {
                 Ok(lock) => return Ok(lock),
                 Err(TryLock::Busy(holder)) => {
                     if started.elapsed() >= deadline {
                         return Err(Error::Other(format!(
-                            "workspace lock not acquired within {:?}: held by {} (path {}); \
-                             another Pangu run is working in this workspace. If no Pangu process \
+                            "{what} not acquired within {:?}: held by {} (path {}); \
+                             another Pangu run is working on it. If no Pangu process \
                              is running, the lock was left by one that was killed before it could \
-                             release it — deleting that file is then safe. It is only a \
+                             release it 鈥?deleting that file is then safe. It is only a \
                              mutual-exclusion marker, not evidence, so it is never removed \
                              automatically here.",
                             deadline,
@@ -357,6 +595,256 @@ mod tests {
     fn plant_lock(root: &Path, contents: &str) {
         let path = prepare_lock_dir(root).expect("prepare lock dir");
         fs::write(path, contents).expect("plant lock");
+    }
+
+    // ---- per-path locking -------------------------------------------------
+
+    #[test]
+    fn different_paths_do_not_block_each_other() {
+        let root = workspace("path-parallel");
+        let _a = PathLock::acquire(
+            &root,
+            Path::new("src/a.rs"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        // A different file is a different lock: this must not wait.
+        let b = PathLock::acquire(
+            &root,
+            Path::new("docs/b.md"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        )
+        .expect("an unrelated path must be free");
+        assert_eq!(b.key(), Path::new("docs/b.md"));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn the_same_path_serialises() {
+        let root = workspace("path-serialise");
+        let _held = PathLock::acquire(
+            &root,
+            Path::new("src/a.rs"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let second = PathLock::acquire(
+            &root,
+            Path::new("src/a.rs"),
+            LockMode::Write,
+            Duration::from_millis(80),
+        );
+        assert!(
+            second.is_err(),
+            "the same path must not be writable by two holders at once"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn a_path_lock_names_the_file_it_covers() {
+        let root = workspace("path-naming");
+        let _held = PathLock::acquire(
+            &root,
+            Path::new("src/deep/file.rs"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let error = PathLock::acquire(
+            &root,
+            Path::new("src/deep/file.rs"),
+            LockMode::Write,
+            Duration::from_millis(50),
+        )
+        .expect_err("contended")
+        .to_string();
+        assert!(
+            error.contains("src/deep/file.rs"),
+            "the wait error must name the file, not the hashed lock name: {error}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn equivalent_spellings_share_one_lock() {
+        let root = workspace("path-spelling");
+        let _held = PathLock::acquire(
+            &root,
+            Path::new("src/a.rs"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        // `./src/a.rs` is the same file; it must contend, not slip through.
+        let other = PathLock::acquire(
+            &root,
+            Path::new("./src/a.rs"),
+            LockMode::Write,
+            Duration::from_millis(50),
+        );
+        assert!(
+            other.is_err(),
+            "two spellings of one path must not both be lockable"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn acquire_all_takes_every_path_and_a_write_supersedes_a_read() {
+        let root = workspace("path-multi");
+        let held = PathLock::acquire_all(
+            &root,
+            &[PathBuf::from("src/a.rs"), PathBuf::from("docs/b.md")],
+            &[PathBuf::from("src/a.rs")],
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert_eq!(held.len(), 2, "both paths must be locked");
+        let a = held
+            .iter()
+            .find(|lock| lock.key() == Path::new("src/a.rs"))
+            .expect("a.rs locked");
+        assert_eq!(
+            a.mode(),
+            LockMode::Write,
+            "a path needed for writing must be held exclusively even if also read"
+        );
+        let b = held
+            .iter()
+            .find(|lock| lock.key() == Path::new("docs/b.md"))
+            .expect("b.md locked");
+        assert_eq!(b.mode(), LockMode::Read);
+        cleanup(&root);
+    }
+
+    /// Two holders that want the same pair of paths in opposite orders must not
+    /// deadlock. Sorted acquisition is what makes that true.
+    ///
+    /// Each thread takes both paths, holds them briefly, and releases 鈥?so the
+    /// test exercises real contention. Returning the locks instead would be
+    /// useless: a thread that still holds them cannot be "finished", and the
+    /// other would be waiting on a live holder rather than a deadlocked one.
+    /// With unsorted acquisition this test deadlocks and fails on the deadline.
+    #[test]
+    fn acquire_all_is_deadlock_free_for_overlapping_sets() {
+        let root = workspace("path-deadlock");
+
+        let worker = |order: [&'static str; 2], root: PathBuf| {
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let paths = vec![PathBuf::from(order[0]), PathBuf::from(order[1])];
+                    let held = PathLock::acquire_all(&root, &[], &paths, Duration::from_secs(5))?;
+                    // Hold long enough that an unsorted implementation would
+                    // reliably interleave into a deadlock.
+                    std::thread::sleep(Duration::from_millis(2));
+                    drop(held);
+                }
+                Ok::<_, crate::error::Error>(())
+            })
+        };
+
+        let a = worker(["p/one", "p/two"], root.clone());
+        let b = worker(["p/two", "p/one"], root.clone());
+
+        let a = a.join().expect("thread a panicked");
+        let b = b.join().expect("thread b panicked");
+        assert!(a.is_ok(), "holder a must complete: {:?}", a.err());
+        assert!(b.is_ok(), "holder b must complete: {:?}", b.err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn a_failed_multi_acquire_releases_what_it_already_took() {
+        let root = workspace("path-rollback");
+        // Hold one of the two paths, so acquire_all fails part-way through.
+        let _blocker = PathLock::acquire(
+            &root,
+            Path::new("p/two"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        let attempt = PathLock::acquire_all(
+            &root,
+            &[],
+            &[PathBuf::from("p/one"), PathBuf::from("p/two")],
+            Duration::from_millis(80),
+        );
+        assert!(attempt.is_err(), "the blocked path must fail the call");
+        assert!(
+            attempt.unwrap_err().to_string().contains("p/two"),
+            "the error must name the blocking path"
+        );
+
+        // `p/one` was taken before the failure. It must have been released, or
+        // the rest of the run would wait on a lock nobody holds.
+        let reclaimed = PathLock::acquire(
+            &root,
+            Path::new("p/one"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        );
+        assert!(
+            reclaimed.is_ok(),
+            "a partially failed acquire must not leak the locks it took"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn path_keys_that_leave_the_workspace_are_refused() {
+        let root = workspace("path-escape");
+        for bad in ["../outside.rs", "/etc/passwd"] {
+            let result = PathLock::acquire(
+                &root,
+                Path::new(bad),
+                LockMode::Write,
+                Duration::from_millis(50),
+            );
+            assert!(
+                result.is_err(),
+                "`{bad}` must not be lockable as a workspace path"
+            );
+        }
+        cleanup(&root);
+    }
+
+    /// Reading `.` is an ordinary action, so the workspace root must be a
+    /// usable key rather than an error. Refusing it failed real runs.
+    #[test]
+    fn the_workspace_root_is_a_valid_key() {
+        let root = workspace("path-root");
+        let held = PathLock::acquire(
+            &root,
+            Path::new("."),
+            LockMode::Read,
+            Duration::from_millis(200),
+        )
+        .expect("the workspace root must be lockable");
+        assert_eq!(held.key(), Path::new(""));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn path_locks_live_under_pangu_not_the_tracked_tree() {
+        let root = workspace("path-location");
+        let _held = PathLock::acquire(
+            &root,
+            Path::new("src/a.rs"),
+            LockMode::Write,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let dir = path_lock_dir(&root);
+        assert!(dir.starts_with(root.join(WORKSPACE_LOCK_DIR)));
+        // The tracked file itself must never be touched.
+        assert!(!root.join("src/a.rs").exists());
+        cleanup(&root);
     }
 
     #[test]

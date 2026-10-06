@@ -508,16 +508,35 @@ pub struct BoundarySection {
     /// budget and its contract is derived, never model-supplied.
     #[serde(default)]
     pub allow_delegation: bool,
-    /// How long a delegated sub-agent waits for the shared workspace lock
-    /// before the delegation fails closed.
+    /// How long a tool call waits for the paths it touches before failing
+    /// closed.
     ///
-    /// A sub-agent shares its parent's workspace, so only one writer may run
-    /// at a time. Two Pangu processes in the same repository is the ordinary
-    /// case this serialises; a lock left by a killed process is why the wait
-    /// is bounded at all. Raising it trades a longer hang on a stale lock for
-    /// more patience with a genuinely slow sibling run.
+    /// Every tool call takes a lock per path, so two agents editing the same
+    /// file serialise while agents editing different files run in parallel. A
+    /// lock left by a killed process is why the wait is bounded at all.
     #[serde(default = "default_workspace_lock_wait_secs")]
     pub workspace_lock_wait_secs: u64,
+    /// Whether tool calls take per-path locks. Default on.
+    ///
+    /// Turning this off removes all cross-process serialisation of workspace
+    /// writes: two agents may then edit one file concurrently and the result
+    /// matches neither one's recorded actions. Only disable it when the
+    /// deployment serialises writers some other way.
+    #[serde(default = "default_true")]
+    pub workspace_path_locks: bool,
+    /// Whether a delegated sub-agent additionally excludes the **whole**
+    /// workspace while it runs. Default off.
+    ///
+    /// The child's own tool calls take per-path locks, so this is only for
+    /// callers that need to stop unrelated work too. Enabling it makes two
+    /// agents in one repository block each other even when their files do not
+    /// overlap.
+    #[serde(default)]
+    pub delegation_workspace_lock: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Default wait for the shared workspace lock: long enough to outlast an
@@ -558,6 +577,8 @@ impl Default for BoundarySection {
             extra_readonly_commands: Vec::new(),
             allow_delegation: false,
             workspace_lock_wait_secs: default_workspace_lock_wait_secs(),
+            workspace_path_locks: true,
+            delegation_workspace_lock: false,
         }
     }
 }

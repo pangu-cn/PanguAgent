@@ -409,6 +409,14 @@ pub struct Agent {
     /// delegation fails closed. Bounded on purpose: a holder that died without
     /// releasing leaves an unreleasable file (see `pangu_core::lockfile`).
     delegation_lock_timeout: std::time::Duration,
+    /// Whether each tool call takes per-path locks.
+    ///
+    /// This is the fine-grained default: only overlapping files serialise. The
+    /// whole-workspace lock (`delegation_workspace_lock`) is the coarse option
+    /// for callers that cannot say which paths they will touch.
+    workspace_path_lock: bool,
+    /// How long a tool call waits for its paths before failing closed.
+    path_lock_timeout: std::time::Duration,
 }
 
 impl Agent {
@@ -513,11 +521,14 @@ impl Agent {
             tools,
             approval,
             delegation: None,
-            delegation_workspace_lock: true,
-            // Matches `boundary.workspace_lock_wait_secs`. The CLI overrides
-            // this from config; the default here keeps library callers from
-            // getting a different timeout than config-driven runs.
+            // Off by default: the child's tool calls take per-path locks, so
+            // unrelated work is not blocked. Turning this on excludes the whole
+            // workspace, which is only wanted when the caller needs to stop
+            // *everything* else rather than just overlapping paths.
+            delegation_workspace_lock: false,
             delegation_lock_timeout: Duration::from_secs(120),
+            workspace_path_lock: true,
+            path_lock_timeout: Duration::from_secs(120),
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
@@ -562,6 +573,11 @@ impl Agent {
 
     /// Configure the workspace lock a delegated child must hold while running.
     ///
+    /// The child's own tool calls already take **per-path** locks, so
+    /// overlapping files serialise and unrelated files do not. This coarse
+    /// whole-workspace lock is for callers that need to exclude everything at
+    /// once — it is off by default precisely because it blocks unrelated work.
+    ///
     /// `timeout` bounds the wait. It is deliberately not `Option<Duration>`:
     /// an unbounded wait cannot be satisfied when the previous holder died
     /// without releasing, so there is no useful sense in which it is "more
@@ -569,6 +585,17 @@ impl Agent {
     pub fn with_delegation_workspace_lock(mut self, enabled: bool, timeout: Duration) -> Self {
         self.delegation_workspace_lock = enabled;
         self.delegation_lock_timeout = timeout;
+        self
+    }
+
+    /// Configure the per-path lock every tool call takes.
+    ///
+    /// `timeout` bounds the wait for each path, for the same reason the
+    /// workspace lock is bounded: a holder killed before it could release
+    /// leaves a lock file nothing will remove.
+    pub fn with_path_locks(mut self, enabled: bool, timeout: Duration) -> Self {
+        self.workspace_path_lock = enabled;
+        self.path_lock_timeout = timeout;
         self
     }
 
@@ -2655,6 +2682,29 @@ impl Agent {
                 }
             }
         }
+
+        // Serialise this action against other agents touching the same files.
+        //
+        // The lock is per path, not per workspace: two agents editing different
+        // files must not wait for each other, and only overlapping paths need
+        // serialising. `acquire_for_action` sorts the keys, so a call touching
+        // several paths cannot deadlock against another call touching the same
+        // paths in a different order.
+        //
+        // Taken after approval, so a denied action never reserves paths. Held
+        // only for the duration of the tool call; every lock taken is released
+        // on drop if the call fails, so a failed action cannot strand a lock
+        // the rest of the run would wait on.
+        let _path_locks = if self.workspace_path_lock {
+            Some(pangu_core::PathLock::acquire_for_action(
+                &self.sandbox.workspace,
+                &resources.read_paths,
+                &resources.write_paths,
+                self.path_lock_timeout,
+            )?)
+        } else {
+            None
+        };
 
         let action = VerifiedAction::new(call.clone(), resources, Arc::clone(&self.sandbox));
         let started_event = self

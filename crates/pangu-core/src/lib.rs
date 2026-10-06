@@ -75,8 +75,8 @@ pub use inspect::{
 };
 pub use journal::{ConsoleSink, Journal};
 pub use lockfile::{
-    describe_lock, lock_file_path, peek_lock_file, LockHolder, LockMode, WorkspaceLock,
-    WORKSPACE_LOCK_FILE,
+    describe_lock, lock_file_path, path_lock_dir, path_lock_file, peek_lock_file, LockHolder,
+    LockMode, PathLock, WorkspaceLock, PATH_LOCK_DIR, WORKSPACE_LOCK_DIR, WORKSPACE_LOCK_FILE,
 };
 pub use memory::{
     MemoryCandidate, MemoryLimits, MemoryStatus, MemoryStore, MemoryTransition, MEMORY_SCHEMA,
