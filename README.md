@@ -25,6 +25,41 @@ cargo run -q -p pangu -- --demo
 
 默认运行会在工作区的 `.pangu/journal-<timestamp>.jsonl` 写入经过脱敏的哈希链事件。`doctor` 不会发模型请求或执行工具；`--dry-run` 只打印有效配置。
 
+## OS 级沙箱（F8）
+
+`[execution] profile` 是**审计声明**（"我认为它跑在容器里"），`[execution] runtime` 是**强制**（"它真的跑在哪个边界里"）。两者分开，因为承诺不同——命名一个容器不会创建容器。
+
+```toml
+[execution]
+profile = "container"
+runtime = "oci"          # local（默认）/ auto / firecracker / gvisor / oci
+image = "alpine:3.20"
+network = false
+```
+
+声明非 `local` 后，Pangu 会**真正在里面跑一条命令**来探测；探测失败即**拒绝执行**，**不存在退回宿主机**的路径——审计里记着声明的运行时、实际却在宿主机上跑，会让这条记录变成假的。`auto` 按内核边界强度择优：firecracker > gvisor > oci；显式选择不会被静默降级。
+
+Firecracker 目前始终报不可用（缺 vsock/串口通道驱动到完成），这是刻意的：声称一个从不启动的微 VM，正是这个特性要消除的那类失败。详见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) 第 1 节。
+
+## 内置浏览器（F9）
+
+浏览器自动化不再只能靠外部 MCP 接入。`[browser] enabled = true` 后，五个工具进入与其它工具**逐位相同**的 L1–L4 链：
+
+```toml
+[browser]
+enabled = true
+network = false
+# executable = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+```
+
+| 工具 | 风险 | 效果 |
+|------|------|------|
+| `browser_open` | `NeedsHuman` | `ExternalRead`（会访问主机，声明其 host） |
+| `browser_read` / `browser_screenshot` | `ReadOnly` | `NoEffect` |
+| `browser_click` / `browser_type` | `Reversible` | **`ExternalMutation`** |
+
+**点击不是只读**：点下去会发生什么由页面决定，把它当成观察会让改变状态的动作绕过人工闸门。默认关闭时浏览器工具**根本不出现在工具表里**。已在真实 Chrome 154 上端到端验证（点击触发页面自己的 `onclick`、截图是合法 PNG）。详见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) 第 2b 节。
+
 ## 实验性 Checkpoint / Rollback
 
 阶段二实现已经存在，但 checkpoint/rollback **默认关闭，仍是实验性 opt-in，不是 v0.1 的默认支持承诺**。启用后，成功 `VerifiedAction` 的 `ToolFinished` 才会产生 Pangu Artifact checkpoint；rollback 只能由 typed operator/library API 或 CLI 触发，不能由模型用自然语言或裸路径触发。
