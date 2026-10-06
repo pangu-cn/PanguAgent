@@ -1,6 +1,8 @@
 //! Built-in tools. Every executor is an adapter around the Agent capability
 //! protocol; no public method accepts an unverified model call for execution.
 
+pub mod mcp_stdio;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;

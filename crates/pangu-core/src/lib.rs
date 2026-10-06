@@ -19,6 +19,7 @@ pub mod inspect;
 pub mod journal;
 pub mod json;
 pub mod lockfile;
+pub mod mcp;
 pub mod memory;
 pub mod messages;
 pub mod modules;
