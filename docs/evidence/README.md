@@ -44,3 +44,5 @@ CI 把每一行报告同时发成可公开读取的注解（`f7-drill-report.jso
 | 其它（含报告缺失） | `error` | `outcome` 是固定词表，出现别值说明报告本身有问题 |
 
 这条区分是必要的：此前所有行一律发 `::error::`，于是**一次全绿的运行也带着约 14 条 error 注解**，"演练全部通过"与"演练失败"在界面上长得一模一样，只能靠解码载荷才能分辨。常亮的警报不携带信息，也会让真正的失败被淹没。
+
+该分级已在 CI 上实测确认（提交 `7468262`，run [37402160742](https://github.com/pangu-cn/PanguAgent/actions/runs/37402160742)）：两个平台各 7 条 `notice`、0 条 `error`，Ubuntu 的 `replace-backup` 为 `warning`（`not-applicable`），Windows 无该项因而不产生该 warning。**0 条 error 就是这里的终态**——一旦出现 error，说明报告格式坏了（`outcome` 落在词表外）或报告没产出，而不是"演练失败"；演练失败本身会先让 `Run F7 checkpoint operator drills` 步骤以非零码退出。

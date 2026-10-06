@@ -18,7 +18,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -93,7 +93,7 @@ jobs:
 
       - name: Archive CI logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-logs-${{ matrix.os }}
           path: |
@@ -103,7 +103,7 @@ jobs:
 
       - name: Archive all-tests log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-log-${{ matrix.os }}
           path: all-tests.log
@@ -130,7 +130,7 @@ jobs:
       # Severity follows the outcome, and that matters more than it looks.
       # Emitting every line as ::error:: meant a green run carried ~14 error
       # annotations, so "the drills all passed" and "the drills failed" rendered
-      # identically — the signal was only readable by decoding the payload. An
+      # identically 鈥?the signal was only readable by decoding the payload. An
       # alarm that is always on carries no information.
       - name: Publish F7 drill report
         shell: bash
@@ -166,7 +166,7 @@ jobs:
 
       - name: Archive F7 drill report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: f7-drill-report-${{ matrix.os }}
           path: f7-drill-report.jsonl
