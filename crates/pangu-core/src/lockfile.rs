@@ -624,12 +624,17 @@ impl LockHolder {
     /// and a dead pid does not authorise removing the file. Callers must not
     /// use this to decide to break a lock.
     pub fn pid_appears_alive(&self) -> Option<bool> {
+        // `libc_kill` wraps the raw call in exactly one `unsafe` block, so the
+        // caller needs none: adding one here is an `unnecessary_unsafe`.
+        //
+        // This arm is the kind of lint a single-platform local run cannot see:
+        // the Windows build never compiles it, so `cargo clippy` on Windows is
+        // silent while Linux CI fails. That is why CI runs both platforms.
         #[cfg(unix)]
         {
             let pid = self.pid?;
             // Signal 0 performs error checking without sending a signal.
-            let result = unsafe { libc_kill(pid as i32, 0) };
-            return Some(result == 0);
+            Some(libc_kill(pid as i32, 0) == 0)
         }
         #[cfg(not(unix))]
         {
