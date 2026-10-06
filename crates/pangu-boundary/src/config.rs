@@ -308,11 +308,27 @@ impl CheckpointSection {
         // than what it claims to be. Both are rejected here rather than at
         // snapshot time, so the mistake is reported before a run starts.
         for (index, exclude) in self.exclude_roots.iter().enumerate() {
+            // Containment is decided first, and decided from the *spelling*.
+            //
+            // `absolute_path_from` rejects `..` outright, so a rule like
+            // `../elsewhere` fails there. Reporting that would send the operator
+            // looking for a traversal bug in a config field whose actual mistake
+            // is "this exclusion points outside the workspace" — and the verdict
+            // would differ between platforms, because on Windows a canonicalized
+            // workspace plus `..` can normalize away before the rejection is
+            // reached. Same config, same mistake, one message.
+            //
+            // Only the `..` spelling is handled here. An absolute path is *not*
+            // suspicious by itself: the contract normalizes exclusions to
+            // absolute paths before revalidating them, so rejecting one would
+            // break every valid configuration. Containment below covers those.
+            if exclude.components().any(escapes_workspace) {
+                return Err(Error::Config(format!(
+                    "checkpoint.exclude_roots[{index}] must be a subdirectory of the workspace"
+                )));
+            }
             let path = absolute_path_from(&workspace, exclude)?;
             let resolved = canonicalize_with_missing(&path)?;
-            // Containment first, symlink check second. A `../escape` also
-            // fails the symlink-component test, and reporting that instead
-            // would send the operator looking for a symlink that is not there.
             if !path_starts_with(&resolved, &workspace) || same_path(&resolved, &workspace) {
                 return Err(Error::Config(format!(
                     "checkpoint.exclude_roots[{index}] must be a subdirectory of the workspace"
@@ -332,6 +348,15 @@ impl CheckpointSection {
         }
         Ok(())
     }
+}
+
+/// True for a `..` component, i.e. a path spelling that leaves its base.
+///
+/// Used to decide "outside the workspace" from the spelling, before any
+/// platform-specific path normalization can turn one mistake into two different
+/// messages.
+fn escapes_workspace(component: std::path::Component<'_>) -> bool {
+    matches!(component, std::path::Component::ParentDir)
 }
 
 pub(crate) fn canonicalize_with_missing(path: &Path) -> Result<PathBuf> {
