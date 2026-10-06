@@ -533,6 +533,17 @@ pub struct BoundarySection {
     /// overlap.
     #[serde(default)]
     pub delegation_workspace_lock: bool,
+    /// Whether a build-file edit additionally locks its build module. Default
+    /// on.
+    ///
+    /// With this on, a workspace organised into build modules (Cargo crates,
+    /// Gradle subprojects, Maven modules, npm workspaces) lets one agent own a
+    /// module while agents in sibling modules proceed. Only a module map that
+    /// parsed completely is used: a partial map would place files in the wrong
+    /// module while looking authoritative, and a wrong map fails silently —
+    /// two agents would run in one module with no lock reporting anything.
+    #[serde(default = "default_true")]
+    pub workspace_module_locks: bool,
 }
 
 fn default_true() -> bool {
@@ -579,6 +590,7 @@ impl Default for BoundarySection {
             workspace_lock_wait_secs: default_workspace_lock_wait_secs(),
             workspace_path_locks: true,
             delegation_workspace_lock: false,
+            workspace_module_locks: true,
         }
     }
 }

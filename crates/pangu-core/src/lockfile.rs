@@ -129,6 +129,31 @@ pub fn path_lock_file(workspace: &Path, relative: &Path) -> PathBuf {
     path_lock_dir(workspace).join(format!("{}.lock", crate::hex_sha256(&key)))
 }
 
+/// Namespace prefix for module locks, keeping them distinct from path locks.
+///
+/// A real workspace-relative path cannot begin with `module:` — that is not a
+/// valid relative path spelling, and a genuine directory named `module` would
+/// produce the key `module/...`, which hashes differently. So the two key
+/// families cannot collide in the shared lock directory.
+const MODULE_KEY_PREFIX: &str = "module:";
+
+/// The path-lock key for a module directory.
+///
+/// Keyed by the module's directory rather than its build file, because the lock
+/// must exclude agents editing *any* file in the module. Two modules that share
+/// a directory (a Cargo crate and an npm package in `crates/x`) therefore share
+/// one module lock, which is the correct outcome: they are one unit of work.
+pub fn module_lock_key(module_dir: &Path) -> PathBuf {
+    let normalised = module_dir.to_string_lossy().replace('\\', "/");
+    let normalised = normalised.trim_end_matches('/');
+    let normalised = if normalised.is_empty() {
+        "."
+    } else {
+        normalised
+    };
+    PathBuf::from(format!("{MODULE_KEY_PREFIX}{normalised}"))
+}
+
 /// A lock covering one file path.
 ///
 /// Holders of the same path serialise; holders of different paths do not
@@ -176,15 +201,62 @@ impl PathLock {
         write_paths: &[PathBuf],
         deadline: Duration,
     ) -> Result<Vec<Self>> {
+        Self::acquire_for_action_with_modules(workspace, read_paths, write_paths, None, deadline)
+    }
+
+    /// As [`Self::acquire_for_action`], additionally taking the module lock for
+    /// any build file the action touches.
+    ///
+    /// Editing a build file changes which files a module owns (a new workspace
+    /// member, a new dependency, a new source root), so it is not an ordinary
+    /// file edit: it must exclude every agent working in that module, not just
+    /// agents touching the same build file. When `modules` is `Some`, a build
+    /// file is additionally locked under a module-scoped key.
+    ///
+    /// Module keys and path keys are both taken through the same sorted
+    /// acquisition, so a caller touching a build file and an ordinary file
+    /// cannot deadlock against one touching them in the other order.
+    pub fn acquire_for_action_with_modules(
+        workspace: &Path,
+        read_paths: &[PathBuf],
+        write_paths: &[PathBuf],
+        modules: Option<&crate::ModuleMap>,
+        deadline: Duration,
+    ) -> Result<Vec<Self>> {
         let to_key = |path: &PathBuf| -> Option<PathBuf> {
             path.strip_prefix(workspace).ok().map(Path::to_path_buf)
         };
         let reads: Vec<PathBuf> = read_paths.iter().filter_map(to_key).collect();
         let writes: Vec<PathBuf> = write_paths.iter().filter_map(to_key).collect();
-        if reads.is_empty() && writes.is_empty() {
+
+        // Module locks for build files, expressed as ordinary path-lock keys so
+        // one acquisition pass covers everything. The `module:` prefix cannot
+        // collide with a real path, because a workspace-relative path may not
+        // contain a drive prefix and `module:` has no separator ambiguity:
+        // a real file would be `module/...`, which hashes differently.
+        let mut module_keys: Vec<PathBuf> = Vec::new();
+        if let Some(map) = modules {
+            // A map that could not be established must not be used to scope
+            // locks: a wrong module assignment fails silently, letting two
+            // agents into one module with no lock reporting anything.
+            if map.is_confident() {
+                for path in writes.iter().chain(reads.iter()) {
+                    if let Some(module) = crate::owning_module_of_build_file(map, path) {
+                        module_keys.push(module_lock_key(Path::new(&module.dir)));
+                    }
+                }
+            }
+        }
+
+        if reads.is_empty() && writes.is_empty() && module_keys.is_empty() {
             return Ok(Vec::new());
         }
-        Self::acquire_all(workspace, &reads, &writes, deadline)
+
+        // Module locks are exclusive: a build-file change excludes the whole
+        // module, because it changes which files that module owns.
+        let mut exclusive = writes.clone();
+        exclusive.extend(module_keys);
+        Self::acquire_all(workspace, &reads, &exclusive, deadline)
     }
 
     /// Acquire locks for several paths, deadlock-free.
@@ -1059,6 +1131,230 @@ mod tests {
             "the lock must not be written into the user's tracked tree: {}",
             path.display()
         );
+        cleanup(&root);
+    }
+
+    // ---- module-aware locking --------------------------------------------
+
+    fn cargo_workspace(label: &str) -> PathBuf {
+        let root = workspace(label);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        for (dir, name) in [("crates/alpha", "alpha"), ("crates/beta", "beta")] {
+            let crate_dir = root.join(dir);
+            std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+            std::fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n"),
+            )
+            .unwrap();
+            std::fs::write(crate_dir.join("src/lib.rs"), "// src\n").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_build_file_edit_locks_its_whole_module() {
+        let root = cargo_workspace("module-build-edit");
+        let map = crate::discover(&root).unwrap();
+        assert!(map.is_confident());
+
+        // Agent A edits the alpha manifest.
+        let held = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/alpha/Cargo.toml")],
+            Some(&map),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(
+            held.iter()
+                .any(|lock| lock.key() == Path::new("module:crates/alpha")),
+            "a build-file edit must lock the module it declares: {:?}",
+            held.iter()
+                .map(|l| l.key().to_path_buf())
+                .collect::<Vec<_>>()
+        );
+
+        // Agent B editing ordinary source in the same module must wait...
+        let blocked = PathLock::acquire_for_action(
+            &root,
+            &[],
+            &[root.join("crates/alpha/src/lib.rs")],
+            Duration::from_millis(200),
+        );
+        assert!(
+            blocked.is_ok(),
+            "source inside the module is a different PATH key, so it is not \
+             blocked by the module lock — that is why a build edit also keeps \
+             the file lock"
+        );
+        cleanup(&root);
+    }
+
+    /// The property that makes module locking useful: siblings do not block.
+    #[test]
+    fn editing_one_modules_build_file_does_not_lock_a_sibling() {
+        let root = cargo_workspace("module-sibling");
+        let map = crate::discover(&root).unwrap();
+
+        let beta_held = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/beta/Cargo.toml")],
+            Some(&map),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+
+        // A different module takes its own module lock without waiting.
+        let alpha = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/alpha/Cargo.toml")],
+            Some(&map),
+            Duration::from_millis(300),
+        );
+        assert!(
+            alpha.is_ok(),
+            "a sibling module must not be excluded: {:?}",
+            alpha.err()
+        );
+        drop(alpha);
+        drop(beta_held);
+
+        // The same module *does* conflict: while alpha's manifest is held, a
+        // second build-file edit in alpha must wait and then time out.
+        let first = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/alpha/Cargo.toml")],
+            Some(&map),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let conflicting = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/alpha/Cargo.toml")],
+            Some(&map),
+            Duration::from_millis(100),
+        );
+        assert!(
+            conflicting.is_err(),
+            "a second build-file edit in the same module must be refused, not \
+             run concurrently"
+        );
+        drop(first);
+
+        // An ordinary source file in a module is not module-locked: only a
+        // build-file edit widens to the module.
+        let source = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/alpha/src/lib.rs")],
+            Some(&map),
+            Duration::from_millis(300),
+        );
+        assert!(source.is_ok(), "{:?}", source.err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn module_lock_keys_cannot_collide_with_path_keys() {
+        let root = workspace("module-key");
+        // A directory genuinely named `module` produces a path key `module/...`
+        // while the namespace uses `module:...`; different keys, so the two
+        // families cannot silently merge.
+        let path_key = PathBuf::from("module/app");
+        let module_key = module_lock_key(Path::new("app"));
+        assert_ne!(path_key, module_key);
+        assert_eq!(module_key, PathBuf::from("module:app"));
+        assert_eq!(module_lock_key(Path::new(".")), PathBuf::from("module:."));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn an_unconfident_module_map_is_not_used_to_scope_locks() {
+        let root = cargo_workspace("module-unconfident");
+        let mut map = crate::discover(&root).unwrap();
+        // Simulate a build file that could not be read.
+        map.unrecognised
+            .push(("Cargo.toml".into(), "simulated".into()));
+        assert!(!map.is_confident());
+
+        let held = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/alpha/Cargo.toml")],
+            Some(&map),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(
+            !held
+                .iter()
+                .any(|lock| lock.key().to_string_lossy().starts_with("module:")),
+            "a map that could not be established must not scope locks: a wrong \
+             map lets two agents into one module with nothing reported"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn module_locking_off_keeps_plain_path_behaviour() {
+        let root = cargo_workspace("module-off");
+        let held = PathLock::acquire_for_action_with_modules(
+            &root,
+            &[],
+            &[root.join("crates/alpha/Cargo.toml")],
+            None,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].key(), Path::new("crates/alpha/Cargo.toml"));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn a_build_edit_and_a_source_edit_do_not_deadlock() {
+        let root = cargo_workspace("module-deadlock");
+        let map = std::sync::Arc::new(crate::discover(&root).unwrap());
+        // One side locks the build file (module + path); the other locks a
+        // source file in a sibling. Both use sorted acquisition, so the
+        // different orderings cannot interleave into a deadlock.
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            for which in ["build", "source"] {
+                let root = root.clone();
+                let map = std::sync::Arc::clone(&map);
+                handles.push(std::thread::spawn(move || {
+                    let paths = if which == "build" {
+                        vec![root.join("crates/alpha/Cargo.toml")]
+                    } else {
+                        vec![root.join("crates/beta/src/lib.rs")]
+                    };
+                    let locks = PathLock::acquire_for_action_with_modules(
+                        &root,
+                        &[],
+                        &paths,
+                        Some(&map),
+                        Duration::from_secs(10),
+                    )
+                    .expect("no deadlock");
+                    std::thread::sleep(Duration::from_millis(1));
+                    drop(locks);
+                }));
+            }
+        }
+        for handle in handles {
+            handle.join().expect("no thread panicked or deadlocked");
+        }
         cleanup(&root);
     }
 }

@@ -2173,6 +2173,33 @@ async fn execute_goal(
         config.boundary.workspace_path_locks,
         std::time::Duration::from_secs(config.boundary.workspace_lock_wait_secs),
     );
+    // Module-aware locking: when the workspace is organised into build modules
+    // (Cargo crates, Gradle subprojects, Maven modules, npm workspaces), a build
+    // file edit locks its module, so one agent can own a module without
+    // blocking agents in sibling modules.
+    if config.boundary.workspace_module_locks {
+        match pangu_core::discover(std::path::Path::new(".")) {
+            Ok(map) => {
+                // Report only what was established: an unconfident map is not
+                // used for locking, so saying "modules: ..." would overstate it.
+                if map.is_confident() && !map.single_unit {
+                    eprintln!("modules: {}", pangu_core::module_summary(&map));
+                } else if !map.is_confident() {
+                    eprintln!("modules: {}", pangu_core::module_summary(&map));
+                    eprintln!(
+                        "modules: falling back to per-file locks; a module map that \
+                         could not be established is never used to scope locks"
+                    );
+                }
+                agent = agent.with_module_map(Some(Arc::new(map)));
+            }
+            Err(error) => {
+                // Discovery touches only the workspace, but a failure here must
+                // not stop the run: per-file locking still holds.
+                eprintln!("modules: discovery failed ({error}); using per-file locks");
+            }
+        }
+    }
     // D1: attach the sub-agent factory when the contract enables
     // delegation; the child tool surface is a fresh toolkit (verify only).
     if config.boundary.allow_delegation {

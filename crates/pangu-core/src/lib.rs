@@ -21,6 +21,7 @@ pub mod json;
 pub mod lockfile;
 pub mod memory;
 pub mod messages;
+pub mod modules;
 pub mod replay;
 pub mod repomap;
 pub mod session;
@@ -75,13 +76,18 @@ pub use inspect::{
 };
 pub use journal::{ConsoleSink, Journal};
 pub use lockfile::{
-    describe_lock, lock_file_path, path_lock_dir, path_lock_file, peek_lock_file, LockHolder,
-    LockMode, PathLock, WorkspaceLock, PATH_LOCK_DIR, WORKSPACE_LOCK_DIR, WORKSPACE_LOCK_FILE,
+    describe_lock, lock_file_path, module_lock_key, path_lock_dir, path_lock_file, peek_lock_file,
+    LockHolder, LockMode, PathLock, WorkspaceLock, PATH_LOCK_DIR, WORKSPACE_LOCK_DIR,
+    WORKSPACE_LOCK_FILE,
 };
 pub use memory::{
     MemoryCandidate, MemoryLimits, MemoryStatus, MemoryStore, MemoryTransition, MEMORY_SCHEMA,
 };
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
+pub use modules::{
+    build_file_index, discover, module_dir, owning_module_of_build_file, summary as module_summary,
+    BuildSystem, Module, ModuleMap,
+};
 pub use repomap::{
     build as build_repomap, fingerprint as repomap_fingerprint, view as repomap_view, FileEntry,
     MapView, RepoMap, RepoMapOptions, Symbol,

@@ -164,6 +164,11 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
   - **持锁者身份只是线索**：`pid=` 不证明进程存活（pid 会被复用），存活探测只用于诊断，不作为夺锁依据。
   - **与 rollback 事务锁是两把锁**：`artifact` 的 `.rollback-operation.lock` 守护回滚事务，语义是 fail-closed 拒绝等待，由 `stale-lock` drill 断言，不因本项而改动。
 
+  - **模块级锁（`[boundary] workspace_module_locks`，默认开）**：工作区若按构建系统划分成模块（**Cargo crates / Gradle 子项目 / Maven modules / npm workspaces**），改某个模块的**构建文件**（`Cargo.toml`、`build.gradle(.kts)`、`settings.gradle(.kts)`、`pom.xml`、`package.json`）时会额外锁住**整个模块**，而不是只锁该文件。理由：构建文件决定模块拥有哪些文件（workspace 成员、依赖、源码根），所以它不是普通文件编辑——必须排除该模块内所有 Agent。效果是"一个模块一个 Agent"：改 `alpha` crate 的 `Cargo.toml` 不挡改 `beta` crate 的 Agent（实测等待 3ms），同一 crate 的第二个写入者等待锁释放（实测 675ms）。
+  - **只读得懂才用（`is_confident`）**：模块图无法完整解析时（构建文件语法错误、Gradle 用变量计算 `include`、`pom.xml` 里是 `${}` 模板、Cargo 用了 `/**` 这类不展开的 glob），**不**用它划分锁，回退纯文件锁并在 stderr 报告"未识别"。原因：错的模块图**静默失效**——两个 Agent 被判定为不同模块就并发了，而没有任何锁会报错。宁可退化成较粗的文件锁，也不要给出看似权威的错误边界。
+  - **发现范围有限且明示**：只读命名模块的声明（`[workspace] members`、`include`、`<modules>`、`workspaces`），**不**运行任何构建工具、不解析依赖、不执行插件逻辑。需要执行 Gradle 脚本才能得到的模块列表就得不到——猜一个比报告"没有"更糟。嵌套模块以最内层声明为准（更具体）。无模块声明的仓库是**单一单元**（`single_unit`，正常形态），不是"发现失败"——两者由 `single_unit` 与 `is_confident` 分别表达，不可混同。
+  - **模块锁键与路径锁键不会碰撞**：模块键在 `module:` 命名空间下（真实相对路径不可能以该拼写开头，名为 `module` 的目录会产生 `module/...`，哈希不同），两者共用同一套排序取锁，因此"同时改构建文件与普通文件"和"按相反顺序改"不会死锁。
+
 ### 执行后端声明（C5）
 
 `[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：

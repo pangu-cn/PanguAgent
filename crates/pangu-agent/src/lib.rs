@@ -417,6 +417,12 @@ pub struct Agent {
     workspace_path_lock: bool,
     /// How long a tool call waits for its paths before failing closed.
     path_lock_timeout: std::time::Duration,
+    /// Discovered build modules, used to widen a build-file edit into a module
+    /// lock. `None` means module locking is off.
+    ///
+    /// Only a confident map is consulted when locking; see
+    /// [`pangu_core::ModuleMap::is_confident`].
+    module_map: Option<std::sync::Arc<pangu_core::ModuleMap>>,
 }
 
 impl Agent {
@@ -529,6 +535,7 @@ impl Agent {
             delegation_lock_timeout: Duration::from_secs(120),
             workspace_path_lock: true,
             path_lock_timeout: Duration::from_secs(120),
+            module_map: None,
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
@@ -596,6 +603,22 @@ impl Agent {
     pub fn with_path_locks(mut self, enabled: bool, timeout: Duration) -> Self {
         self.workspace_path_lock = enabled;
         self.path_lock_timeout = timeout;
+        self
+    }
+
+    /// Supply the discovered build-module layout for module-aware locking.
+    ///
+    /// With a map attached, a tool call that edits a build file additionally
+    /// locks the module that file declares. This is what lets one agent own a
+    /// Gradle subproject or a Rust crate without blocking agents working in
+    /// sibling modules.
+    ///
+    /// An **unconfident** map is accepted here and ignored at lock time: it is
+    /// stored so the run can still report what was found, but scoping locks by
+    /// a map that failed to parse would let two agents into one module with no
+    /// lock reporting anything wrong.
+    pub fn with_module_map(mut self, map: Option<std::sync::Arc<pangu_core::ModuleMap>>) -> Self {
+        self.module_map = map;
         self
     }
 
@@ -2691,15 +2714,21 @@ impl Agent {
         // several paths cannot deadlock against another call touching the same
         // paths in a different order.
         //
+        // When this action edits a build file, the owning *module* is locked as
+        // well, because a build edit changes which files the module owns. The
+        // module map is only consulted when it is confident: a wrong map fails
+        // silently, letting two agents into one module with nothing reported.
+        //
         // Taken after approval, so a denied action never reserves paths. Held
         // only for the duration of the tool call; every lock taken is released
         // on drop if the call fails, so a failed action cannot strand a lock
         // the rest of the run would wait on.
         let _path_locks = if self.workspace_path_lock {
-            Some(pangu_core::PathLock::acquire_for_action(
+            Some(pangu_core::PathLock::acquire_for_action_with_modules(
                 &self.sandbox.workspace,
                 &resources.read_paths,
                 &resources.write_paths,
+                self.module_map.as_deref(),
                 self.path_lock_timeout,
             )?)
         } else {

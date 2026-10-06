@@ -79,6 +79,24 @@ extra_readonly_commands = []
 # workspace（而非只锁它实际碰到的路径），会让同一仓库里文件不重叠的两个
 # Agent 也互相阻塞。只在需要"让其它一切先停下"时才开。
 # delegation_workspace_lock = false
+#
+# workspace_module_locks：默认 true。按构建模块加锁，支持 Cargo crates、
+# Gradle 子项目、Maven modules、npm workspaces。
+#
+# 为什么"改构建文件"要升级成模块锁：改 Cargo.toml / build.gradle / pom.xml /
+# package.json 会改变**这个模块拥有哪些文件**（新增 workspace 成员、新增依赖、
+# 新增源码根）。所以它不是普通文件编辑——它必须排除该模块内所有 Agent，而不
+# 只是排除改同一个构建文件的 Agent。
+#
+# 效果：一个模块一个 Agent。改 alpha crate 的 Cargo.toml 不会挡住改 beta crate
+# 的 Agent（实测等待 3ms），但同一 crate 的第二个写入者会等锁释放（实测 675ms）。
+#
+# 只读得懂才用：模块图若无法完整解析（构建文件语法错误、Gradle 用变量计算
+# include、pom.xml 里是 ${} 模板、Cargo 用了 /** 这类不展开的 glob），则**不**
+# 用它来划分锁，而是回退到纯文件锁并在 stderr 报告"未识别"。原因是错的模块图
+# 会**静默失效**：两个 Agent 被判定为不同模块就并发了，而没有任何锁会报错。
+# 宁可退化成较粗的文件锁，也不要给出看似权威的错误模块边界。
+# workspace_module_locks = true
 
 # D1: 受限子 Agent。默认 false = 无 delegate_task 工具、digest 不变。开启
 # 后模型可把子任务交给受限子 Agent：子 contract 由父 contract 派生（预算
