@@ -61,6 +61,46 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// The `snake_case` name used on the wire.
+    ///
+    /// Matches the `serde(rename_all = "snake_case")` representation exactly, so
+    /// a derived view (a trace, a report) names an event the same way the
+    /// Journal does. A view that spelled kinds differently would be impossible
+    /// to cross-check against the record it claims to summarise.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RunStarted => "run_started",
+            Self::TurnStarted => "turn_started",
+            Self::ModelRequest => "model_request",
+            Self::ModelResponse => "model_response",
+            Self::ToolRequested => "tool_requested",
+            Self::PolicyDecision => "policy_decision",
+            Self::ApprovalRequested => "approval_requested",
+            Self::ApprovalResolved => "approval_resolved",
+            Self::ToolStarted => "tool_started",
+            Self::ToolBlocked => "tool_blocked",
+            Self::ToolFinished => "tool_finished",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::FinishRequested => "finish_requested",
+            Self::RunFinished => "run_finished",
+            Self::Note => "note",
+            Self::PhaseChanged => "phase_changed",
+            Self::ProviderSwitched => "provider_switched",
+            Self::MemoryProposed => "memory_proposed",
+            Self::DeliverableRecorded => "deliverable_recorded",
+            Self::TaskDelegated => "task_delegated",
+            Self::CheckpointCreated => "checkpoint_created",
+            Self::CheckpointFailed => "checkpoint_failed",
+            Self::RollbackRequested => "rollback_requested",
+            Self::RollbackStarted => "rollback_started",
+            Self::RollbackApplied => "rollback_applied",
+            Self::RollbackSkippedAlreadyApplied => "rollback_skipped_already_applied",
+            Self::RollbackFailed => "rollback_failed",
+            Self::FailedPathRecorded => "failed_path_recorded",
+            Self::ContextAssembled => "context_assembled",
+        }
+    }
+
     pub fn is_v2_only(self) -> bool {
         matches!(
             self,

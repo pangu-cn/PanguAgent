@@ -6,6 +6,7 @@
 
 pub mod artifact;
 pub mod assemble;
+pub mod audit;
 pub mod checkpoint;
 pub mod conversation;
 pub mod deliverable;
@@ -31,6 +32,7 @@ pub mod skills;
 pub mod slice;
 pub mod stream;
 pub mod summary;
+pub mod trace;
 pub mod util;
 
 pub use artifact::{
