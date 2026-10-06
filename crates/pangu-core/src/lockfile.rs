@@ -524,6 +524,22 @@ impl WorkspaceLock {
                 }
                 Err(TryLock::Busy(holder))
             }
+            Err(error) if is_transient_contention(&error) => {
+                // Windows reports a create that races a concurrent delete as
+                // `ERROR_ACCESS_DENIED` (os error 5) rather than
+                // `ERROR_FILE_EXISTS`, because the path is momentarily in a
+                // delete-pending state. `ERROR_SHARING_VIOLATION` is the same
+                // situation seen from a different angle.
+                //
+                // Treating this as a hard failure is wrong: it is exactly the
+                // contention the retry loop exists for, and a 20-thread test
+                // failed because the loser of such a race was reported as a
+                // permanent error. It is reported as `Busy` so the caller
+                // retries; a genuine permission problem still fails, by
+                // exhausting the deadline and reporting the path it could not
+                // lock.
+                Err(TryLock::Busy(LockHolder::read(path).unwrap_or_default()))
+            }
             Err(error) => Err(TryLock::Failed(error.into())),
         }
     }
@@ -565,6 +581,36 @@ impl WorkspaceLock {
 enum TryLock {
     Busy(LockHolder),
     Failed(Error),
+}
+
+/// Whether a failed atomic create means "someone else has it right now".
+///
+/// `AlreadyExists` is the documented answer and is handled separately. These are
+/// the Windows spellings of the same situation when the path is momentarily in
+/// a delete-pending state because a concurrent holder is releasing it:
+///
+/// - `ERROR_ACCESS_DENIED` (5) — observed: a create racing a delete loses with
+///   this rather than `ERROR_FILE_EXISTS`.
+/// - `ERROR_SHARING_VIOLATION` (32) — the same race through a shared handle.
+/// - `ERROR_DELETE_PENDING` (303) — the path is being removed.
+///
+/// Only these specific codes are treated as contention. Any other error
+/// (a missing parent, a read-only volume, an invalid name) stays a hard
+/// failure, so real problems are still reported immediately instead of being
+/// retried until the deadline hides the cause.
+fn is_transient_contention(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(5) | Some(32) | Some(303))
+    }
+    #[cfg(not(windows))]
+    {
+        // On Unix a failed `O_CREAT|O_EXCL` reports `AlreadyExists`, which is
+        // handled before this is reached. `PermissionDenied` there means a real
+        // permission problem, so it must not be swallowed as contention.
+        let _ = error;
+        false
+    }
 }
 
 /// What a contender can learn about the current holder.
@@ -1329,6 +1375,89 @@ mod tests {
             "a map that could not be established must not scope locks: a wrong \
              map lets two agents into one module with nothing reported"
         );
+        cleanup(&root);
+    }
+
+    /// The Windows code that means "someone else has it right now".
+    ///
+    /// A create that races a concurrent delete reports `ERROR_ACCESS_DENIED`
+    /// (5) rather than `ERROR_FILE_EXISTS`, and a 20-thread test failed because
+    /// that was classified as a permanent error instead of contention. This
+    /// pins the classification, since the race itself is timing-dependent and
+    /// cannot be provoked on demand.
+    #[test]
+    fn windows_delete_pending_codes_are_contention_not_failure() {
+        for code in [5, 32, 303] {
+            let error = std::io::Error::from_raw_os_error(code);
+            #[cfg(windows)]
+            assert!(
+                is_transient_contention(&error),
+                "os error {code} on Windows is contention, not a permanent failure"
+            );
+            #[cfg(not(windows))]
+            assert!(
+                !is_transient_contention(&error),
+                "these are Windows codes; on Unix they must not be swallowed"
+            );
+        }
+    }
+
+    /// A real permission problem must still be reported, not retried into a
+    /// timeout that hides the cause.
+    #[test]
+    fn a_missing_parent_is_a_hard_failure_not_contention() {
+        let root = workspace("missing-parent");
+        // A path whose parent does not exist: the create fails with NotFound,
+        // which is a genuine problem rather than contention.
+        let missing = root.join("no-such-dir").join("x.lock");
+        let error = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&missing)
+            .expect_err("a missing parent must fail");
+        assert!(
+            !is_transient_contention(&error),
+            "a missing parent must not be classified as contention: {error:?}"
+        );
+        cleanup(&root);
+    }
+
+    /// The failing test's shape, run harder: many threads contend for the same
+    /// lock file while others release it, which is what produced the
+    /// delete-pending race.
+    #[test]
+    fn heavy_contention_on_one_path_never_reports_a_permanent_failure() {
+        let root = cargo_workspace("module-contention-storm");
+        let map = std::sync::Arc::new(crate::discover(&root).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            for which in ["build", "build", "source"] {
+                let root = root.clone();
+                let map = std::sync::Arc::clone(&map);
+                handles.push(std::thread::spawn(move || {
+                    let paths = if which == "build" {
+                        vec![root.join("crates/alpha/Cargo.toml")]
+                    } else {
+                        vec![root.join("crates/beta/src/lib.rs")]
+                    };
+                    // Every acquisition must succeed by the deadline: a create
+                    // that lost a race to a concurrent delete must be retried,
+                    // not surfaced as a hard error.
+                    let locks = PathLock::acquire_for_action_with_modules(
+                        &root,
+                        &[],
+                        &paths,
+                        Some(&map),
+                        Duration::from_secs(20),
+                    )
+                    .expect("contention must be retried, never reported as a permanent failure");
+                    drop(locks);
+                }));
+            }
+        }
+        for handle in handles {
+            handle.join().expect("no thread panicked");
+        }
         cleanup(&root);
     }
 
