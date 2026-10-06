@@ -1,0 +1,6 @@
+schema = "pangu-skill-manifest/1"
+name = "refactor-safely"
+version = "1.0.0"
+description = "Change structure without changing behaviour, in steps small enough that each one is verifiable. Turns 'it still works' into a check someone else can repeat."
+files = ["SKILL.md"]
+scripts = []
