@@ -65,7 +65,16 @@ extra_readonly_commands = []
 # 后模型可把子任务交给受限子 Agent：子 contract 由父 contract 派生（预算
 # 钳到父级剩余，拒绝任何加宽），子事件进同一 Journal、花费聚合进父级账
 # 本，深度 1（子不能再委派）。
+#
+# workspace_lock_wait_secs：子 Agent 与父共用同一个 workspace，运行期间持
+# 有 workspace 写锁，同一 workspace 上同一时刻只允许一个写入者（例如同一
+# 仓库开了两个终端各自委派时，后者会等待而不是与前者互相覆盖）。等待有上
+# 限：若上一个持锁进程被强杀、锁文件残留，等待到点即按失败关闭处理并报告
+# 持锁者，而不是无限挂起。锁文件位于 .pangu/workspace.lock（该目录已是
+# Pangu 自有存储，不会出现在你的 git status 里）。长编译/长测试的子任务可
+# 调高此值。
 # allow_delegation = true
+# workspace_lock_wait_secs = 120
 
 [skills]
 enabled = false

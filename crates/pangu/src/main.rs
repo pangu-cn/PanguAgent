@@ -2169,6 +2169,13 @@ async fn execute_goal(
     // delegation; the child tool surface is a fresh toolkit (verify only).
     if config.boundary.allow_delegation {
         agent = agent.with_delegation(Arc::new(FreshToolkitFactory));
+        // The child shares this run's workspace, so it takes the workspace
+        // write lock while it runs. The wait is bounded so a lock left by a
+        // killed process is reported instead of hanging the run.
+        agent = agent.with_delegation_workspace_lock(
+            true,
+            std::time::Duration::from_secs(config.boundary.workspace_lock_wait_secs),
+        );
     }
     let outcome = agent.run().await?;
     eprintln!("journal: {}", journal_path.display());

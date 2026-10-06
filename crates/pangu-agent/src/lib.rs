@@ -514,7 +514,10 @@ impl Agent {
             approval,
             delegation: None,
             delegation_workspace_lock: true,
-            delegation_lock_timeout: std::time::Duration::from_secs(30),
+            // Matches `boundary.workspace_lock_wait_secs`. The CLI overrides
+            // this from config; the default here keeps library callers from
+            // getting a different timeout than config-driven runs.
+            delegation_lock_timeout: Duration::from_secs(120),
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),

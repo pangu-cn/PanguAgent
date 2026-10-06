@@ -40,8 +40,32 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
-/// Suffix for the read/write lock file, placed inside the workspace.
-pub const WORKSPACE_LOCK_FILE: &str = ".pangu-workspace.lock";
+/// Name of the read/write lock file.
+///
+/// The lock lives **inside** the workspace's `.pangu/` directory, which is
+/// already Pangu's own storage: it is a forbidden tool-write glob and every
+/// deployment that uses memory, skills, conversations or checkpoints already
+/// creates it. Putting the lock at the workspace root instead would show a user
+/// an untracked dotfile in `git status` for the duration of a delegation —
+/// visible clutter, and something they might wrongly commit or delete. Nothing
+/// about the lock belongs in the user's tracked tree.
+pub const WORKSPACE_LOCK_FILE: &str = "workspace.lock";
+
+/// Directory holding the lock, relative to the workspace. Stored relative so
+/// lock paths follow the effective workspace rather than the process CWD.
+pub const WORKSPACE_LOCK_DIR: &str = ".pangu";
+
+/// Absolute path of the lock file for a workspace.
+pub fn lock_file_path(workspace: &Path) -> PathBuf {
+    workspace.join(WORKSPACE_LOCK_DIR).join(WORKSPACE_LOCK_FILE)
+}
+
+/// Create the `.pangu` directory if needed and return the lock file path.
+fn prepare_lock_dir(workspace: &Path) -> Result<PathBuf> {
+    let dir = workspace.join(WORKSPACE_LOCK_DIR);
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(WORKSPACE_LOCK_FILE))
+}
 
 /// How the caller intends to use the workspace while holding the lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +118,7 @@ impl WorkspaceLock {
         deadline: Duration,
         poll: Duration,
     ) -> Result<Self> {
-        let path = workspace.join(WORKSPACE_LOCK_FILE);
+        let path = prepare_lock_dir(workspace)?;
         let started = Instant::now();
 
         loop {
@@ -103,9 +127,12 @@ impl WorkspaceLock {
                 Err(TryLock::Busy(holder)) => {
                     if started.elapsed() >= deadline {
                         return Err(Error::Other(format!(
-                            "workspace lock not acquired within {:?}: held by {} (path {}); the \
-                             holder may be a crashed process — inspect the workspace before \
-                             removing the lock, and do not delete it to make a run proceed",
+                            "workspace lock not acquired within {:?}: held by {} (path {}); \
+                             another Pangu run is working in this workspace. If no Pangu process \
+                             is running, the lock was left by one that was killed before it could \
+                             release it — deleting that file is then safe. It is only a \
+                             mutual-exclusion marker, not evidence, so it is never removed \
+                             automatically here.",
                             deadline,
                             holder.describe(),
                             path.display()
@@ -120,7 +147,7 @@ impl WorkspaceLock {
 
     /// Attempt to take the lock without waiting.
     pub fn try_acquire_now(workspace: &Path, mode: LockMode) -> Result<Option<Self>> {
-        let path = workspace.join(WORKSPACE_LOCK_FILE);
+        let path = prepare_lock_dir(workspace)?;
         match Self::try_acquire(&path, mode) {
             Ok(lock) => Ok(Some(lock)),
             Err(TryLock::Busy(_)) => Ok(None),
@@ -291,12 +318,7 @@ fn libc_kill(pid: i32, signal: i32) -> i32 {
 
 /// Describe the lock file for error messages and inspection output.
 pub fn describe_lock(workspace: &Path) -> Option<LockHolder> {
-    LockHolder::read(&workspace.join(WORKSPACE_LOCK_FILE))
-}
-
-/// A convenience wrapper holding both the file guard and its mode.
-pub fn lock_file_path(workspace: &Path) -> PathBuf {
-    workspace.join(WORKSPACE_LOCK_FILE)
+    LockHolder::read(&lock_file_path(workspace))
 }
 
 /// Open (without creating) the lock file, for read-only inspections.
@@ -328,6 +350,13 @@ mod tests {
 
     fn cleanup(path: &Path) {
         fs::remove_dir_all(path).ok();
+    }
+
+    /// Plant a lock file exactly as a crashed holder would leave it: the
+    /// directory exists, the file is present, and nobody will remove it.
+    fn plant_lock(root: &Path, contents: &str) {
+        let path = prepare_lock_dir(root).expect("prepare lock dir");
+        fs::write(path, contents).expect("plant lock");
     }
 
     #[test]
@@ -424,11 +453,7 @@ mod tests {
     fn a_lock_left_by_a_crashed_holder_times_out_with_the_holder_named() {
         let root = workspace("stale");
         // Simulate a crash: the file exists but no live holder will remove it.
-        fs::write(
-            lock_file_path(&root),
-            format!("mode=write\npid={}\n", std::process::id()),
-        )
-        .unwrap();
+        plant_lock(&root, &format!("mode=write\npid={}\n", std::process::id()));
 
         let started = Instant::now();
         let error = WorkspaceLock::acquire_with_poll(
@@ -451,13 +476,22 @@ mod tests {
         );
         assert!(
             error.contains("write") && error.contains("pid"),
-            "the error must name the holder so an operator can act: {error}"
+            "the error must name the holder so a user can act: {error}"
+        );
+        // This lock is a mutual-exclusion marker, not audit evidence, so the
+        // message must tell a user what to do rather than forbid action. A
+        // stranger running a public CLI has no "operator" to escalate to, and
+        // an unactionable message gets worked around unsafely.
+        assert!(
+            error.contains("deleting that file is then safe"),
+            "the error must tell a user how to recover: {error}"
         );
         assert!(
-            error.contains("do not delete it"),
-            "the error must not invite lock deletion: {error}"
+            error.contains("no Pangu process is running"),
+            "the recovery advice must be conditioned on nothing running: {error}"
         );
-        // The evidence must survive the failed acquisition.
+        // The file must survive the failed acquisition regardless of the
+        // advice: reporting it is the job, removing it is the user's call.
         assert!(
             lock_file_path(&root).exists(),
             "an expired wait must not remove the holder's file"
@@ -478,7 +512,7 @@ mod tests {
     #[test]
     fn an_unrecognised_mode_is_treated_as_unknown_and_never_as_compatible() {
         let root = workspace("unknown-mode");
-        fs::write(lock_file_path(&root), "mode=exclusive\npid=1\n").unwrap();
+        plant_lock(&root, "mode=exclusive\npid=1\n");
         let holder = describe_lock(&root).unwrap();
         assert_eq!(holder.mode, None);
         // Unknown must not be read as "read", or a writer would slip past.
@@ -490,7 +524,7 @@ mod tests {
     #[test]
     fn a_corrupt_or_empty_lock_file_still_blocks() {
         let root = workspace("corrupt");
-        fs::write(lock_file_path(&root), b"not a lock file").unwrap();
+        plant_lock(&root, "not a lock file");
         let attempt = WorkspaceLock::try_acquire_now(&root, LockMode::Write).unwrap();
         assert!(
             attempt.is_none(),
@@ -520,11 +554,23 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_file_lives_inside_the_workspace() {
+    fn the_lock_file_lives_under_pangu_storage() {
         let root = workspace("location");
         let _held = WorkspaceLock::acquire(&root, LockMode::Write, Duration::from_secs(1)).unwrap();
-        assert_eq!(lock_file_path(&root), root.join(WORKSPACE_LOCK_FILE));
-        assert!(root.join(WORKSPACE_LOCK_FILE).is_file());
+        let path = lock_file_path(&root);
+        assert_eq!(
+            path,
+            root.join(WORKSPACE_LOCK_DIR).join(WORKSPACE_LOCK_FILE)
+        );
+        assert!(path.is_file());
+        // It must sit inside `.pangu/`, which is already Pangu-owned and a
+        // forbidden tool-write glob: a lock file loose in the workspace root
+        // would show up in the user's `git status` and could be committed.
+        assert!(
+            path.starts_with(root.join(WORKSPACE_LOCK_DIR)),
+            "the lock must not be written into the user's tracked tree: {}",
+            path.display()
+        );
         cleanup(&root);
     }
 }

@@ -227,6 +227,7 @@ fn a_reader_does_not_block_another_reader() {
 #[test]
 fn the_lock_file_is_gone_once_every_holder_released() {
     let workspace = scratch("cleanup");
+    let path = pangu_core::lock_file_path(&workspace);
     {
         let _lock = pangu_core::WorkspaceLock::acquire(
             &workspace,
@@ -234,11 +235,45 @@ fn the_lock_file_is_gone_once_every_holder_released() {
             Duration::from_secs(1),
         )
         .unwrap();
-        assert!(workspace.join(pangu_core::WORKSPACE_LOCK_FILE).exists());
+        assert!(path.exists());
     }
     assert!(
-        !workspace.join(pangu_core::WORKSPACE_LOCK_FILE).exists(),
+        !path.exists(),
         "a normal release must leave no lock file behind"
+    );
+    fs::remove_dir_all(&workspace).ok();
+}
+
+/// The lock must never be written into the part of the workspace a user
+/// tracks. This is the property that keeps a public CLI from leaving a stray
+/// untracked file in someone's repository.
+#[test]
+fn the_lock_never_touches_the_users_tracked_tree() {
+    let workspace = scratch("location");
+    {
+        let _lock = pangu_core::WorkspaceLock::acquire(
+            &workspace,
+            pangu_core::LockMode::Write,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let path = pangu_core::lock_file_path(&workspace);
+        assert!(
+            path.starts_with(workspace.join(".pangu")),
+            "the lock must live under .pangu/: {}",
+            path.display()
+        );
+    }
+    // Nothing is left at the workspace root either way.
+    let strays: Vec<String> = fs::read_dir(&workspace)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".pangu")
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the workspace root must gain no files: {strays:?}"
     );
     fs::remove_dir_all(&workspace).ok();
 }

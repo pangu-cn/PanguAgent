@@ -508,6 +508,23 @@ pub struct BoundarySection {
     /// budget and its contract is derived, never model-supplied.
     #[serde(default)]
     pub allow_delegation: bool,
+    /// How long a delegated sub-agent waits for the shared workspace lock
+    /// before the delegation fails closed.
+    ///
+    /// A sub-agent shares its parent's workspace, so only one writer may run
+    /// at a time. Two Pangu processes in the same repository is the ordinary
+    /// case this serialises; a lock left by a killed process is why the wait
+    /// is bounded at all. Raising it trades a longer hang on a stale lock for
+    /// more patience with a genuinely slow sibling run.
+    #[serde(default = "default_workspace_lock_wait_secs")]
+    pub workspace_lock_wait_secs: u64,
+}
+
+/// Default wait for the shared workspace lock: long enough to outlast an
+/// ordinary sibling delegation, short enough that a stale lock is reported
+/// rather than experienced as a hang.
+fn default_workspace_lock_wait_secs() -> u64 {
+    120
 }
 
 pub type BoundaryConfig = BoundarySection;
@@ -540,6 +557,7 @@ impl Default for BoundarySection {
             max_paths_per_action: 64,
             extra_readonly_commands: Vec::new(),
             allow_delegation: false,
+            workspace_lock_wait_secs: default_workspace_lock_wait_secs(),
         }
     }
 }
