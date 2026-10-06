@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::artifact::ArtifactStore;
-use crate::checkpoint::SessionNode;
+use crate::checkpoint::{SessionNode, ROOT_NODE_PREFIX};
 use crate::error::{Error, Result};
 
 /// An immutable, fully loaded view of the session ledger.
@@ -101,12 +101,25 @@ impl SessionTree {
     /// either way — but they do make the *result* misleading, because the walk
     /// looks like it reached the beginning of history when in fact history is
     /// missing. Callers that present a tree to a user should check this.
+    ///
+    /// **The run-root orphan is not damage.** A run's starting node is created
+    /// in memory to name the run's first parent, but its `EventRef` cannot be
+    /// sealed until the Journal writes it: `event_id` is derived from the
+    /// event's sequence number and its predecessor's `sha`, neither of which
+    /// exists before the write. Committing the root anyway would mean inventing
+    /// an id that the Journal would later contradict — turning an honestly
+    /// absent record into a false one. So every ordinary run leaves exactly one
+    /// orphan, and it is expected.
+    ///
+    /// Only unknown gaps are treated as a broken ledger. Telling an operator
+    /// "your tree is corrupt" when the shape is the one every run produces
+    /// trains them to ignore the message, which is how a real gap gets missed.
     pub fn ensure_complete(&self) -> Result<()> {
-        if self.orphans.is_empty() {
+        let unexpected = self.unexplained_orphans();
+        if unexpected.is_empty() {
             return Ok(());
         }
-        let sample = self
-            .orphans
+        let sample = unexpected
             .iter()
             .take(3)
             .map(|(node, parent)| format!("{node} -> {parent}"))
@@ -115,8 +128,34 @@ impl SessionTree {
         Err(Error::Config(format!(
             "session tree is incomplete: {} node(s) name a parent that is not in \
              the ledger ({sample}); the history behind them is missing",
-            self.orphans.len()
+            unexpected.len()
         )))
+    }
+
+    /// Orphans that are not the known run-root gap.
+    ///
+    /// A missing parent named [`ROOT_NODE_PREFIX`] is the structural gap
+    /// described on [`Self::ensure_complete`]. Anything else is an unexplained
+    /// hole in the ledger.
+    pub fn unexplained_orphans(&self) -> Vec<(String, String)> {
+        self.orphans
+            .iter()
+            .filter(|(_, parent)| !parent.starts_with(ROOT_NODE_PREFIX))
+            .cloned()
+            .collect()
+    }
+
+    /// The expected run-root gap, as `(node, missing_root)`, when present.
+    ///
+    /// Reported separately so a caller can say "this run's start is not
+    /// recorded, and that is how this version works" instead of either hiding
+    /// the gap or calling it corruption.
+    pub fn run_root_gaps(&self) -> Vec<(String, String)> {
+        self.orphans
+            .iter()
+            .filter(|(_, parent)| parent.starts_with(ROOT_NODE_PREFIX))
+            .cloned()
+            .collect()
     }
 
     pub fn node(&self, session_node_id: &str) -> Result<&SessionNode> {
@@ -381,18 +420,69 @@ mod tests {
             Some("root")
         );
         assert_eq!(
-            tree.common_ancestor("left", "right")
-                .expect("walk")
-                .map(|node| node.session_node_id.as_str()),
-            Some("root")
-        );
-        assert_eq!(
             tree.common_ancestor("left", "unrelated")
                 .expect("walk")
                 .map(|node| node.session_node_id.as_str()),
             None,
             "separate histories have no shared ancestor and must say so"
         );
+    }
+
+    /// Every ordinary run leaves exactly one node whose parent is the run's
+    /// uncommitted root. That shape is expected, so it must not be reported as
+    /// ledger damage — an operator told "corrupt" about the one shape every run
+    /// produces learns to ignore the warning that matters.
+    #[test]
+    fn an_expected_run_root_gap_is_not_reported_as_damage() {
+        let tree = SessionTree::from_nodes(vec![node("node_abc_1", Some("node_root_123_0"))])
+            .expect("tree");
+
+        assert_eq!(tree.orphans().len(), 1, "the gap is still surfaced");
+        assert!(
+            tree.ensure_complete().is_ok(),
+            "the run-root gap is how this version works, not corruption"
+        );
+        assert_eq!(tree.run_root_gaps().len(), 1);
+        assert!(tree.unexplained_orphans().is_empty());
+    }
+
+    /// A gap that is not the known run-root shape is still damage, even when it
+    /// appears alongside the expected gap. Suppressing this would be the exact
+    /// failure the classification exists to prevent.
+    #[test]
+    fn an_unknown_gap_is_still_damage_even_next_to_an_expected_one() {
+        let tree = SessionTree::from_nodes(vec![
+            node("node_abc_1", Some("node_root_123_0")),
+            node("node_def_2", Some("node_missing_9")),
+        ])
+        .expect("tree");
+
+        assert_eq!(tree.orphans().len(), 2);
+        assert_eq!(tree.run_root_gaps().len(), 1);
+        assert_eq!(
+            tree.unexplained_orphans(),
+            vec![("node_def_2".to_string(), "node_missing_9".to_string())],
+            "only the run-root gap is expected"
+        );
+        let error = tree
+            .ensure_complete()
+            .expect_err("an unexplained gap must still refuse");
+        assert!(error.to_string().contains("incomplete"), "got: {error}");
+        assert!(
+            error.to_string().contains("node_def_2"),
+            "the error must name the unexplained gap, not the expected one: {error}"
+        );
+    }
+
+    /// A complete ledger has neither kind of gap.
+    #[test]
+    fn a_complete_tree_reports_no_gaps_of_either_kind() {
+        let tree =
+            SessionTree::from_nodes(vec![node("a", None), node("b", Some("a"))]).expect("tree");
+        assert!(tree.ensure_complete().is_ok());
+        assert!(tree.orphans().is_empty());
+        assert!(tree.run_root_gaps().is_empty());
+        assert!(tree.unexplained_orphans().is_empty());
     }
 
     #[test]

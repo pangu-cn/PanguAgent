@@ -30,7 +30,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - `pangu-core`：消息、事件、错误、Journal 和 replay；
 - `pangu-boundary`：L1 `GoalContract`、L2 `Policy`、L3 `Sandbox`、L4 `Approval`、预算；
 - `pangu-agent`：唯一的 provider/tool 回合编排和 `VerifiedAction` 入口；
-- `pangu-toolkit`：读文件、列目录、搜索、写文件、有限 HTTP GET、只读命令 allow-list、`finish`；
+- `pangu-toolkit`：读文件、列目录、搜索、写文件、有限 HTTP GET、只读命令 allow-list、只读 `git diff/status/log/show`、配置预声明验证命令（`verify`）、`finish`；
 - `pangu-provider`：OpenAI-compatible provider；
 - CLI：配置导出、`doctor`、`explain`、dry-run、demo、append-only JSONL Journal，以及 `events`、`conversation`、`session`、`artifact inspect` 只读入口与 `rollback`；
 - G1–G5：诚实、可审计、自主但不越界、成本有界、可嵌入。
@@ -333,28 +333,41 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - **“恢复不携带授权”的端到端证据**：provider 实际收到**恰好 6 条**已存消息（重新 seed 会是 8 条）；首轮获批写入 `one`，恢复后无审批、规则为 `ask`，工作区仍是 `one`，事件流里有 `ToolBlocked`、**无** `ToolFinished`；恢复后第二轮脚本调用 `finish {"status":"complete"}`，运行仍报 `failed`、evidence 为空。
   - **接进循环后抓到的真问题**：① 快照 id 曾用未脱敏的 goal 文本（journal 对 goal 做了 `redact_text`，放进**路径**等于撤销该规则），改为 `short_hash(redact_text(...))`；② `max_turns=1` 的运行会**丢弃模型第一条响应**（`Breach::Turns` 在响应并入 history 之前就判定超预算）——既有行为，本次未改，记此备忘。
   - **纠正一处早期夸大**：`SessionNode.history_digest` 那个死字段**至今仍无任何非 None 赋值**。被真正赋值的是 `ConversationSnapshot.history_digest`——一个新结构上的新字段，不是同一个字段。两者要打通，接入 agent 运行循环是前提（已完成），还需会话树本身（见下方未完成项）。
+    - **已修（2026-10-05）**：`SessionNode.history_digest` 不再是死字段。运行时在提交每个 session node 时赋值（`pangu-agent/src/checkpoint.rs::commit_after_success`）。
+    - **取值必须描述"这个节点所属的会话状态"，而不是随手一个哈希**：digest 由 `ConversationSnapshot::new` 生成——与 `ConversationRuntime::save` 写快照用的**同一个构造器**（含同一步脱敏）。另起一套编码会得到一个永远匹配不上任何快照的哈希，那比没有更糟：它看起来像证据。
+    - **时序是对的，不是巧合**：tool result 在提交 checkpoint 之后才 push 进 history，所以 digest 在 `history.push` **之前**用"即将落地的那条 tool result"投影计算（`history_digest_after_tool_result`）。用 push 前的 history 算，会让节点指向一个会话**从未处于**的状态，`session replay` 随后报出的 digest 匹配不上任何快照。
+    - **节点 digest 与 replay 输出的 digest 允许不同，这是设计而非缺陷**：一个节点上会记录多个快照（同一节点停留期间逐 turn 存一次 + 终局一次），`replay` 按设计报**最新**那个（"离开该节点前走得最远"），而节点记录的是**创建节点那一刻**的状态。因此不变量是"节点 digest 必须等于存于该节点的**某一个**快照"，不是"等于 replay 的输出"。测试按前者断言。
+    - 覆盖测试：`crates/pangu/tests/session_node_digest.rs`（4 个，跑真实二进制）——字段非空且为 64 位 hex、digest 匹配存于该节点的快照、digest 描述的是含 tool result 的历史、replay 仍工作且报出真实快照。
   - **核心保证**：恢复的历史**只是模型输入**。它不携带任何 `Decision`/`Effect`/已批准记忆；resume 后第一次发起工具调用仍走完整 `Policy → Sandbox → Approval`。不提供任何到判定的转换。
   - **安全边界**：存储前脱敏（`redact_text`/`redact_value`）、内容 digest 读时校验（篡改即拒）、空历史**拒绝恢复**（否则等于静默重开会话）、**缺 system 轮的快照拒绝恢复**（否则是恢复进一个从没被告知边界的上下文）、快照不可变（保护压缩出处链可解）、压缩必须非空摘要且必须真的丢弃内容、压缩必须用新 `snapshot_id`。
   - **第三阶段已完成（树导航与每节点回放）**：`session::SessionTree`（`roots`/`children`/`ancestors`/`common_ancestor`/`by_checkpoint`/`render`）、`ArtifactStore::list_session_nodes`（解析失败即报错，静默丢分支会让"这里发生过什么"答错）、`ConversationRuntime::at_node`/`replay_at`、CLI `pangu session tree|replay`。
   - **补上了一个静默的接线缺口**：`ConversationRuntime::save` 一直收 `session_node_id`，而 `run_inner` 两处都传 `None`——对话快照从来没有真正挂到节点上。已接上 `checkpoint_state.session_node_id`。
   - **环与孤儿是按损坏账本处理的，不是按正常情况**：`ancestors()` 双重限界（visited 集合 + 步数上限），账本被手改后 `parent` 指回祖先会让朴素遍历**永久挂死**；缺失 parent **不提升为 root**，否则一次停在缺口上的遍历看起来和走到历史开头完全一样。
-  - **发现一个真实结构缺口：运行根节点从不落盘。** `SessionNode` 只在提交检查点时入账本，`node_root_…` 只在内存里，所以每次普通运行的树恰好有一个孤儿。**不影响 rollback**（`rollback_transition_node_id` 是输入的确定性哈希，不查账本）。**修不了**：`EventRef.event_id` 是写 Journal 时才分配的，给根节点编一个就是在可审计结构里塞假值。现在如实报告 + CLI 警告 + `replay` 拒绝。**待决**：接受"运行起点不可回溯"，或改 F7 让 event_id 在事件发出时就分配。
+  - **发现一个真实结构缺口：运行根节点从不落盘。** `SessionNode` 只在提交检查点时入账本，`node_root_…` 只在内存里，所以每次普通运行的树恰好有一个孤儿。**不影响 rollback**（`rollback_transition_node_id` 是输入的确定性哈希，不查账本）。**修不了**：`EventRef.event_id` 是写 Journal 时才分配的，给根节点编一个就是在可审计结构里塞假值。**待决**：接受"运行起点不可回溯"，或改 F7 让 event_id 在事件发出时就分配。**已决，见下条。**
+    - **已决（2026-10-05）：接受"运行起点不可回溯"，并把"预期缺口"与"账本损坏"分开报告。** 复核了"改 F7 提前分配 event_id"这条路：**不可行**。`event_id = evt_sha256(prev_sha, "event-id:{seq}:{canonical}")`（`journal.rs:177`），依赖 `state.seq` 与 `state.prev_sha`，两者都是 Journal 写入时的状态；提前编一个 id 必然与 Journal 事后算出的值冲突，等于**把一处诚实的缺失换成一条会被验证拒绝的假记录**。故不采纳。
+    - 落地：新增 `ROOT_NODE_PREFIX`（`pangu-core::checkpoint`）作为单一定义源，`SessionTree` 新增 `run_root_gaps()` / `unexplained_orphans()`，`ensure_complete()` 只在**存在非 root 缺口**时拒绝。理由：每次运行都会产生这一种孤儿，把它叫作"损坏"等于训练操作者忽略真正重要的告警——那正是真缺口被漏掉的方式。
+    - 报告未减弱：缺口仍在 `orphans()` 里、仍在 `tree.render()` 里标注、`session tree --json` 新增 `run_root_gaps` 与 `unexplained_orphans` 两个字段、CLI 用 note 明说"这是本版本的工作方式，不是损坏"。`session replay` 仍对**未解释**缺口拒绝；对预期缺口放行（它不说明目标节点自身的history 是否可走）。
+    - 不变量测试相应更新：`invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden` 现在断言**披露**（仍命名缺失 parent、仍被分类、仍渲染）而非"必须拒绝导航"，与其自身文档注释一致。
+  - **未包含（有意排除）**：branch/fork；**fork 的工作区隔离完全未解决**（两条分支共享同一工作区必然互相覆盖）；跨机器同步、协作编辑。`SessionNode.history_digest` 已不再是死字段（见下条），现由运行时在每次提交节点时赋值。
   - **当时顺带发现的两个既有 bug 现已修复（详见 ADR-0004 §7）**：① `demo()` 未应用 `--checkpoint`/`--no-checkpoint`——现在 demo 同样应用 `CliOverrides`，`pangu --checkpoint --demo` 正常开启检查点；② 当时记为“自定义相对 `checkpoint.artifact_root` 导致 `--demo` 报 `checkpoint creation failed`”的描述**本身是错的**，已纠正：真实原因是快照遍历整个工作区、默认 `forbidden_globs` 不排除构建产物，与 `artifact_root` 相对/绝对无关；修法是新增 `checkpoint.exclude_roots` 并让超限错误指出具体越界文件（已用自定义相对 `artifact_root` 的 `--demo` 复测通过）。
-  - **未包含（有意排除）**：branch/fork；**fork 的工作区隔离完全未解决**（两条分支共享同一工作区必然互相覆盖）；跨机器同步、协作编辑。`SessionNode.history_digest` 仍是死字段——现在有真实节点与对话可供它记录，赋值待做。
 - [x] **A2 结构化事件兼容层**：在现有 Journal 之外提供稳定的 JSONL/NDJSON 事件流、事件版本和迁移器；借鉴 Pi JSON/RPC、ZCode 协议层、DeepSeek Harness 的 SessionEvent、OpenHands Agent Server 和 Cline headless 模式。
   - 已有：Journal（`pangu-journal/v1`、`/v2`），带 `prev_sha`/`sha` 哈希链与 `event_id` 回执（v2）。但这是**内部存储格式**，18 个 `Option` 字段 + `deny_unknown_fields`，外部工具要么绑死内部结构、要么把审计链当数据流读。
   - 已完成（ADR-0003）：独立的 `pangu-stream/1` 契约——闭集 `StreamEvent`（非 `Value`）、`EventMigrator`、`StreamWriter`（`EventSink` 实现）、`read_stream`、CLI `pangu events read|contract`。
   - 三个版本概念各管各的：Journal 磁盘格式（内部可演进）/ 事件流契约（**只增不改**，改则发 `/2`）/ 单条 kind 的冻结状态（`stable` vs `provisional`）。
   - 安全边界：事件流**不带自己的哈希链**，天然无法自证；每条记录固定 `derived: true` / `authoritative: false`，`validate()` 拒绝声称权威的记录；未知/未来 schema 硬失败不猜；损坏行整体失败不返回前缀；脱敏与 Journal 同一套。
   - **未包含（有意排除）**：实时推送（订阅式/gRPC/WebSocket）、写回 API、替代 Journal；F7 的 checkpoint/rollback kind 定为 `provisional` 而非 `stable`（F7 仍是实验性 opt-in，现在冻结等于对未定型行为做兼容承诺）。
-- [ ] **A3 审批与差异预览**：显示文件 diff、命令预览、网络目标摘要、预计风险和影响范围；借鉴 Pi 的交互扩展点和 Cline 的 Plan/Act、checkpoint/undo。
+- [x] **A3 审批与差异预览（已做，结构化 impact 先行；文件内容 diff 移列 F2）**：借鉴 Pi 的交互扩展点和 Cline 的 Plan/Act、checkpoint/undo。
+  - `ApprovalRequest` 新增 `impact: ApprovalImpact`（`command`/`network`/`reads`/`writes`/`cwd`，serde 默认空、向后兼容旧 journal 载荷）；审批提示按「影响范围」分组渲染命令预览、网络目标、读写路径清单。
+  - 文件内容的 unified diff 暂不提供——那依赖 F2 的 Git 可选后端；本期只保证读写**范围**可见。
 - [x] **A4 `doctor`/`explain`/策略模拟**：在不执行副作用的情况下解释配置、规则命中顺序、预算和预计阻塞点；扩展 Pangu 现有能力，并参考 OpenHands backend 状态检查。
   - 已有：`pangu doctor`（配置摘要 + digest + Journal 统计）、`pangu config`、`Config::explain()`。
   - 已完成（ADR-0002）：`pangu explain` 投影 `Policy → Sandbox → Approval` 三层，逐条规则报出 `decided` / `matched_but_refused` / `shadowed` / `no_match` / `not_reached`，并做遮蔽（死规则）分析。报告固定带 `advisory: true` / `authoritative: false`，不提供到 `Effect` 的转换，因此不可能被当作授权。
   - **未包含（有意排除）**：预算耗尽点预测、从 Journal 解释历史判定（依赖 A2 的稳定事件契约）、规则修改建议。
-- [ ] **A5 会话导出与隐私检查**：导出前扫描 secret、绝对路径、命令输出和大对象；借鉴 Pi session export、SWE-agent trajectory 和 Cline history。
-- [ ] **A6 无限上下文（切片、组装与写回）**：会话历史本地全量留存、不受模型上下文窗口限制；按需切片，只把当前需要的部分传上去，返回的内容再并回总上下文。详见 [`docs/adr/0005-context-assembly.md`](docs/adr/0005-context-assembly.md)。
-  - **动机（仓库里的真实痛点）**：现在不是裁剪，是终止。`crates/pangu-agent/src/lib.rs` 的三处独立检查点（`Breach::InputTokens`）一旦 `estimated_input >= max_input_tokens` 就把 `terminal` 置为 `BudgetExhausted` 并 `break`，默认阈值 200,000。长任务今天只有两种结局：塞得下，或者死。
+- [x] **A5 会话导出与隐私检查（已做）**：借鉴 Pi session export、SWE-agent trajectory 和 Cline history。
+  - `pangu conversation export --out <path> [--strict]`：导出前重扫 secret 标记、含用户名的绝对路径、超 64KiB 大对象（典型命令输出）；Sanitize 模式掩码/截断并出报告，Strict 模式直接拒绝。
+  - 输出为 JSONL 派生投影（`derived: true, authoritative: false`），只可读不可回灌；`pangu-export/1` schema。
+- [x] **A6 无限上下文（切片、组装与写回）**：会话历史本地全量留存、不受模型上下文窗口限制；按需切片，只把当前需要的部分传上去，返回的内容再并回总上下文。详见 [`docs/adr/0005-context-assembly.md`](adr/0005-context-assembly.md)。（勾选含义按本节约定为“需求已确认并写入 ADR”；A6-0~A6-5 已实现并接入运行循环，剩余项见 ADR-0005 状态行：模型请求集接线、留存上界可配置化）
+  - **动机（A6-5 接入前的基线）**：A6 之前不是裁剪，是终止。`crates/pangu-agent/src/lib.rs` 曾有三处独立检查点（`Breach::InputTokens`）一旦 `estimated_input >= max_input_tokens` 就把 `terminal` 置为 `BudgetExhausted` 并 `break`，默认阈值 200,000——长任务只有两种结局：塞得下，或者死。（现状见 ADR-0005 §1 状态注记：接入后预算基于组装窗口，超预算仍有硬终止。）
   - **与 A1 的关系(重要)**:这是 A1 路线的**分叉**,不是叠加。A1b 路线是"全量 + 显式压缩"= 有损但连续(压缩后原文没了,只留 `compacted_from_digest` 指针);A6 是"全量留存 + 按需切片"= 无损但非连续。两者不能同时是默认。A6 定为**主路线**（2026-10-03 已确认），`ConversationSnapshot::compacted()` 降级为“某个切片摘要的一种降级模式”而非会话级一次性压缩。
   - **“需要哪个”不能由模型决定**：模型能裁掉 system 轮（边界指令在哪），也能裁掉“上次这个操作被拒了”的历史然后重试——正是 `invariant_i_failed_path_not_repeated` 防的事。组装 = **不可协商强制集**（system 轮 / goal / 被拒路径 / 未完成工具调用 / 最近 N 轮）+ 模型**请求**集；模型只能*请求*，不能*排除*。每次组装把**每个切片的来源与选取理由**写进事件流。
   - **写回（2026-10-03 已确认为读法 (a)）**：写回 = 模型的正常新消息，沿用现有 history 追加路径，不引入新的存储原语。模型改写切片内容的写回（读法 (b)）才是新攻击面——模型能改本地状态、篡改未来的输入——它**移交 B3**；届时护栏必须是：只追加为新切片、原切片不可变、记 `derived_from`、显式标 `unverified`、扩展 `invariant_i_resumed_conversation_carries_no_authorization` 覆盖它（ADR-0005 §3.3）。
@@ -383,11 +396,37 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 ### B. 扩展、技能和模型
 
-- [ ] **B1 Capability Manifest**：借鉴 Pi/ZCode/DeepSeek Harness 的 capability seam，以及 OpenHands SDK、Cline SDK/MCP；插件/扩展声明工具、风险、读写 roots、网络 host、预算和版本，只能通过中心边界执行。
-- [ ] **B2 技能注册表与签名包**：借鉴 Pi 的 Agent Skills、Hermes 的技能学习、DeepSeek Harness/OpenHands 的 skills/plugins 和 Cline 的 rules/skills，但默认只加载说明，脚本需显式批准。
-- [ ] **B3 受控记忆候选队列**：借鉴 Hermes 的学习闭环；模型只能提出记忆，用户/策略确认后写入，保留来源和撤销能力。
-- [ ] **B4 Provider Registry**：统一 OpenAI-compatible 之外的 provider 配置、能力探测、模型能力声明和成本表；借鉴 Pi、OpenHands、Cline 和 Aider 的多 provider/本地模型设计。
-- [ ] **B5 Provider fallback 策略**：只有兼容性、价格、健康状态和用户策略均允许时才 fallback；禁止静默切换到更宽权限模型。
+- [x] **B1 Capability Manifest（已做，工具层）**：借鉴 Pi/ZCode/DeepSeek Harness 的 capability seam，以及 OpenHands SDK、Cline SDK/MCP。
+  - `CapabilityManifest`/`Capability` 数据结构：name/version/risk/effect descriptor/reads/writes/hosts/processes/timeout_ms，`validate()` 强制一致性（unique 名字、risk×effect 与运行时 `validate_for_risk` 同规则、Workspace 不得声明 hosts/processes、NoEffect 不得声明 writes、有界）。
+  - `Toolkit::manifest()` 与 `specs()` 一一对应，有测试锁定；后续插件/扩展注册的工具必须先声明进 manifest，模型无法绕过中心边界调用未声明能力。扩展侧注册入口留待 E1 统一落地。
+- [x] **B2 技能注册表与签名包（已做）**：借鉴 Pi 的 Agent Skills、Hermes 的技能学习、DeepSeek Harness/OpenHands 的 skills/plugins 和 Cline 的 rules/skills，但默认只加载说明，脚本需显式批准。设计详见 [`docs/adr/0007-skill-registry.md`](adr/0007-skill-registry.md)；W-03 对照：签名 ✓（ed25519，四态诚实标注）、锁版本 ✓（package_digest 冻结进 contract）、SBOM ✓（skill.lock 逐文件 SHA-256 + 字节数）、最小 capability ✓（read_skill 只读、无执行面）、隔离加载 ✓（.pangu 禁区 + internal 通道）。
+  - 包与注册表：操作者 `pangu skills install|list|verify|remove`；install 逐文件校验 + lock；运行时每次加载重算 hash，不匹配拒载 + `Note` audible。
+  - 签名：`pangu skills keygen`（ed25519）+ `install --sign-key`；`[skills] verify_key` 钉公钥后运行时验签；四态（signed+verified / signature-invalid / signed-unverified / unsigned）——没人查过的签名不冒充信任级别。
+  - 运行时：仅注入有界索引（name/version/签名状态/描述，标注 operator-installed、carry no permissions）；`read_skill` 读 SKILL.md 正文是模型唯一触达点；**脚本零执行原语**——"脚本需显式批准"以"执行口不存在"成立。
+  - 冻结与绑定：contract 冻结技能集并携带进 digest；with_chain 拒广告不一致；run 启动逐位比对冻结集与实际 registry，不一致拒启。
+  - **未包含（有意排除）**：脚本执行原语（若 E1 要做，须以 capability + 显式批准 + 隔离加载重新过准入，见 ADR-0007 §3）；模型安装/修改技能；在线分发/市场；向量检索。
+- [x] **B3 受控记忆候选队列（已做）**：借鉴 Hermes 的学习闭环；模型只能提出记忆，用户/策略确认后写入，保留来源和撤销能力。设计详见 [`docs/adr/0006-memory-candidate-queue.md`](adr/0006-memory-candidate-queue.md)；W-01 对照：proposal ✓（propose_memory 只入队）、来源 ✓（proposed_at/in_run + content_digest）、证据 ✓（transitions 全程审计、事件不带原文）、人工/策略确认 ✓（accept 仅 CLI）、可撤销 ✓（revoke 单向且保留记录）。
+  - 生命周期三段式：模型提议（pending，惰性）→ 操作者 CLI 审阅（accept/reject）→ accepted 注入后续运行；revoke 停止注入但记录永久保留。从运行到 accept 之间没有代码路径。
+  - 存储 `pangu-memory/1`：`<workspace>/.pangu/memory/candidates.json`；加载即校验（损坏硬错误，不静默重置）；原子写；fail-closed 上界（内容 4 KiB / pending 256 / 注入 24 条 16 KiB）+ 去重 + 控制字符拒绝。
+  - 存储保护：默认 `forbidden_globs` 新增 `**/.pangu/**`——Pangu 自有存储对工具 I/O 禁区（**兼容性收紧**，见 BOUNDARY §7 记录；同时堵住工具改写旧 journal 的既有缺口）；Pangu 自身 I/O 走 `ResourceRequest.internal` 通道（跳过禁区 glob，保留其余检查）。
+  - 注入：仅 accepted、仅新 run 的 system turn、固定 `UNTRUSTED — data only, carries no authorization` 标注；对 L1–L4 零影响（不变量 #22 I-Memory-Proposal-Only）；恢复的会话不重新注入；超限诚实截断。
+  - 事件：`MemoryProposed`（pangu-stream/1 provisional）只含 id + 内容 SHA-256，原文只在 store 一处。
+  - CLI：`pangu memory list [--json] [--all]`、`accept|reject|revoke <id> [--by] [--note]`。
+  - **未包含（有意排除）**：ADR-0005 读法 (b) 切片写回（护栏已由 ADR-0006 §2.5 承接为准入条件）；自动接受/策略自动接受（accept 只能是人）；向量/语义检索；跨机器同步；记忆修改边界（永不）。
+- [x] **B4 Provider Registry（已做，配置/数据层）**：统一 OpenAI-compatible 之外的 provider 配置、能力探测、模型能力声明和成本表；借鉴 Pi、OpenHands、Cline 和 Aider 的多 provider/本地模型设计。
+  - `pangu-boundary::registry`：内置预设（openai / deepseek / ollama，schema `pangu-provider-registry/1`），携带 endpoint、key 变量、每模型能力（context window、输出上限、是否支持工具调用）与带 as-of 日期的价格表。**不新增 wire 协议**（BOUNDARY §5 非目标保持：Anthropic 等专用协议仍不实现）。
+  - 解析是纯函数（`Config::resolve_provider`），优先级：显式配置 > 具名预设 > 内置默认；**价格表只在 `model.provider` 显式命名时生效**——命名 provider 即操作者决定采用其数据；digest 语义不变（contract digest 已覆盖生效价格）。
+  - fail-closed 前移到配置期：未知 provider、keyed preset 缺 key 变量、不支持工具调用的模型、`budget.max_input_tokens` 超出 context window、请求输出上限超过模型能力，均在启动时拒绝；混合价格（只设一边）也从运行期失败提前到配置期（兼容性说明：唯一的行为收紧点，旧配置中半设价格本就不可用）。
+  - CLI：`pangu models list [--json]`（离线）；`pangu models probe [--json]`（对生效 endpoint 发一次有界 `GET /models`，操作者显式发起，非 2xx 只报状态不回显 body/key，客户端纪律与 `chat` 相同）。
+  - **诚实边界**：价格表会过期——`models list` 显示 as-of 日期，覆盖以显式配置为准；本地 provider（ollama）无内置价格，必须显式声明（G4 fail closed 保持）。
+  - **未包含（有意排除）**：Anthropic 等专用 wire 协议；在线价格抓取；自动 fallback 到其他 provider（归 B5）。
+- [x] **B5 Provider fallback 策略（已做）**：只有兼容性、价格、健康状态和用户策略均允许时才 fallback；禁止静默切换到更宽权限模型。
+  - `[[model.fallback]]` 有序候选链：主 provider `chat` 失败时按声明顺序尝试；默认空 = 单 provider，行为与旧版完全一致。
+  - 配置期全量校验（fail-closed）：候选必须在注册表（能力可验证）、支持工具调用、context window 覆盖 `budget.max_input_tokens`、价格可解析、不与主模型/先前候选重复；主模型必须有可解析价格。
+  - 冻结与绑定：链冻结进 `GoalContract.fallbacks`（digest 仅在非空时携带）；`Agent::with_chain` 拒绝注入链与 contract 不一致（长度、逐位模型名）；新构造器 `Agent::with_chain`，`Agent::new` 语义不变（单 provider）。
+  - 审计与计价：每次失败尝试发 `Note`，每次成功切换发 `ProviderSwitched`（pangu-stream/1 provisional kind，F4 先例）；成本按段累计——每段 usage 按实际服务的 provider 冻结价格计，切换不能低估成本；链耗尽时运行失败（报最后错误），不回跳主 provider。
+  - **未包含（有意排除）**：后台健康探测（未受控出站请求；健康在尝试时判定）；运行中动态增删候选（链只能来自配置，边界收紧/放宽归人）；跨 run 的失败记忆（failed-path 账本只覆盖动作，不覆盖端点）。
+  - W-10 对照：能力声明 ✓（注册表强制）、价格校验 ✓（按段计价 + 配置期拒绝无价格候选）、用户策略 ✓（链只能显式声明）、显著变更提示 ✓（切换事件 + ModelRequest 记录实际 provider）、禁止静默切换 ✓。
 - [ ] **B6 本地部署 laya（用户可选）**：支持把 laya 作为本地决策服务/模型运行，用于 triage、gate、routing 等有界判断；默认关闭，由用户在配置或安装时显式开启。laya 不得成为 Pangu 核心启动依赖，不得直接创建 `VerifiedAction`、修改 Policy/预算/审批模式或执行工具；服务默认仅绑定 loopback，模型下载、远程 endpoint 和数据出站必须分别显式配置。
 
   - **改名记录（2026-09-26）**：B6 的本地决策模型从 JEV 换为 **laya**（开源）。代码零依赖，JEV 从未进入 `Cargo.toml`，所以这是**候选集成目标的名字替换**，不是依赖变更。
@@ -399,14 +438,31 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - [ ] **C2 Gateway 渠道**：CLI 之外增加 Web/API 或消息渠道适配器；借鉴 Hermes、OpenHands automation 和 Cline connectors；所有渠道共用同一 run contract。
 - [ ] **C3 定时任务与持久任务**：借鉴 Hermes/OpenHands/Cline；每个任务独立 workspace、预算、审批策略、取消和过期时间。
 - [ ] **C4 远程 Runner**：借鉴 ZCode 的 SSH/WSL 思路、OpenHands Agent Server 和 Cline SDK/ACP；支持临时挂载、短时令牌、断线恢复和完整审计。
-- [ ] **C5 隔离执行配置**：借鉴 Pi 的容器/VM 思路、OpenHands 的 Docker/Kubernetes workspace 和 Cline 的 sandbox/data-dir；提供 local、container、remote profile，并明确每种 profile 的真实保护范围。
+- [x] **C5 隔离执行配置（已做，声明/审计层）**：借鉴 Pi 的容器/VM 思路、OpenHands 的 Docker/Kubernetes workspace 和 Cline 的 sandbox/data-dir；提供 local、container、remote profile，并明确每种 profile 的真实保护范围。
+  - `[execution]` 配置段：`profile = local|container|remote`（默认 local）+ 可选 `description`（审计描述，脱敏、限长 512 字节、拒绝控制字符）。
+  - 冻结与审计：声明冻结进 `GoalContract`（digest 仅在声明时携带，保持既有 digest 稳定）并记入 `RunStarted` 载荷（`execution_profile`/`execution_description`，未声明时缺席）；`doctor`/`explain` 引用固定话术 `ExecutionProfile::scope_statement` 陈述各 profile 的真实保护范围。
+  - **诚实边界（本特性的核心）**：声明不是验证事实——Pangu 不启动、不管理、不验证容器/VM/远程后端，从进程内部看它们与 local 无法区分；L1–L4 在所有 profile 下逐位相同；容器边界由部署者的容器运行时提供（BOUNDARY §5 非目标保持）。
+  - 部署者提醒已写入 BOUNDARY：Artifact store 存在于声明的后端内，container/remote 下 artifact_root 应位于持久化存储。
+  - **未包含（有意排除）**：容器/远程编排、镜像拉取、远程 runner（归 C4/R4）；任何把声明冒充隔离保证的行为。
 
 ### D. 多 Agent 和产物
 
-- [ ] **D1 受限子 Agent**：借鉴 Hermes/WorkBuddy/DeepSeek Harness/OpenHands/Cline；子 Agent 只有父任务授予的 capability budget，不能扩大权限。
+- [x] **D1 受限子 Agent（已做）**：借鉴 Hermes/WorkBuddy/DeepSeek Harness/OpenHands/Cline；子 Agent 只有父任务授予的 capability budget，不能扩大权限。设计详见 [`docs/adr/0010-restricted-sub-agent.md`](adr/0010-restricted-sub-agent.md)。
+  - `[boundary] allow_delegation`（默认关，条件性 digest）启用 `delegate_task` 控制工具；子 contract 由 `GoalContract::derive_sub_contract` 从父 contract 派生——执行面字段全复制（sandbox/policy/审批/provider 链/网络/限额），run 作用域特性全剥离（memory/skills/deliverables/eval/checkpoint/委派本身）。
+  - 预算独立且可汇总（R4 完成门）：子预算钳到父级剩余（turns/cost/wall-clock），构造器拒绝任何加宽（纵深防御）；子花费 merge 进父级账本，每 turn 检查覆盖；委派失败 = 工具错误回灌，父 run 永不致命。
+  - 中央 Journal（子事件进同一 sink）+ `TaskDelegated` 事件（provisional，tag `⇒ sub  `，payload 只带 task digest 与钳制后子预算）+ 同一审批处理器；深度 1 结构性（子 contract `allow_delegation = false` + with_chain advertisement 校验双保险）。
+  - `pangu eval` 未动：委派与评测正交；子终态 + 脱敏汇总 + 统计作为工具结果回传。
+  - **未包含（有意排除）**：并行 DAG/多节点编排（D2）；跨 Agent 消息协议（父子通信 = task 文本 + 终态汇总）；按子任务收窄文件根（需要 sandbox 派生机制）；深度 > 1。
 - [ ] **D2 并行任务 DAG**：借鉴 OpenHands/Cline teams；每个节点独立预算、取消、超时、重试和终态，禁止无界 fan-out。
-- [ ] **D3 Artifact + Evidence 管线**：借鉴 WorkBuddy 的产物导向、Aider 的 Git diff 和 Cline 的 checkpoint；支持报告、代码补丁、表格等结构化产物。
-- [ ] **D4 产物验收器**：定义 schema、测试、引用、数据版本和人工签收；借鉴 Aider 的 lint/test loop 与 Cline 的 diff/checkpoint；没有验收证据不能标记完成。
+- [x] **D3 Artifact + Evidence 管线（已做）**：借鉴 WorkBuddy 的产物导向、Aider 的 Git diff 和 Cline 的 checkpoint；支持报告、代码补丁、表格等结构化产物。与 D4 一并实现，设计详见 [`docs/adr/0008-deliverable-acceptance.md`](adr/0008-deliverable-acceptance.md)。
+  - 交付物在目标里声明（`[[goal.deliverable]]`：name/path/kind/acceptor/min_bytes），冻结进 contract 并携带进 digest；产物文件本身经 write_file 与 L1–L4 产出，无新工具面。
+  - complete 时把每个交付物快照（路径、SHA-256、字节数、run、时间）登记进 `<workspace>.pangu/deliverables/` 注册表（工具禁区）并 events `DeliverableRecorded`（pangu-stream/1 provisional，digest only）；同产物重复交付追加新记录，历史不改写。
+  - **未包含**：产物内容的事实性校验（签收者责任）、云端产物库。
+- [x] **D4 产物验收器（已做）**：定义 schema、测试、引用、数据版本和人工签收；借鉴 Aider 的 lint/test loop 与 Cline 的 diff/checkpoint；没有验收证据不能标记完成。W-18 对照：数据版本 ✓（SHA-256+时间+run 双链登记）、校验规则 ✓（acceptor）、人工签收 ✓（CLI 单向审计）。
+  - 验收器：`manual`（run 内只登记）、`verify`（复用 F3 验证证据）、`json`/`jsonl`（格式校验）。
+  - complete 闸门：存在性 + min_bytes + acceptor 全过才接受；失败详情回灌给模型（Aider lint-loop），可修复重试或诚实改口 failed；登记失败同样拒绝 complete——未经审计的完成不是完成。
+  - 人工签收：`pangu deliverable list|accept|reject`（run 外、单向、审计）；`complete` ≠ `accepted`（格式正确 ≠ 事实正确）。
+  - **未包含（如实声明）**：完整 JSON Schema 校验（需 jsonschema 依赖，届时另过准入）；产物内引用存在性检查（属内容语义）。
 
 ### E. 连接器和办公工作台
 
@@ -419,11 +475,29 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 
 这些候选直接吸收 OpenHands、SWE-agent、Aider 和 Cline 的代码工作流优势；它们仍然必须服从 Pangu 的中心边界，不代表默认开放任意 shell 或自动提交。
 
-- [ ] **F1 Repo Map / 代码库地图**：借鉴 Aider，生成可解释的文件、符号、依赖图和 token budget；默认只读，显示来源、时效和发送给模型的上下文。
-- [ ] **F2 Git diff/undo 可选后端**：借鉴 Aider 和 Cline，保存可审查的 diff、恢复点和 Git 辅助信息；它不是 Pangu checkpoint 的必需实现，默认不自动 commit，不跳过项目 hooks。
-- [ ] **F3 Lint/Test/Compile evidence loop**：借鉴 Aider、Cline 和 OpenHands，在编辑后运行受限验证命令，记录退出码、测试摘要和产物；失败不能自动改写为完成。
-- [ ] **F4 Plan/Act 与逐步审批**：借鉴 Cline 和 OpenHands 的计划/执行分离；Plan 阶段只读探索，Act 阶段逐项显示 diff、命令和影响范围。
-- [ ] **F5 Issue-to-patch 评测 profile**：借鉴 SWE-agent，把 issue、仓库版本、测试、patch、trajectory 和成本固定为可复现实验；benchmark 分数不替代验收。
+- [x] **F1 Repo Map / 代码库地图（已做）**：借鉴 Aider，生成可解释的文件、符号、依赖图和 token budget；默认只读，显示来源、时效和发送给模型的上下文。
+  - `pangu-core::repomap`：`build(root)` 确定性扫描（忽略 .git/target 等，不跟随 symlink、不写盘），Rust/Python/JS/TS/Go 符号抽取，`use crate::`/`mod` 内部边，`view(map, budget_tokens)` 预算视图（超预算文件进入 `omitted_files`，视图永不静默丢信息），`fingerprint` 供 staleness 检测。CLI `pangu repo map`。
+- [x] **F2 Git diff/undo 可选后端（已做，只读 git_diff 能力；undo 归 F7 rollback）**：借鉴 Aider 和 Cline，保存可审查的 diff、恢复点和 Git 辅助信息；它不是 Pangu checkpoint 的必需实现，默认不自动 commit，不跳过项目 hooks。
+  - `git_diff` 工具（ReadOnly/ProcessRead/NoEffect）：argv 仅允许 `git diff|status|log|show` + 白名单 flag + 相对路径；沙箱执行、输出过限即失败；集成测试走完整 verified-action 链。
+  - "undo" 不归此处：工作区恢复走 F7 的 `pangu rollback`（显式 capability + L4 审批 + failed-path 账本），F2 只提供可读 diff/状态，不替 checkpoint 承担恢复语义。
+- [x] **F3 Lint/Test/Compile evidence loop（已做，工具层）**：借鉴 Aider、Cline 和 OpenHands，在编辑后运行受限验证命令，记录退出码、测试摘要和产物；失败不能自动改写为完成。
+  - `verify` 工具：只执行 `[verify] command` 配置的**整条 argv**——模型无参数可控制（任何键即拒绝），空配置 = 工具不广告；程序名必须在只读 argv 白名单（内置或 `boundary.extra_readonly_commands`）上，flag 走同一 SAFE 列表；`Config::validate` 在启动时 fail-closed 校验不可运行的命令。
+  - 冻结与绑定：命令冻结进 `GoalContract.verify_command` 并进 contract digest；`Agent::new` 拒绝 toolkit 广告与 contract 不一致的 executor；Sandbox 的 `extra_readonly_commands` 同样进 contract 并参与 `validate_against` 比较。
+  - 风险与审批：`needs_human`——每次运行验证命令都需 L4 人工批准（W-38：验证命令会执行项目代码）。成功产生 `verify:` evidence；失败回灌退出码与输出、不产生 evidence，`complete` 因此被拒（I-Honest-Terminal）。
+  - **诚实边界**：`extra_readonly_commands` 是操作者对被声明程序副作用的断言，Pangu 不验证其真实副作用；验证命令的外部效果（如依赖下载）不进 effect ledger、不被 rollback 处理。
+  - **未包含（有意排除）**：结构化测试摘要解析（输出原样回灌）；产物收集；编辑后自动触发（何时调用 verify 由模型自主决定，每次仍需人工批准）；并行验证。
+- [x] **F4 Plan/Act 与逐步审批（已做）**：借鉴 Cline 和 OpenHands 的计划/执行分离；Plan 阶段只读探索，Act 阶段逐项显示 diff、命令和影响范围。
+  - `goal.plan_first = true`（默认 false）：运行从只读 plan 阶段开始；风险高于 `read_only` 的动作在任何闸门前拒绝并回灌指向 `begin_act` 的错误；只读工具不受影响，纯只读目标可以在 plan 阶段内 `complete`。
+  - `begin_act` 是 agent 拥有的控制调用（同 `finish` 类，不经过 assess/闸门，不执行任何动作）：仅 plan_first 运行广告；发 `PhaseChanged` 事件（pangu-stream/1 新 kind，provisional，沿用 F7 先例）；重入被拒；act 阶段每个变更动作仍逐项走 L1-L4。
+  - 逐项展示：`write_file` 审批请求携带有界（8 KiB）、脱敏的 unified diff（`pangu-core::diff::unified_diff`，确定性 LCS + 上下文行，超界时明确说明而非静默截断/伪造）；命令与网络/读写范围展示沿用 A3 的 `ApprovalImpact`。diff 无法内联时（非 UTF-8、过大、不可读）说明原因，不伪造 "new file"。
+  - 兼容性：`plan_first`/`diffs` 均为新增可选字段；digest 仅在 plan_first 启用时携带该键，默认运行 digest 不变；事件流新增 provisional kind 属契约"只增"演进。
+  - **未包含（有意排除）**：人工切换相位的 UI 开关（模型提名过渡 + 逐项人工审批已满足边界；纯 UI 交互归 C1）；多相位计划文档与计划持久化；`--plan-only` 旗标（用 plan_first + `Never` 审批模式即可达到只读运行）。
+- [x] **F5 Issue-to-patch 评测 profile（已做）**：借鉴 SWE-agent，把 issue、仓库版本、测试、patch、trajectory 和成本固定为可复现实验；benchmark 分数不替代验收。设计详见 [`docs/adr/0009-issue-to-patch-eval.md`](adr/0009-issue-to-patch-eval.md)。
+  - `[eval]` 声明（profile + issue_path）；`pangu eval run` 在 run 开始钉取 issue 内容 SHA-256、探测 workspace git 版本（unknown 如实记录）、合成带来源标注的 goal 文本，然后走与 `pangu run` 完全相同的边界管线——评测不是新执行模式，对模型不可见。
+  - `pangu-eval/1` 记录（`.pangu/eval/records.json`，追加式/原子写/损坏硬错误）：输入三元组（issue digest + workspace_version + contract digest）、终态、turns、token、成本（未定价记 None 不是 0）、`verify:` 证据计数、本 run 登记的 deliverable 快照、Journal 指针。
+  - **没有 score 字段**：每条记录携带固定免责声明（机器事实不断言修复；验收 = verify evidence + 人工 deliverable 签收）；`complete` ≠ 修复正确（W-31）。
+  - `pangu eval list [--json]`；不声明 `[eval]` 时行为与 digest 完全不变。
+  - **未包含（有意排除）**：批处理 runner（多 issue 批量归 F6/C4）；内建 benchmark 判定 harness（属外部工具）；非终态 run 的 eval 记录（Journal 兜底）。
 - [ ] **F6 控制平面与 backend/automation profile**：借鉴 OpenHands Agent Canvas，支持本地、Docker、VM、远程 backend 和计划/webhook 任务；每个 backend 和任务都独立认证、限额、幂等和审计。
 - [x] **F7 Pangu Artifact 检查点与受限回退（需求已确认；ADR 已批准；阶段二实现已存在；默认关闭、实验性 opt-in、未正式激活）**：已实现成功 VerifiedAction 后的工作区快照、稳定事件指针、session node、operation ledger、typed rollback、failed-path/effect ledger、Journal v2 receipt 和 CLI 子命令；回退只恢复文件系统/会话状态，不回退外部副作用；默认不自动 commit。详细实现边界见 [`docs/adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md) 和 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)。当前不得把它描述为默认支持。
 
@@ -440,17 +514,18 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - **事件契约**：已加入 checkpoint、rollback、failed-path 事件和稳定 v2 event receipt；旧 Journal 不重写，v1 读取兼容保留。
 - **测试门**：已覆盖外部副作用、幂等、快照损坏、失败路径阻断、wall-clock budget、TeeSink receipt、真实 CLI 子进程、stale lock 和配置/事件兼容；operator 事故分支（stale lock、failed operation、CAS drift、外部 mutation、Windows replacement backup、只读性、CLI 退出码）另有 `crates/pangu/tests/operator_drills.rs` 可重复演练，并按平台记录机制差异。
 - **正式激活门**：operator recovery 运行手册已补充，证据收集与四个事故分支已有只读工具（`pangu artifact inspect`）和可重复 drill，**跨平台 CI 已通过**（run 36210280753，提交 `1b0245d`，Ubuntu 与 Windows 的 drill 原始报告已转录到 `docs/evidence/`）；仍缺目标部署平台自身的验证、恢复期间的备份/审计可用性、无人工输入与并发 writer 的停止策略确认，以及 operator/发布负责人签署；在此之前不把 F7 描述为默认支持。详见 [`docs/CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
+  - **四个剩余项已各自落成可执行程序（2026-10-05）**：见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) §9——§9.1 目标平台 drill（含 `not-applicable`/`skipped` 的判读规则）、§9.2 停止策略书面确认清单（5 个必答问题）、§9.3 备份与独立审计验证（`artifact inspect` 前后对照）、§9.4 签署与四处文档同步。§8 的每个 `[ ]` 都指向对应小节，留证要求写死在那里。
+  - 同日新增本机 drill 记录（Windows 10.0.19045 / rustc 1.98.1 / 提交 `3aa11da`，7 pass，转录见 `docs/evidence/`）。**它不满足 §9.1**——本机仍属 CI 已覆盖的平台，不是目标部署平台；它只证明 drill 在该提交上可复现。
+  - **CI 已连续 7 次红，且此前无人处理**：`plan-a` 上每次都是 ubuntu-latest 测试失败、windows-latest 通过。根因是 `exclude_roots` 校验在两个平台上对同一份配置给出不同诊断（Windows 的 `\\?\` 前缀让 `..` 在 `join()` 时被折叠，Linux 保留 `ParentDir` 提前被拒），已修复。提交 `105258e` 是修复后第一次全绿运行（run 37398616832）。原因与教训见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) §11。
 
 ### 选择建议
 
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-第一批：A1、A2、A3、A4、B1、B4、C5
-代码场景可选：F1、F2、F3、F4
-第二批：B2、B3、D3、D4、F5
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D1、D3、D4、F1、F2、F3、F4、F5
+        （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
-阶段二实现已存在但仍为实验性 opt-in：F7（Artifact/Agent/CLI、事件和测试已完成；正式激活与支持声明仍受 operator recovery、跨平台和最终验收门约束）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```
 

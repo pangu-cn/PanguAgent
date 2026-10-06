@@ -361,6 +361,69 @@ impl WireRole for pangu_core::MessageRole {
     }
 }
 
+/// B4 capability probe: one bounded GET `<base_url>/models` against the
+/// configured provider endpoint. Operator-initiated diagnostics only — never
+/// model-driven, never part of a run. Same client discipline as `chat` (no
+/// proxy, no redirect, bounded response); non-2xx reports the status only and
+/// never echoes the body or the key.
+pub async fn probe_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Vec<String>> {
+    if timeout_secs == 0 {
+        bail!("timeout_secs must be > 0");
+    }
+    let url = format!("{}/models", normalize_base_url(base_url.to_string())?);
+    if let Some(key) = api_key {
+        validate_api_key(key)?;
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()?;
+    let mut request = client.get(&url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("models probe failed: HTTP {status}");
+    }
+    if let Some(length) = response.content_length() {
+        if length as usize > MAX_RESPONSE_BYTES {
+            bail!("models probe response exceeds {MAX_RESPONSE_BYTES} bytes");
+        }
+    }
+    let body = response.bytes().await?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        bail!("models probe response exceeds {MAX_RESPONSE_BYTES} bytes");
+    }
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|_| anyhow!("models probe returned a non-JSON body"))?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("models probe response is missing `data`"))?;
+    if data.len() > 1_000 {
+        bail!("models probe returned too many entries");
+    }
+    let mut ids = Vec::new();
+    for entry in data {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("models probe entry is missing `id`"))?;
+        if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            bail!("models probe returned an invalid model id");
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

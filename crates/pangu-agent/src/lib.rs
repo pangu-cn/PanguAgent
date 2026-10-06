@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How many trailing turns are always in the assembled window (§3.2 FORCED).
 const RECENT_TURNS: usize = 8;
@@ -21,16 +21,18 @@ use pangu_boundary::{
     ValidatedResources,
 };
 use pangu_core::{
-    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact, Event,
-    EventKind, EventSink, FailureClass, JournalMeta, Message, RestoreDisposition,
-    RollbackOperation, RollbackRequest, ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1,
-    JOURNAL_FORMAT_V2,
+    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact,
+    DeliverableStore, Event, EventKind, EventSink, FailureClass, JournalMeta, MemoryStore, Message,
+    RestoreDisposition, RollbackOperation, RollbackRequest, SkillRegistry, ToolCall, ToolSpec,
+    Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
 };
 
+pub mod capability;
 mod checkpoint;
 pub mod conversation;
 mod effect;
 
+pub use capability::{Capability, CapabilityManifest};
 pub use effect::{EffectDescriptor, EffectScope, Reversibility};
 
 const MAX_TOOL_CALLS_PER_RESPONSE: usize = 128;
@@ -319,8 +321,23 @@ pub trait Provider: Send + Sync {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn specs(&self) -> Vec<ToolSpec>;
+    /// F3: the exact argv the executor's `verify` tool will run. Must equal
+    /// the contract-frozen `GoalContract::verify_command`; `Agent::new`
+    /// refuses a mismatch. Empty means the executor has no verify tool.
+    fn verify_command(&self) -> Vec<String> {
+        Vec::new()
+    }
     async fn assess(&self, call: &ToolCall, sandbox: &Sandbox) -> Result<ToolAssessment>;
     async fn execute(&self, action: &VerifiedAction) -> Result<ToolOutput>;
+}
+
+/// D1: builds the tool executor a restricted sub-agent will use. Called by
+/// the parent run once per delegation. The factory is operator wiring (the
+/// CLI builds a fresh toolkit); whatever it returns is checked against the
+/// derived child contract like any other executor, so a factory cannot
+/// smuggle capabilities the child contract does not declare.
+pub trait SubtoolFactory: Send + Sync {
+    fn build(&self, verify_command: Vec<String>) -> Result<std::sync::Arc<dyn ToolExecutor>>;
 }
 
 /// Capability token for one already-approved, already-validated action.
@@ -357,6 +374,9 @@ pub struct Agent {
     policy: Arc<Policy>,
     sandbox: Arc<Sandbox>,
     provider: Arc<dyn Provider>,
+    /// B5: declared fallback providers, in contract order. Empty = no
+    /// fallback.
+    fallbacks: Vec<Arc<dyn Provider>>,
     tools: Arc<dyn ToolExecutor>,
     approval: Arc<dyn ApprovalHandler>,
     event_sink: Arc<dyn EventSink>,
@@ -365,6 +385,44 @@ pub struct Agent {
     /// History to continue from. Model input only: it carries no decision and
     /// no approval, and every action in the resumed run is re-evaluated.
     resume_from: Option<Vec<Message>>,
+    /// B3: the memory candidate store. Attached only when the contract
+    /// enables the queue; used to inject accepted, clearly-labeled memory
+    /// into fresh runs.
+    memory: Option<Arc<MemoryStore>>,
+    /// B2: the skill registry. Attached only when the contract enables the
+    /// registry; used to inject the skill index and to pin the readable set.
+    skills: Option<Arc<SkillRegistry>>,
+    /// D3/D4: the deliverable registry. Attached only when the contract
+    /// declares deliverables; `complete` runs the acceptance checks against
+    /// it and finished runs record their delivery snapshots into it.
+    deliverables: Option<Arc<DeliverableStore>>,
+    /// D1: the sub-agent tool factory. Attached only when the contract
+    /// enables delegation; builds the restricted executor each child runs
+    /// with.
+    delegation: Option<Arc<dyn SubtoolFactory>>,
+    /// D1/D2: whether a delegated child must hold the workspace write lock.
+    /// Defaults on: a child shares the parent's workspace, so concurrent
+    /// children would otherwise race. Kept as a field so a deployment that
+    /// serialises its own writers can turn the wait off.
+    delegation_workspace_lock: bool,
+    /// How long a delegated child waits for the workspace lock before the
+    /// delegation fails closed. Bounded on purpose: a holder that died without
+    /// releasing leaves an unreleasable file (see `pangu_core::lockfile`).
+    delegation_lock_timeout: std::time::Duration,
+    /// Whether each tool call takes per-path locks.
+    ///
+    /// This is the fine-grained default: only overlapping files serialise. The
+    /// whole-workspace lock (`delegation_workspace_lock`) is the coarse option
+    /// for callers that cannot say which paths they will touch.
+    workspace_path_lock: bool,
+    /// How long a tool call waits for its paths before failing closed.
+    path_lock_timeout: std::time::Duration,
+    /// Discovered build modules, used to widen a build-file edit into a module
+    /// lock. `None` means module locking is off.
+    ///
+    /// Only a confident map is consulted when locking; see
+    /// [`pangu_core::ModuleMap::is_confident`].
+    module_map: Option<std::sync::Arc<pangu_core::ModuleMap>>,
 }
 
 impl Agent {
@@ -377,10 +435,59 @@ impl Agent {
         approval: Arc<dyn ApprovalHandler>,
         event_sink: Arc<dyn EventSink>,
     ) -> Result<Self> {
+        Self::with_chain(
+            contract,
+            policy,
+            sandbox,
+            vec![provider],
+            tools,
+            approval,
+            event_sink,
+        )
+    }
+
+    /// B5: build a run over a declared provider chain. `providers[0]` is the
+    /// primary; the rest are the fallbacks, in the order the contract froze
+    /// them. The chain must match the contract position by position (model
+    /// name), or the run is refused — a fallback is never injected silently.
+    pub fn with_chain(
+        contract: GoalContract,
+        policy: Arc<Policy>,
+        sandbox: Arc<Sandbox>,
+        providers: Vec<Arc<dyn Provider>>,
+        tools: Arc<dyn ToolExecutor>,
+        approval: Arc<dyn ApprovalHandler>,
+        event_sink: Arc<dyn EventSink>,
+    ) -> Result<Self> {
         contract.validate_against(&sandbox)?;
         if approval.mode() != contract.approval_mode {
             return Err(anyhow!(
                 "approval handler mode does not match GoalContract approval mode"
+            ));
+        }
+        if tools.verify_command() != contract.verify_command {
+            return Err(anyhow!(
+                "tool executor's verify command does not match GoalContract verify_command"
+            ));
+        }
+        // B3: the propose_memory advertisement must match the contract — a
+        // tool the contract does not know about must not exist, and a
+        // contract-enabled queue without its tool is a broken freeze.
+        let memory_advertised = tools
+            .specs()
+            .iter()
+            .any(|spec| spec.name == "propose_memory");
+        if contract.memory.enabled != memory_advertised {
+            return Err(anyhow!(
+                "tool executor's propose_memory advertisement does not match GoalContract memory.enabled"
+            ));
+        }
+        // B2: the read_skill advertisement must match the contract the same
+        // way.
+        let skills_advertised = tools.specs().iter().any(|spec| spec.name == "read_skill");
+        if contract.skills.enabled != skills_advertised {
+            return Err(anyhow!(
+                "tool executor's read_skill advertisement does not match GoalContract skills.enabled"
             ));
         }
         if contract.policy_digest != policy.digest() {
@@ -388,20 +495,136 @@ impl Agent {
                 "GoalContract and Policy do not describe the same rule set"
             ));
         }
+        if providers.is_empty() {
+            return Err(anyhow!("provider chain must contain the primary provider"));
+        }
+        if providers.len() != contract.fallbacks.len() + 1 {
+            return Err(anyhow!(
+                "provider chain length ({}) does not match GoalContract fallbacks ({})",
+                providers.len(),
+                contract.fallbacks.len()
+            ));
+        }
+        for (index, candidate) in contract.fallbacks.iter().enumerate() {
+            if providers[index + 1].model() != candidate.model {
+                return Err(anyhow!(
+                    "fallback provider at position {index} does not match GoalContract \
+                     fallback model `{}`",
+                    candidate.model
+                ));
+            }
+        }
         let checkpoint = checkpoint::CheckpointRuntime::from_contract(&contract)?;
         let conversation = conversation::ConversationRuntime::from_contract(&contract)?;
+        let mut fallback_iter = providers.into_iter();
+        let provider = fallback_iter.next().expect("primary checked above");
         Ok(Self {
             contract,
             policy,
             sandbox,
             provider,
+            fallbacks: fallback_iter.collect(),
             tools,
             approval,
+            delegation: None,
+            // Off by default: the child's tool calls take per-path locks, so
+            // unrelated work is not blocked. Turning this on excludes the whole
+            // workspace, which is only wanted when the caller needs to stop
+            // *everything* else rather than just overlapping paths.
+            delegation_workspace_lock: false,
+            delegation_lock_timeout: Duration::from_secs(120),
+            workspace_path_lock: true,
+            path_lock_timeout: Duration::from_secs(120),
+            module_map: None,
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
             resume_from: None,
+            memory: None,
+            skills: None,
+            deliverables: None,
         })
+    }
+
+    /// B3: attach the memory candidate store. The same store instance must
+    /// back the toolkit's `propose_memory` tool; the run refuses to start if
+    /// the contract enables the queue but no store was attached.
+    pub fn with_memory(mut self, store: Arc<MemoryStore>) -> Self {
+        self.memory = Some(store);
+        self
+    }
+
+    /// B2: attach the skill registry. The same registry instance must back
+    /// the toolkit's `read_skill` tool; the run refuses to start if the
+    /// contract enables the registry but no registry was attached, or if the
+    /// loaded set diverges from the contract-frozen one.
+    pub fn with_skills(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.skills = Some(registry);
+        self
+    }
+
+    /// D3/D4: attach the deliverable registry. The run refuses to start if
+    /// the contract declares deliverables but no registry was attached.
+    pub fn with_deliverables(mut self, store: Arc<DeliverableStore>) -> Self {
+        self.deliverables = Some(store);
+        self
+    }
+
+    /// D1: attach the sub-agent tool factory. The `delegate_task` tool
+    /// exists only when the contract enables delegation AND a factory is
+    /// attached; run_inner refuses a contract/attachment mismatch.
+    pub fn with_delegation(mut self, factory: Arc<dyn SubtoolFactory>) -> Self {
+        self.delegation = Some(factory);
+        self
+    }
+
+    /// Configure the workspace lock a delegated child must hold while running.
+    ///
+    /// The child's own tool calls already take **per-path** locks, so
+    /// overlapping files serialise and unrelated files do not. This coarse
+    /// whole-workspace lock is for callers that need to exclude everything at
+    /// once — it is off by default precisely because it blocks unrelated work.
+    ///
+    /// `timeout` bounds the wait. It is deliberately not `Option<Duration>`:
+    /// an unbounded wait cannot be satisfied when the previous holder died
+    /// without releasing, so there is no useful sense in which it is "more
+    /// permissive" — it only converts a reportable failure into a hang.
+    pub fn with_delegation_workspace_lock(mut self, enabled: bool, timeout: Duration) -> Self {
+        self.delegation_workspace_lock = enabled;
+        self.delegation_lock_timeout = timeout;
+        self
+    }
+
+    /// Configure the per-path lock every tool call takes.
+    ///
+    /// `timeout` bounds the wait for each path, for the same reason the
+    /// workspace lock is bounded: a holder killed before it could release
+    /// leaves a lock file nothing will remove.
+    pub fn with_path_locks(mut self, enabled: bool, timeout: Duration) -> Self {
+        self.workspace_path_lock = enabled;
+        self.path_lock_timeout = timeout;
+        self
+    }
+
+    /// Supply the discovered build-module layout for module-aware locking.
+    ///
+    /// With a map attached, a tool call that edits a build file additionally
+    /// locks the module that file declares. This is what lets one agent own a
+    /// Gradle subproject or a Rust crate without blocking agents working in
+    /// sibling modules.
+    ///
+    /// An **unconfident** map is accepted here and ignored at lock time: it is
+    /// stored so the run can still report what was found, but scoping locks by
+    /// a map that failed to parse would let two agents into one module with no
+    /// lock reporting anything wrong.
+    pub fn with_module_map(mut self, map: Option<std::sync::Arc<pangu_core::ModuleMap>>) -> Self {
+        self.module_map = map;
+        self
+    }
+
+    /// Whether a delegated child must take the workspace write lock.
+    fn delegation_needs_workspace_lock(&self) -> bool {
+        self.delegation_workspace_lock
     }
 
     /// Continue from a stored conversation.
@@ -709,7 +932,13 @@ impl Agent {
                 .into_iter()
                 .chain(resource_probes)
                 .collect(),
-            ..ResourceRequest::default()
+            // Pangu-internal I/O: the artifact root lives under `.pangu`,
+            // which tools can never touch (forbidden glob), but the runtime
+            // itself must.
+            hosts: Vec::new(),
+            argv: Vec::new(),
+            cwd: None,
+            internal: true,
         };
         if self.sandbox.validate_resources(&resources).is_err()
             || runtime.validate_rollback_resources().is_err()
@@ -744,6 +973,13 @@ impl Agent {
                 redact_text(&truncate_middle(&request.reason, 1024))
             ),
             args: approval_args(&args),
+            impact: pangu_boundary::ApprovalImpact {
+                writes: vec![format!(
+                    "checkpoint {} 恢复到 node {}",
+                    request.checkpoint_id, request.source_session_node_id
+                )],
+                ..Default::default()
+            },
         };
         self.emit(
             Event::new_v2(
@@ -1029,7 +1265,11 @@ impl Agent {
                 self.contract.checkpoint.artifact_root.clone(),
             ],
             write_paths: vec![self.contract.checkpoint.artifact_root.clone()],
-            ..ResourceRequest::default()
+            hosts: Vec::new(),
+            argv: Vec::new(),
+            cwd: None,
+            // Pangu-internal I/O: see the rollback site note.
+            internal: true,
         };
         if let Err(error) = self.sandbox.validate_resources(&resources) {
             return Err(("sandbox", anyhow!(error)));
@@ -1055,6 +1295,10 @@ impl Agent {
                 invariant: Some("I-Checkpoint-After-Verified-Action".into()),
                 preview: "create an internal workspace checkpoint".into(),
                 args: approval_args(&args),
+                impact: pangu_boundary::ApprovalImpact {
+                    writes: vec![self.contract.workspace().display().to_string()],
+                    ..Default::default()
+                },
             };
             self.emit(
                 Event::new_v2(
@@ -1240,7 +1484,100 @@ impl Agent {
         }
     }
 
+    /// B2: the run's skill registry must exist when enabled and must match
+    /// the contract-frozen skill set position by position (name, version,
+    /// package digest, signing status). Rejected packages are audible `Note`
+    /// events — a skill that fails its integrity check is never silently
+    /// skipped.
+    async fn check_skills_binding(&self) -> Result<()> {
+        if !self.contract.skills.enabled {
+            return Ok(());
+        }
+        let registry = self.skills.as_ref().ok_or_else(|| {
+            anyhow!(
+                "GoalContract enables the skill registry but no registry was attached;                  build the agent with `with_skills`"
+            )
+        })?;
+        for rejected in registry.rejected() {
+            self.emit(self.event(
+                EventKind::Note,
+                0,
+                format!(
+                    "skill `{}` rejected: {}",
+                    rejected.dir_name, rejected.reason
+                ),
+            ))
+            .await?;
+        }
+        let frozen = &self.contract.skills.skills;
+        let loaded = registry.skills();
+        if frozen.len() != loaded.len() {
+            anyhow::bail!(
+                "loaded skill set ({}) does not match GoalContract frozen skill set ({})",
+                loaded.len(),
+                frozen.len()
+            );
+        }
+        for (frozen, loaded) in frozen.iter().zip(loaded.iter()) {
+            if frozen.name != loaded.name
+                || frozen.version != loaded.version
+                || frozen.package_digest != loaded.lock.package_digest
+                || frozen.signed != loaded.signature_verified()
+            {
+                anyhow::bail!(
+                    "skill `{}` does not match the GoalContract-frozen entry (name/version/digest/signature)",
+                    loaded.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// B2: the skill index injection block for this run, or `None`.
+    fn skills_index_block(&self) -> Result<Option<String>> {
+        if !self.contract.skills.enabled {
+            return Ok(None);
+        }
+        let registry = self.skills.as_ref().ok_or_else(|| {
+            anyhow!(
+                "GoalContract enables the skill registry but no registry was attached;                  build the agent with `with_skills`"
+            )
+        })?;
+        Ok(registry.index_block())
+    }
+
+    /// B3: the accepted-memory injection block for this run, or `None`. The
+    /// store must exist when the contract enables the queue.
+    fn memory_block(&self) -> Result<Option<String>> {
+        if !self.contract.memory.enabled {
+            return Ok(None);
+        }
+        let store = self.memory.as_ref().ok_or_else(|| {
+            anyhow!(
+                "GoalContract enables the memory queue but no memory store was attached; \
+                 build the agent with `with_memory`"
+            )
+        })?;
+        Ok(store.injection_block())
+    }
+
     async fn run_inner(&self) -> Result<Outcome> {
+        // D3/D4: declared deliverables require the registry; undeclared
+        // deliverables make the registry irrelevant.
+        if !self.contract.deliverables.deliverables.is_empty() && self.deliverables.is_none() {
+            return Err(anyhow!(
+                "GoalContract declares deliverables but no deliverable registry was attached;                  build the agent with `with_deliverables`"
+            ));
+        }
+        // D1: a delegation-enabled contract without its factory is a broken
+        // freeze — refuse before the first turn (fail-fast, like the
+        // deliverables registry check).
+        if self.contract.allow_delegation && self.delegation.is_none() {
+            return Err(anyhow!(
+                "GoalContract enables delegation but no sub-tool factory was attached; build the                  agent with `with_delegation`"
+            ));
+        }
+        self.check_skills_binding().await?;
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut evidence = Vec::new();
@@ -1252,7 +1589,29 @@ impl Agent {
                 conversation::validate_resumable(history)?;
                 history.clone()
             }
-            None => conversation::seed_history(self.contract.system_prompt(), &self.contract.goal),
+            None => {
+                let mut seeded =
+                    conversation::seed_history(self.contract.system_prompt(), &self.contract.goal);
+                // B3/B2: fresh runs get the accepted-memory block and the
+                // skill index appended to the system turn, both explicitly
+                // labeled. Resumed runs keep the blocks from when they were
+                // seeded — no mid-history context mutation.
+                let mut appended = String::new();
+                if let Some(block) = self.memory_block()? {
+                    appended.push_str("\n\n");
+                    appended.push_str(&block);
+                }
+                if let Some(block) = self.skills_index_block()? {
+                    appended.push_str("\n\n");
+                    appended.push_str(&block);
+                }
+                if !appended.is_empty() {
+                    if let Some(pangu_core::Message::System { content }) = seeded.first_mut() {
+                        content.push_str(&appended);
+                    }
+                }
+                seeded
+            }
         };
         let mut terminal = None;
         let mut last_turn = 0;
@@ -1274,6 +1633,20 @@ impl Agent {
             boundary_digest: self.contract.digest(),
             unattended: self.contract.is_unattended(),
             config_files: self.contract.config_files.clone(),
+            // C5: record the declared backend so audit trails show what the
+            // operator claimed about the environment. Redacted like every
+            // payload string; absent when undeclared.
+            execution_profile: if self.contract.execution().is_declared() {
+                Some(self.contract.execution().profile.as_str().to_string())
+            } else {
+                None
+            },
+            execution_description: self
+                .contract
+                .execution()
+                .description
+                .as_deref()
+                .map(redact_text),
         };
         self.emit(
             self.event(EventKind::RunStarted, 0, "run started")
@@ -1281,11 +1654,74 @@ impl Agent {
         )
         .await?;
 
-        let specs = self.tools.specs();
+        let mut act_phase = !self.contract.plan_first();
+        // B5: the active position in the provider chain (0 = primary) and the
+        // accumulated spend. Cost is summed per segment: each response's usage
+        // is priced by the provider that served it, so a switch can never
+        // under-count the cost of tokens consumed on a pricier fallback.
+        let mut active_provider = 0usize;
+        let mut spent = if self.contract.price.is_some() {
+            0.0
+        } else {
+            f64::INFINITY
+        };
+        // F4: the begin_act control tool exists only in plan-first runs. It is
+        // agent-owned (like `finish`): it executes nothing and passes no gate,
+        // it just ends the read-only phase.
+        let mut specs = self.tools.specs();
+        // D1: the agent-owned `delegate_task` control tool exists only in
+        // delegation-enabled runs. The child contract is derived from the
+        // parent at call time; the model can only narrow it.
+        if self.contract.allow_delegation {
+            specs.push(pangu_core::ToolSpec::new(
+                "delegate_task",
+                "Delegate one bounded subtask to a restricted sub-agent. The sub-agent gets a \
+                     fresh context, the same workspace/sandbox/policy as this run, and a budget \
+                     clamped to this run's remaining budget (it can never exceed them). It \
+                     cannot delegate further. Arguments: task (required string), max_turns and \
+                     max_cost_usd (optional narrowing). Returns the sub-agent's final summary \
+                     and its status; its spend counts against this run's budget.",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["task"],
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Self-contained instructions for the sub-agent."
+                        },
+                        "max_turns": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional tighter turn cap for the sub-agent."
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": "Optional tighter cost cap for the sub-agent."
+                        }
+                    }
+                }),
+            ));
+        }
+        if self.contract.plan_first() {
+            specs.push(pangu_core::ToolSpec::new(
+                "begin_act",
+                "End the read-only plan phase and start the act phase. Takes no arguments; \
+                 mutating actions still require approval one by one.",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {}
+                }),
+            ));
+        }
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
-            let mut breaches =
-                self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed());
+            let breaches =
+                self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed(), spent);
             if !breaches.is_empty() {
                 self.emit_budget(turn, &breaches).await?;
                 terminal = Some(GoalStatus::BudgetExhausted);
@@ -1351,13 +1787,14 @@ impl Agent {
 
             self.emit(self.event(EventKind::TurnStarted, turn, format!("turn {turn}")))
                 .await?;
+            let active = self.provider_for(active_provider);
             self.emit(self.event(
                 EventKind::ModelRequest,
                 turn,
                 format!(
                     "provider={} model={} messages={} tools={} (history={})",
-                    self.provider.name(),
-                    self.provider.model(),
+                    active.name(),
+                    active.model(),
                     assembled.messages.len(),
                     specs.len(),
                     history.len()
@@ -1366,10 +1803,19 @@ impl Agent {
             .await?;
 
             let response = self
-                .provider
-                .chat(assembled.messages.clone(), specs.clone())
+                .chat_with_fallback(
+                    &mut active_provider,
+                    turn,
+                    assembled.messages.clone(),
+                    specs.clone(),
+                )
                 .await?;
             let response_usage = response.usage;
+            // B5: price this segment by the provider that served it.
+            match self.active_price(active_provider) {
+                Some(price) => spent += price.cost_usd(&response_usage),
+                None => spent = f64::INFINITY,
+            }
             usage.merge(&response_usage);
             self.emit(
                 self.event(EventKind::ModelResponse, turn, "provider response received")
@@ -1377,7 +1823,8 @@ impl Agent {
             )
             .await?;
 
-            let post_response_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+            let post_response_breaches =
+                self.budget_breaches(turn, &usage, started.elapsed(), spent);
             if !post_response_breaches.is_empty() {
                 self.emit_budget(turn, &post_response_breaches).await?;
                 terminal = Some(GoalStatus::BudgetExhausted);
@@ -1428,7 +1875,7 @@ impl Agent {
             }
 
             for call in tool_calls {
-                let mut call_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+                let call_breaches = self.budget_breaches(turn, &usage, started.elapsed(), spent);
                 if !call_breaches.is_empty() {
                     self.emit_budget(turn, &call_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -1484,9 +1931,65 @@ impl Agent {
                     .await?;
                     continue;
                 }
-                if call.name == "finish" {
-                    match self.finish_status(&call, evidence.len()) {
+                if call.name == "begin_act" {
+                    // F4 control call: no assess, no gates, no side effect —
+                    // it only ends the read-only plan phase. Every mutating
+                    // action afterwards still passes L1-L4 individually.
+                    if act_phase {
+                        let context = FailureContext::from_call(&call);
+                        let error = anyhow!("already in the act phase");
+                        self.record_tool_error_with_context(
+                            &mut history,
+                            &call,
+                            turn,
+                            EventKind::ToolBlocked,
+                            error,
+                            checkpoint_state.as_ref(),
+                            &context,
+                            FailureClass::InvalidToolCall,
+                        )
+                        .await?;
+                    } else {
+                        act_phase = true;
+                        self.emit(
+                            self.event(
+                                EventKind::PhaseChanged,
+                                turn,
+                                "plan phase complete; entering the act phase",
+                            )
+                            .tool("begin_act")
+                            .call_id(&call.id),
+                        )
+                        .await?;
+                        history.push(Message::tool_result(
+                            &call.id,
+                            "begin_act",
+                            "act phase started; mutating actions now proceed through the gates",
+                        ));
+                    }
+                } else if call.name == "finish" {
+                    match self.finish_status(&call, &evidence) {
                         Ok(status) => {
+                            if status == GoalStatus::Complete {
+                                // D3/D4: record the delivery snapshots before
+                                // the run ends; a registry failure refuses
+                                // the completion.
+                                if let Err(error) = self.record_deliverables(turn).await {
+                                    let context = FailureContext::from_call(&call);
+                                    self.record_tool_error_with_context(
+                                        &mut history,
+                                        &call,
+                                        turn,
+                                        EventKind::ToolBlocked,
+                                        error,
+                                        checkpoint_state.as_ref(),
+                                        &context,
+                                        FailureClass::InvalidToolCall,
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
                             self.emit(
                                 self.event(
                                     EventKind::FinishRequested,
@@ -1515,11 +2018,44 @@ impl Agent {
                             .await?;
                         }
                     }
+                } else if call.name == "delegate_task" {
+                    // D1 control call: the parent run itself derives the
+                    // child contract, spawns the restricted sub-agent, and
+                    // merges the child's spend into its own ledger. The
+                    // model supplied only the task text and optional
+                    // narrowing; every budget is clamped here.
+                    if let Err(error) = self
+                        .handle_delegation(
+                            &call,
+                            turn,
+                            started,
+                            spent,
+                            &mut usage,
+                            &mut spent,
+                            &mut evidence,
+                            &mut history,
+                        )
+                        .await
+                    {
+                        let context = FailureContext::from_call(&call);
+                        self.record_tool_error_with_context(
+                            &mut history,
+                            &call,
+                            turn,
+                            EventKind::ToolBlocked,
+                            error,
+                            checkpoint_state.as_ref(),
+                            &context,
+                            FailureClass::InvalidToolCall,
+                        )
+                        .await?;
+                    }
                 } else if let Some(status) = self
                     .process_tool(
                         &mut history,
                         call,
                         turn,
+                        act_phase,
                         &mut evidence,
                         &mut checkpoint_state,
                     )
@@ -1530,7 +2066,7 @@ impl Agent {
                 }
             }
             if terminal.is_none() {
-                let mut final_breaches = self.budget_breaches(turn, &usage, started.elapsed());
+                let final_breaches = self.budget_breaches(turn, &usage, started.elapsed(), spent);
                 if !final_breaches.is_empty() {
                     self.emit_budget(turn, &final_breaches).await?;
                     terminal = Some(GoalStatus::BudgetExhausted);
@@ -1582,7 +2118,238 @@ impl Agent {
             messages: history,
             usage,
             evidence,
+            turns: last_turn,
+            cost_usd: if spent.is_finite() { Some(spent) } else { None },
         })
+    }
+
+    /// D1: execute the agent-owned `delegate_task` control call. The child
+    /// contract is derived from this run's contract (never wider), the child
+    /// budget is clamped to the parent's remaining budget, and the child
+    /// writes into the same central journal through the same sink. The
+    /// child's tokens and cost are merged into the parent's ledger, so a
+    /// delegation can never be used to escape the parent's budget. Any
+    /// failure here is a tool error the parent model sees — delegation is
+    /// never fatal to the parent run.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_delegation(
+        &self,
+        call: &ToolCall,
+        turn: u32,
+        started: Instant,
+        spent_now: f64,
+        usage: &mut Usage,
+        spent: &mut f64,
+        evidence: &mut Vec<String>,
+        history: &mut Vec<Message>,
+    ) -> Result<()> {
+        let object = call
+            .args
+            .as_object()
+            .ok_or_else(|| anyhow!("delegate_task arguments must be an object"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "task" | "max_turns" | "max_cost_usd"))
+        {
+            return Err(anyhow!(
+                "delegate_task accepts only task, max_turns, and max_cost_usd"
+            ));
+        }
+        let task = call
+            .args
+            .get("task")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("delegate_task requires a string task"))?;
+        if task.trim().is_empty() {
+            return Err(anyhow!("delegate_task task must not be empty"));
+        }
+        if task.len() > 16_384 {
+            return Err(anyhow!(
+                "delegate_task task is {} bytes; the limit is 16384 bytes",
+                task.len()
+            ));
+        }
+        let grant_turns = match call.args.get("max_turns") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("max_turns must be an integer"))?
+                    .try_into()
+                    .map_err(|_| anyhow!("max_turns must fit in u32"))?,
+            ),
+        };
+        let grant_cost = match call.args.get("max_cost_usd") {
+            None => None,
+            Some(value) => {
+                let cost = value
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("max_cost_usd must be a number"))?;
+                if !cost.is_finite() || cost < 0.0 {
+                    return Err(anyhow!("max_cost_usd must be finite and >= 0"));
+                }
+                Some(cost)
+            }
+        };
+
+        // The grant is clamped to what this run still has left. The model
+        // can narrow; it can never widen — and it cannot grant what the
+        // parent no longer has.
+        let remaining_turns = self.contract.budget.max_turns.saturating_sub(turn);
+        if remaining_turns == 0 {
+            return Err(anyhow!(
+                "delegation refused: no remaining turns to grant (this is the parent run's last \
+                 turn)"
+            ));
+        }
+        if !spent_now.is_finite() {
+            return Err(anyhow!(
+                "delegation refused: cost accounting is unavailable (unpriced run)"
+            ));
+        }
+        let remaining_cost = self.contract.budget.max_cost_usd - spent_now;
+        if remaining_cost <= 0.0 {
+            return Err(anyhow!("delegation refused: no remaining cost budget"));
+        }
+        let remaining_wall = self
+            .contract
+            .budget
+            .max_wall_clock_secs
+            .checked_sub(started.elapsed())
+            .unwrap_or_default();
+        if remaining_wall.is_zero() {
+            return Err(anyhow!(
+                "delegation refused: no remaining wall-clock budget"
+            ));
+        }
+        let child_budget = pangu_boundary::Budget {
+            max_turns: grant_turns.unwrap_or(remaining_turns).min(remaining_turns),
+            max_input_tokens: self.contract.budget.max_input_tokens,
+            max_output_tokens: self.contract.budget.max_output_tokens,
+            max_cost_usd: match grant_cost {
+                Some(cost) => cost.min(remaining_cost),
+                None => remaining_cost,
+            },
+            max_wall_clock_secs: remaining_wall,
+        };
+        let sub_max_turns = child_budget.max_turns;
+        let sub_max_cost_usd = child_budget.max_cost_usd;
+        let sub_max_wall_clock_secs = child_budget.max_wall_clock_secs.as_secs();
+        let task_digest = pangu_core::hex_sha256(task);
+        let child_contract = self
+            .contract
+            .derive_sub_contract(task, child_budget)
+            .map_err(|error| anyhow!("delegation refused: {error}"))?;
+        let factory = self
+            .delegation
+            .as_ref()
+            .ok_or_else(|| anyhow!("delegation refused: no sub-tool factory attached"))?;
+        let child_tools = factory.build(self.contract.verify_command.clone())?;
+        let mut providers = vec![self.provider.clone()];
+        providers.extend(self.fallbacks.iter().cloned());
+        let child = Agent::with_chain(
+            child_contract.clone(),
+            self.policy.clone(),
+            self.sandbox.clone(),
+            providers,
+            child_tools,
+            self.approval.clone(),
+            self.event_sink.clone(),
+        )?;
+
+        self.emit(
+            self.event(
+                EventKind::TaskDelegated,
+                turn,
+                format!(
+                    "subtask delegated (task digest {}); child contract {}",
+                    &task_digest[..12],
+                    &child_contract.digest()[..12]
+                ),
+            )
+            .tool("delegate_task")
+            .call_id(&call.id)
+            .payload(serde_json::json!({
+                "task_sha256": task_digest,
+                "task_bytes": task.len(),
+                "sub_contract_digest": child_contract.digest(),
+                "sub_max_turns": sub_max_turns,
+                "sub_max_cost_usd": sub_max_cost_usd,
+                "sub_max_wall_clock_secs": sub_max_wall_clock_secs,
+            })),
+        )
+        .await?;
+
+        // The child writes into the same journal and approval surface as
+        // the parent; nothing about the delegation bypasses the gates.
+        //
+        // A sub-agent shares the parent's workspace, so it must hold the
+        // workspace write lock while it runs: two writers touching the same
+        // files would race, and the resulting state would match neither run's
+        // recorded actions. The lock is taken here rather than inside the child
+        // so that the wait is attributable to the delegation as a whole.
+        //
+        // Waiting is bounded. A holder that died without releasing (crash,
+        // SIGKILL) leaves the file behind and nothing will ever remove it, so an
+        // unbounded wait would hang the parent run forever instead of reporting
+        // a problem. On expiry this is a normal tool error: the delegation fails
+        // closed, the parent keeps running, and the message names the holder so
+        // an operator can act. The lock file is never deleted to force progress.
+        let _workspace_lock = if self.delegation_needs_workspace_lock() {
+            Some(pangu_core::WorkspaceLock::acquire(
+                &self.sandbox.workspace,
+                pangu_core::LockMode::Write,
+                self.delegation_lock_timeout,
+            )?)
+        } else {
+            None
+        };
+
+        // Boxed because a parent run containing a child run is (bounded)
+        // structural recursion.
+        let outcome = Box::pin(child.run()).await?;
+        drop(_workspace_lock);
+        usage.merge(&outcome.usage);
+        if let Some(cost) = outcome.cost_usd {
+            *spent += cost;
+        }
+        evidence.push(format!(
+            "delegate: {} -> {} (turns={})",
+            &task_digest[..12],
+            outcome.status.as_str(),
+            outcome.turns
+        ));
+        let summary = outcome
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::Assistant { content, .. } if !content.trim().is_empty() => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .map(|content| truncate_middle(&redact_text(&content), 4000))
+            .unwrap_or_else(|| "(no final assistant message)".to_string());
+        let cost_text = match outcome.cost_usd {
+            Some(cost) => format!("${cost:.4}"),
+            None => "unpriced".to_string(),
+        };
+        history.push(Message::tool_result(
+            &call.id,
+            "delegate_task",
+            format!(
+                "subtask {} finished: {} (turns={}, tokens in={}, out={}, cost={})\n\n{}",
+                &task_digest[..12],
+                outcome.status.as_str(),
+                outcome.turns,
+                outcome.usage.input_tokens,
+                outcome.usage.output_tokens,
+                cost_text,
+                summary
+            ),
+        ));
+        Ok(())
     }
 
     async fn process_tool(
@@ -1590,6 +2357,7 @@ impl Agent {
         history: &mut Vec<Message>,
         call: ToolCall,
         turn: u32,
+        act_phase: bool,
         evidence: &mut Vec<String>,
         checkpoint_state: &mut Option<checkpoint::RunCheckpointState>,
     ) -> Result<Option<GoalStatus>> {
@@ -1640,6 +2408,27 @@ impl Agent {
                 return Ok(None);
             }
         };
+        // F4: in the plan phase the run is read-only. Mutating actions are
+        // refused before any gate can approve them; only the typed `begin_act`
+        // control call ends the phase, and it executes nothing.
+        if !act_phase && assessment.risk.at_least(pangu_boundary::Risk::Reversible) {
+            let context = FailureContext::from_assessment(&call, &assessment);
+            let error = pangu_core::Error::Denied {
+                reason: "plan phase is read-only; call `begin_act` before any mutating action"
+                    .into(),
+            };
+            self.tool_blocked_with_context(
+                history,
+                &call,
+                turn,
+                error,
+                checkpoint_state.as_ref(),
+                &context,
+                FailureClass::PolicyDenied,
+            )
+            .await?;
+            return Ok(None);
+        }
         if let Err(error) = assessment.validate_effect() {
             let context = FailureContext::from_assessment(&call, &assessment);
             self.tool_blocked_with_context(
@@ -1762,11 +2551,19 @@ impl Agent {
         }
 
         let resource_request = ResourceRequest {
-            read_paths: assessment.read_paths,
-            write_paths: assessment.write_paths,
-            hosts: assessment.hosts,
-            argv: assessment.argv,
-            cwd: assessment.cwd,
+            read_paths: assessment.read_paths.clone(),
+            write_paths: assessment.write_paths.clone(),
+            hosts: assessment.hosts.clone(),
+            argv: assessment.argv.clone(),
+            cwd: assessment.cwd.clone(),
+            // B3/B2: `propose_memory` writes and `read_skill` reads exactly
+            // one Pangu-owned location (declared in their manifest entries)
+            // whose path comes from the operator's config, never from model
+            // output. The forbidden globs exist to keep model-controlled tool
+            // paths out of Pangu-owned storage; the sanctioned tools
+            // themselves are validated with the internal rule set (root
+            // containment, symlinks, limits) instead.
+            internal: call.name == "propose_memory" || call.name == "read_skill",
         };
         let resources = match self.sandbox.validate_resources(&resource_request) {
             Ok(resources) => resources,
@@ -1824,6 +2621,28 @@ impl Agent {
                 invariant: decision.invariant.clone(),
                 preview: truncate_middle(&redact_text(&assessment.preview), 16 * 1024),
                 args: approval_args(&call.args),
+                impact: pangu_boundary::ApprovalImpact {
+                    command: (!assessment.argv.is_empty())
+                        .then(|| truncate_middle(&redact_text(&assessment.argv.join(" ")), 4_096)),
+                    network: (!assessment.hosts.is_empty()).then(|| assessment.hosts.join(", ")),
+                    reads: resources
+                        .read_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                    writes: resources
+                        .write_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                    cwd: assessment
+                        .cwd
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    // F4: show what would change, bounded and redacted; honest
+                    // summary when no inline diff is possible.
+                    diffs: write_file_diffs(&call, &resources),
+                },
             };
             self.emit(
                 self.event(
@@ -1886,6 +2705,35 @@ impl Agent {
                 }
             }
         }
+
+        // Serialise this action against other agents touching the same files.
+        //
+        // The lock is per path, not per workspace: two agents editing different
+        // files must not wait for each other, and only overlapping paths need
+        // serialising. `acquire_for_action` sorts the keys, so a call touching
+        // several paths cannot deadlock against another call touching the same
+        // paths in a different order.
+        //
+        // When this action edits a build file, the owning *module* is locked as
+        // well, because a build edit changes which files the module owns. The
+        // module map is only consulted when it is confident: a wrong map fails
+        // silently, letting two agents into one module with nothing reported.
+        //
+        // Taken after approval, so a denied action never reserves paths. Held
+        // only for the duration of the tool call; every lock taken is released
+        // on drop if the call fails, so a failed action cannot strand a lock
+        // the rest of the run would wait on.
+        let _path_locks = if self.workspace_path_lock {
+            Some(pangu_core::PathLock::acquire_for_action_with_modules(
+                &self.sandbox.workspace,
+                &resources.read_paths,
+                &resources.write_paths,
+                self.module_map.as_deref(),
+                self.path_lock_timeout,
+            )?)
+        } else {
+            None
+        };
 
         let action = VerifiedAction::new(call.clone(), resources, Arc::clone(&self.sandbox));
         let started_event = self
@@ -1973,7 +2821,44 @@ impl Agent {
                         })),
                     )
                     .await?;
+                // B3: audit the proposal into the journal. The event carries
+                // the candidate id and content digest, never the raw content:
+                // model text may contain secrets, and the store is the only
+                // place the full content lives.
+                if call.name == "propose_memory" {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&output.content) {
+                        let id = parsed.get("id").and_then(Value::as_str);
+                        let digest = parsed.get("content_sha256").and_then(Value::as_str);
+                        if let (Some(id), Some(digest)) = (id, digest) {
+                            self.emit(
+                                self.event(
+                                    EventKind::MemoryProposed,
+                                    turn,
+                                    format!("memory candidate {id} queued for operator review"),
+                                )
+                                .tool(&call.name)
+                                .call_id(&call.id)
+                                .action_digest(action_digest.clone())
+                                .payload(serde_json::json!({
+                                    "id": id,
+                                    "content_sha256": digest,
+                                    "status": "pending",
+                                })),
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 let mut checkpoint_error: Option<(&'static str, anyhow::Error)> = None;
+                let mut completed_checkpoint: Option<checkpoint::CheckpointCommit> = None;
+                // The node must record the conversation as it will stand once
+                // this tool result is in it. Computing it from the pre-push
+                // history would make the node point at a state the conversation
+                // never held, and `pangu session replay` would then report a
+                // digest that matches no snapshot.
+                let history_digest = Self::history_digest_after_tool_result(
+                    history, &call.id, &call.name, &content,
+                )?;
                 if let (Some(runtime), Some(state)) =
                     (self.checkpoint.as_ref(), checkpoint_state.as_mut())
                 {
@@ -1982,36 +2867,13 @@ impl Agent {
                         .await
                     {
                         Ok(()) => {
-                            match runtime.commit_after_success(state, &finished_event, effect) {
-                                Ok(commit) => {
-                                    self.emit(
-                                    Event::new_v2(
-                                        EventKind::CheckpointCreated,
-                                        turn,
-                                        "checkpoint created",
-                                    )
-                                    .tool("checkpoint")
-                                    .call_id(&commit.artifact.session_node_id)
-                                    .effect_scope("session")
-                                    .reversibility("reversible")
-                                    .action_digest(pangu_core::hex_sha256(&format!(
-                                        "checkpoint:{}",
-                                        commit.artifact.event_ref.event_id
-                                    )))
-                                    .external_mutation(false)
-                                    .payload(serde_json::json!({
-                                        "checkpoint_id": commit.artifact.checkpoint_id,
-                                        "session_node_id": commit.artifact.session_node_id,
-                                        "event_ref": commit.artifact.event_ref,
-                                        "snapshot_digest": commit.artifact.snapshot_digest,
-                                        "workspace_digest": commit.artifact.workspace_digest,
-                                        "contract_digest": commit.artifact.contract_digest,
-                                        "policy_digest": commit.artifact.policy_digest,
-                                        "parent_checkpoint_id": commit.artifact.parent_checkpoint_id,
-                                    })),
-                                )
-                                .await?;
-                                }
+                            match runtime.commit_after_success(
+                                state,
+                                &finished_event,
+                                effect,
+                                history_digest.as_deref(),
+                            ) {
+                                Ok(commit) => completed_checkpoint = Some(commit),
                                 Err(error) => checkpoint_error = Some(("snapshot", error)),
                             }
                         }
@@ -2029,6 +2891,31 @@ impl Agent {
                     .map(|message| format!("{content}\n[checkpoint failed: {message}]"))
                     .unwrap_or(content);
                 history.push(Message::tool_result(&call.id, &call.name, history_content));
+                if let Some(commit) = completed_checkpoint {
+                    self.emit(
+                        Event::new_v2(EventKind::CheckpointCreated, turn, "checkpoint created")
+                            .tool("checkpoint")
+                            .call_id(&commit.artifact.session_node_id)
+                            .effect_scope("session")
+                            .reversibility("reversible")
+                            .action_digest(pangu_core::hex_sha256(&format!(
+                                "checkpoint:{}",
+                                commit.artifact.event_ref.event_id
+                            )))
+                            .external_mutation(false)
+                            .payload(serde_json::json!({
+                                "checkpoint_id": commit.artifact.checkpoint_id,
+                                "session_node_id": commit.artifact.session_node_id,
+                                "event_ref": commit.artifact.event_ref,
+                                "snapshot_digest": commit.artifact.snapshot_digest,
+                                "workspace_digest": commit.artifact.workspace_digest,
+                                "contract_digest": commit.artifact.contract_digest,
+                                "policy_digest": commit.artifact.policy_digest,
+                                "parent_checkpoint_id": commit.artifact.parent_checkpoint_id,
+                            })),
+                    )
+                    .await?;
+                }
                 if let Some((failure_stage, error)) = checkpoint_error {
                     let safe_error = truncate_middle(
                         &redact_text(&error.to_string()),
@@ -2180,7 +3067,8 @@ impl Agent {
         Ok(())
     }
 
-    fn finish_status(&self, call: &ToolCall, evidence_count: usize) -> Result<GoalStatus> {
+    fn finish_status(&self, call: &ToolCall, evidence: &[String]) -> Result<GoalStatus> {
+        let evidence_count = evidence.len();
         let object = call
             .args
             .as_object()
@@ -2202,7 +3090,84 @@ impl Agent {
         {
             return Ok(GoalStatus::Failed);
         }
+        // D3/D4: a `complete` over declared deliverables must pass every
+        // acceptance check. Failures come back as a tool error so the model
+        // can repair the artifact and retry - an Aider-style verify loop at
+        // the finish gate.
+        if status == GoalStatus::Complete && !self.contract.deliverables.deliverables.is_empty() {
+            let has_verify_evidence = evidence.iter().any(|item| item.starts_with("verify:"));
+            let mut failures = Vec::new();
+            for frozen in &self.contract.deliverables.deliverables {
+                let spec = pangu_core::DeliverableSpec::from(frozen);
+                let outcome = pangu_core::deliverable::check_spec(
+                    &spec,
+                    self.contract.workspace(),
+                    has_verify_evidence,
+                );
+                if !outcome.passed {
+                    failures.push(format!("  - {}: {}", spec.name, outcome.detail));
+                }
+            }
+            if !failures.is_empty() {
+                return Err(anyhow!(
+                    "deliverable acceptance failed ({} of {}); fix and call finish again:\n{}",
+                    failures.len(),
+                    self.contract.deliverables.deliverables.len(),
+                    failures.join("\n")
+                ));
+            }
+        }
         Ok(status)
+    }
+
+    /// D3/D4: record every declared deliverable into the registry and emit
+    /// one `DeliverableRecorded` event per artifact. Called only after all
+    /// acceptance checks passed; a registry failure refuses the `complete`
+    /// the same way a failed check does - an unaudited completion is not a
+    /// completion.
+    async fn record_deliverables(&self, turn: u32) -> Result<()> {
+        let Some(store) = self.deliverables.as_ref() else {
+            return Ok(());
+        };
+        for frozen in &self.contract.deliverables.deliverables {
+            let spec = pangu_core::DeliverableSpec::from(frozen);
+            let outcome =
+                pangu_core::deliverable::check_spec(&spec, self.contract.workspace(), false);
+            let sha256 = outcome.sha256.ok_or_else(|| {
+                anyhow!(
+                    "deliverable `{}` disappeared between the finish check and recording",
+                    spec.name
+                )
+            })?;
+            let bytes = outcome.bytes.unwrap_or(0);
+            store
+                .record(&spec, &sha256, bytes, None)
+                .map_err(|error| anyhow!("deliverable registry: {error}"))?;
+            self.emit(
+                self.event(
+                    EventKind::DeliverableRecorded,
+                    turn,
+                    format!(
+                        "deliverable `{}` recorded: {} bytes={} sha256={}",
+                        spec.name,
+                        spec.path,
+                        bytes,
+                        &sha256[..12]
+                    ),
+                )
+                .tool("finish")
+                .payload(serde_json::json!({
+                    "name": spec.name,
+                    "path": spec.path,
+                    "kind": spec.kind,
+                    "acceptor": spec.acceptor.as_str(),
+                    "sha256": sha256,
+                    "bytes": bytes,
+                })),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn budget_breaches(
@@ -2210,21 +3175,106 @@ impl Agent {
         turn: u32,
         usage: &Usage,
         elapsed: std::time::Duration,
+        spent: f64,
     ) -> Vec<pangu_boundary::Breach> {
-        let cost = self
-            .contract
-            .price
-            .map(|price| price.cost_usd(usage))
-            // An absent price is not zero cost. Treat it as an unknown,
-            // unbudgeted provider and fail closed before the next request.
-            .unwrap_or(f64::INFINITY);
+        // B5: the spend is accumulated per segment — each response's usage is
+        // priced by the provider that served it — so a fallback switch can
+        // never under-count cost. An absent primary price starts the run at
+        // INFINITY, which preserves the old fail-closed behavior.
         self.contract.budget.check(
             turn,
             usage.input_tokens.saturating_add(usage.cache_read_tokens),
             usage.output_tokens,
-            cost,
+            spent,
             elapsed,
         )
+    }
+
+    /// B5: the provider at a chain position (0 = primary).
+    fn provider_for(&self, active: usize) -> &Arc<dyn Provider> {
+        if active == 0 {
+            &self.provider
+        } else {
+            self.fallbacks
+                .get(active - 1)
+                .expect("active position within the declared chain")
+        }
+    }
+
+    /// B5: the price of the provider at a chain position, from the frozen
+    /// contract (primary) or the frozen candidate list (fallbacks).
+    fn active_price(&self, active: usize) -> Option<pangu_core::Price> {
+        if active == 0 {
+            self.contract.price
+        } else {
+            let candidate = self.contract.fallbacks.get(active - 1)?;
+            Some(pangu_core::Price {
+                input_usd_per_mtok: candidate.input_usd_per_mtok,
+                output_usd_per_mtok: candidate.output_usd_per_mtok,
+            })
+        }
+    }
+
+    fn provider_label(&self, active: usize) -> String {
+        let provider = self.provider_for(active);
+        format!("{}/{}", provider.name(), provider.model())
+    }
+
+    /// B5: run the declared chain. On a chat failure the next declared
+    /// candidate is tried; every failed attempt and every successful switch
+    /// is audited. The active position persists across turns — the run never
+    /// silently jumps back to the primary.
+    async fn chat_with_fallback(
+        &self,
+        active: &mut usize,
+        turn: u32,
+        messages: Vec<Message>,
+        specs: Vec<pangu_core::ToolSpec>,
+    ) -> Result<ChatResponse> {
+        let total = 1 + self.fallbacks.len();
+        let mut attempt = *active;
+        let mut last_error = String::from("unknown");
+        loop {
+            let provider = self.provider_for(attempt);
+            match provider.chat(messages.clone(), specs.clone()).await {
+                Ok(response) => {
+                    if attempt != *active {
+                        let from = self.provider_label(*active);
+                        let to = self.provider_label(attempt);
+                        self.emit(self.event(
+                            EventKind::ProviderSwitched,
+                            turn,
+                            format!(
+                                "provider fallback: {from} -> {to}; prior attempt failed: \
+                                     {last_error}"
+                            ),
+                        ))
+                        .await?;
+                        *active = attempt;
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let reason = redact_text(&error.to_string());
+                    self.emit(self.event(
+                        EventKind::Note,
+                        turn,
+                        format!(
+                            "provider attempt failed: {}: {reason}",
+                            self.provider_label(attempt)
+                        ),
+                    ))
+                    .await?;
+                    last_error = reason;
+                    attempt += 1;
+                    if attempt >= total {
+                        return Err(anyhow!(
+                            "all declared providers failed; last error: {last_error}"
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     async fn emit_budget(&self, turn: u32, breaches: &[pangu_boundary::Breach]) -> Result<()> {
@@ -2264,6 +3314,29 @@ impl Agent {
             .as_ref()
             .map(|runtime| runtime.failure_policy())
             .unwrap_or(CheckpointFailurePolicy::FailRun)
+    }
+
+    /// The conversation digest as it will stand once this tool result lands.
+    ///
+    /// Computed through `ConversationSnapshot::new`, which is the same
+    /// constructor `ConversationRuntime::save` uses — including its redaction
+    /// step. Reimplementing the encoding here would produce a digest that can
+    /// never match a stored snapshot, which is worse than no digest at all: it
+    /// would look like evidence.
+    ///
+    /// Works whether or not the caller's history is already redacted, because
+    /// redaction is idempotent for the values this stores.
+    fn history_digest_after_tool_result(
+        history: &[Message],
+        call_id: &str,
+        tool: &str,
+        content: &str,
+    ) -> Result<Option<String>> {
+        let mut projected = history.to_vec();
+        projected.push(Message::tool_result(call_id, tool, content));
+        let snapshot =
+            pangu_core::ConversationSnapshot::new("node-digest-projection", "", projected)?;
+        Ok(Some(snapshot.history_digest))
     }
 }
 
@@ -2370,6 +3443,11 @@ pub struct Outcome {
     pub messages: Vec<Message>,
     pub usage: Usage,
     pub evidence: Vec<String>,
+    /// F5: number of the last turn executed (trajectory summary).
+    pub turns: u32,
+    /// F5: total priced cost of the run; `None` when the primary model has
+    /// no declared price. Unpriced is distinguishable from free.
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2381,4 +3459,47 @@ pub struct RollbackOutcome {
     /// new restore. A repeated idempotent call returns `None` because it did
     /// not create another node.
     pub session_node_id: Option<String>,
+}
+
+/// F4: bounded, redacted content diff for a `write_file` approval preview.
+/// Says honestly when no inline diff is possible (non-regular target, too
+/// large, non-UTF-8, unreadable) instead of faking a "new file" diff. The
+/// read is display-only: the path is already validated as a write target.
+fn write_file_diffs(call: &ToolCall, resources: &ValidatedResources) -> Vec<String> {
+    const MAX_INLINE_BYTES: u64 = 256 * 1024;
+    const DIFF_CAP: usize = 8 * 1024;
+    if call.name != "write_file" {
+        return Vec::new();
+    }
+    let Some(content) = call.args.get("content").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(path) = resources.write_paths.first() else {
+        return Vec::new();
+    };
+    let shown = path.display().to_string();
+    let diff = match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            format!("`{shown}` exists and is not a regular file; inline diff unavailable")
+        }
+        Ok(meta) if meta.len() > MAX_INLINE_BYTES => {
+            format!(
+                "existing `{shown}` is {} bytes; too large for an inline diff",
+                meta.len()
+            )
+        }
+        Ok(_) => match std::fs::read_to_string(path) {
+            Ok(old) => pangu_core::unified_diff(&old, content, &shown, DIFF_CAP),
+            Err(_) => {
+                format!("existing `{shown}` is not valid UTF-8; inline diff unavailable")
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            pangu_core::unified_diff("", content, &shown, DIFF_CAP)
+        }
+        Err(error) => {
+            format!("existing `{shown}` could not be read ({error}); inline diff unavailable")
+        }
+    };
+    vec![truncate_middle(&redact_text(&diff), DIFF_CAP)]
 }

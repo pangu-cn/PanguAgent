@@ -99,7 +99,7 @@ impl CheckpointRuntime {
         let run_id = format!("run_{}_{}_{}", self.contract_digest, nanos, nonce);
         let session_id = format!("session_{}_{}", nanos, nonce);
         RunCheckpointState {
-            session_node_id: format!("node_root_{}_{}", nanos, nonce),
+            session_node_id: format!("{}{}_{}", pangu_core::ROOT_NODE_PREFIX, nanos, nonce),
             run_id,
             session_id,
             parent_checkpoint_id: None,
@@ -199,6 +199,7 @@ impl CheckpointRuntime {
         state: &mut RunCheckpointState,
         finished_event: &Event,
         effect: EffectDescriptor,
+        history_digest: Option<&str>,
     ) -> Result<CheckpointCommit> {
         if finished_event.kind != pangu_core::EventKind::ToolFinished {
             bail!("checkpoint source event must be a successful ToolFinished event");
@@ -241,6 +242,23 @@ impl CheckpointRuntime {
             Some(artifact.checkpoint_id.clone()),
         );
         node.parent_session_node_id = Some(state.session_node_id.clone());
+        // Record what the conversation looked like when this node was created.
+        //
+        // This field existed and was validated from the start, but was never
+        // assigned: a node could not say which conversation state it belonged
+        // to. It is filled here, at the only point where both facts are known
+        // together — the node being created and the history as it stands.
+        //
+        // `None` is honest when there is no conversation to digest (checkpoint
+        // without persistence, or a caller that has no history): the node then
+        // says nothing rather than carrying an empty-string digest that would
+        // look like a real value.
+        if let Some(digest) = history_digest {
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("history digest must be a 64-character hex SHA-256 digest");
+            }
+            node.history_digest = Some(digest.to_string());
+        }
         let artifact =
             self.store
                 .commit_snapshot_with_node(&self.request(), artifact, Some(&node))?;

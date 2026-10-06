@@ -28,6 +28,27 @@ pub enum EventKind {
     FinishRequested,
     RunFinished,
     Note,
+    /// F4: the run moved between the read-only plan phase and the act phase
+    /// (`begin_act` control call). Not an action and never an authorization:
+    /// every act-phase mutation still passes L1-L4.
+    PhaseChanged,
+    /// B5: the run switched to a declared fallback provider after the prior
+    /// provider failed. The chain is frozen in the contract; a switch is
+    /// never silent and per-segment cost accounting uses the new price.
+    ProviderSwitched,
+    /// B3: the model proposed a memory candidate. The proposal is inert
+    /// data until an operator accepts it; events carry the content digest,
+    /// never the raw content.
+    MemoryProposed,
+    /// D3/D4: a declared deliverable passed its run-time acceptance checks
+    /// and was recorded into the registry (path, SHA-256, bytes) when the
+    /// run completed. Human acceptance happens outside the run via the CLI.
+    DeliverableRecorded,
+    /// D1: the run delegated a bounded subtask to a restricted sub-agent.
+    /// The child contract is derived from the parent's (never wider), the
+    /// child writes into the same central journal, and the event carries the
+    /// task digest and clamped budgets — never the raw task text.
+    TaskDelegated,
     CheckpointCreated,
     CheckpointFailed,
     RollbackRequested,
@@ -790,6 +811,12 @@ pub struct JournalMeta {
     pub unattended: bool,
     #[serde(default)]
     pub config_files: Vec<String>,
+    /// C5: the operator's declared execution backend. A declaration, not a
+    /// verified fact; absent for undeclared (default local) runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_description: Option<String>,
 }
 
 impl JournalMeta {

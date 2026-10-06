@@ -8,6 +8,7 @@ use pangu_core::{Error, Result};
 
 use crate::approval::ApprovalMode;
 use crate::budget::Budget;
+use crate::execution::ExecutionSection;
 use crate::policy::{Policy, Rule};
 use crate::sandbox::{absolute_path, absolute_path_from, Sandbox};
 
@@ -34,6 +35,127 @@ pub struct Config {
     pub goal: GoalSection,
     pub rules: Vec<Rule>,
     pub unattended: bool,
+    /// C5: the declared execution backend. A declaration, not a verified
+    /// fact; frozen into the contract and recorded in `RunStarted`.
+    #[serde(default)]
+    pub execution: ExecutionSection,
+    /// F3: the lint/test command the `verify` tool runs. Empty = the tool
+    /// is not advertised, exactly as if F3 were not compiled in.
+    #[serde(default)]
+    pub verify: VerifySection,
+    /// B3: the controlled memory candidate queue. Disabled by default: no
+    /// tool, no injection, no digest change.
+    #[serde(default)]
+    pub memory: MemorySection,
+    /// B2: the skill registry. Disabled by default: nothing loads.
+    #[serde(default)]
+    pub skills: SkillsSection,
+    /// F5: the evaluation profile. Undeclared by default: no eval semantics,
+    /// no digest change.
+    #[serde(default)]
+    pub eval: EvalSection,
+}
+
+/// B3: controlled memory candidate queue configuration. Disabled by default:
+/// the `propose_memory` tool does not exist, nothing is injected, and the
+/// contract digest is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemorySection {
+    pub enabled: bool,
+    pub max_pending: usize,
+    pub max_content_bytes: usize,
+    pub max_kind_bytes: usize,
+    pub max_injected: usize,
+    pub max_injected_bytes: usize,
+}
+
+impl Default for MemorySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_pending: 256,
+            max_content_bytes: 4_096,
+            max_kind_bytes: 32,
+            max_injected: 24,
+            max_injected_bytes: 16_384,
+        }
+    }
+}
+
+/// B2: skill registry configuration. Disabled by default: nothing loads,
+/// nothing is advertised, nothing is injected, digests are unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillsSection {
+    pub enabled: bool,
+    /// Pinned ed25519 public key (64 hex chars). Empty = signatures are not
+    /// checked and packages load with an honest `unsigned` marker.
+    pub verify_key: String,
+    pub max_skills: usize,
+    pub max_files: usize,
+    pub max_file_bytes: usize,
+    pub max_doc_bytes: usize,
+    pub max_index_skills: usize,
+    pub max_index_bytes: usize,
+}
+
+impl Default for SkillsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            verify_key: String::new(),
+            max_skills: 64,
+            max_files: 64,
+            max_file_bytes: 262_144,
+            max_doc_bytes: 65_536,
+            max_index_skills: 48,
+            max_index_bytes: 8_192,
+        }
+    }
+}
+
+/// F5: issue-to-patch evaluation profile. An empty `profile` means no
+/// evaluation semantics: nothing is frozen, nothing is recorded, digests and
+/// runs are exactly as before. A declared profile pins the issue document
+/// (by path; the content digest is taken at run start) so one run can be
+/// reproduced and audited as an experiment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EvalSection {
+    /// Profile name (lowercase letters, digits, hyphen; 1-64 chars). Empty =
+    /// evaluation not declared.
+    pub profile: String,
+    /// Workspace-relative path of the issue document. Must be a safe
+    /// workspace-relative path and must not live under `.pangu`.
+    pub issue_path: String,
+}
+
+impl EvalSection {
+    /// F5: whether an evaluation profile is declared.
+    pub fn is_declared(&self) -> bool {
+        !self.profile.trim().is_empty()
+    }
+}
+
+impl SkillsSection {
+    /// The runtime limits derived from this section.
+    pub fn limits(&self) -> pangu_core::SkillLimits {
+        pangu_core::SkillLimits {
+            max_skills: self.max_skills,
+            max_files: self.max_files,
+            max_file_bytes: self.max_file_bytes,
+            max_doc_bytes: self.max_doc_bytes,
+            max_index_skills: self.max_index_skills,
+            max_index_bytes: self.max_index_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct VerifySection {
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -186,11 +308,27 @@ impl CheckpointSection {
         // than what it claims to be. Both are rejected here rather than at
         // snapshot time, so the mistake is reported before a run starts.
         for (index, exclude) in self.exclude_roots.iter().enumerate() {
+            // Containment is decided first, and decided from the *spelling*.
+            //
+            // `absolute_path_from` rejects `..` outright, so a rule like
+            // `../elsewhere` fails there. Reporting that would send the operator
+            // looking for a traversal bug in a config field whose actual mistake
+            // is "this exclusion points outside the workspace" — and the verdict
+            // would differ between platforms, because on Windows a canonicalized
+            // workspace plus `..` can normalize away before the rejection is
+            // reached. Same config, same mistake, one message.
+            //
+            // Only the `..` spelling is handled here. An absolute path is *not*
+            // suspicious by itself: the contract normalizes exclusions to
+            // absolute paths before revalidating them, so rejecting one would
+            // break every valid configuration. Containment below covers those.
+            if exclude.components().any(escapes_workspace) {
+                return Err(Error::Config(format!(
+                    "checkpoint.exclude_roots[{index}] must be a subdirectory of the workspace"
+                )));
+            }
             let path = absolute_path_from(&workspace, exclude)?;
             let resolved = canonicalize_with_missing(&path)?;
-            // Containment first, symlink check second. A `../escape` also
-            // fails the symlink-component test, and reporting that instead
-            // would send the operator looking for a symlink that is not there.
             if !path_starts_with(&resolved, &workspace) || same_path(&resolved, &workspace) {
                 return Err(Error::Config(format!(
                     "checkpoint.exclude_roots[{index}] must be a subdirectory of the workspace"
@@ -210,6 +348,15 @@ impl CheckpointSection {
         }
         Ok(())
     }
+}
+
+/// True for a `..` component, i.e. a path spelling that leaves its base.
+///
+/// Used to decide "outside the workspace" from the spelling, before any
+/// platform-specific path normalization can turn one mistake into two different
+/// messages.
+fn escapes_workspace(component: std::path::Component<'_>) -> bool {
+    matches!(component, std::path::Component::ParentDir)
 }
 
 pub(crate) fn canonicalize_with_missing(path: &Path) -> Result<PathBuf> {
@@ -291,7 +438,17 @@ fn path_has_symlink_component_under(base: &Path, path: &Path) -> bool {
 #[serde(deny_unknown_fields, default)]
 pub struct ModelSection {
     pub protocol: Option<String>,
+    /// B4: name of a built-in registry preset (`pangu models list`). Naming
+    /// the provider opts into its endpoint/key defaults and its price table
+    /// for known models; explicit config values always win.
+    pub provider: Option<String>,
     pub model: Option<String>,
+    /// B5: fallback candidates, tried in order after the primary fails.
+    /// Every candidate is fully resolved and capability-checked at config
+    /// time; the declared chain is frozen into the contract and switches are
+    /// audited — fallback is never silent and never implicit.
+    #[serde(default)]
+    pub fallback: Vec<FallbackCandidate>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub temperature: Option<f32>,
@@ -299,6 +456,29 @@ pub struct ModelSection {
     pub input_usd_per_mtok: Option<f64>,
     pub output_usd_per_mtok: Option<f64>,
     pub request_timeout_secs: Option<u64>,
+}
+
+/// B5: one declared fallback candidate. Field semantics mirror the primary
+/// `[model]` section; registry resolution and capability checks apply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct FallbackCandidate {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub input_usd_per_mtok: Option<f64>,
+    pub output_usd_per_mtok: Option<f64>,
+}
+
+/// A fully resolved fallback candidate (config-time output).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedFallback {
+    pub model: String,
+    pub base_url: String,
+    pub api_key_env: Option<String>,
+    pub input_usd_per_mtok: f64,
+    pub output_usd_per_mtok: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -317,6 +497,64 @@ pub struct BoundarySection {
     pub env: EnvSection,
     pub max_write_bytes: usize,
     pub max_paths_per_action: usize,
+    /// F3: extra programs admitted to the read-only argv allow-list, for
+    /// verify commands such as `cargo`/`npm`. Each entry must be a bare
+    /// program name; declaring one does not weaken path/host checks.
+    #[serde(default)]
+    pub extra_readonly_commands: Vec<String>,
+    /// D1: allow the model to delegate bounded subtasks to restricted
+    /// sub-agents. Default off keeps historical digests and runs unchanged;
+    /// a sub-agent's budget is always clamped to the parent's remaining
+    /// budget and its contract is derived, never model-supplied.
+    #[serde(default)]
+    pub allow_delegation: bool,
+    /// How long a tool call waits for the paths it touches before failing
+    /// closed.
+    ///
+    /// Every tool call takes a lock per path, so two agents editing the same
+    /// file serialise while agents editing different files run in parallel. A
+    /// lock left by a killed process is why the wait is bounded at all.
+    #[serde(default = "default_workspace_lock_wait_secs")]
+    pub workspace_lock_wait_secs: u64,
+    /// Whether tool calls take per-path locks. Default on.
+    ///
+    /// Turning this off removes all cross-process serialisation of workspace
+    /// writes: two agents may then edit one file concurrently and the result
+    /// matches neither one's recorded actions. Only disable it when the
+    /// deployment serialises writers some other way.
+    #[serde(default = "default_true")]
+    pub workspace_path_locks: bool,
+    /// Whether a delegated sub-agent additionally excludes the **whole**
+    /// workspace while it runs. Default off.
+    ///
+    /// The child's own tool calls take per-path locks, so this is only for
+    /// callers that need to stop unrelated work too. Enabling it makes two
+    /// agents in one repository block each other even when their files do not
+    /// overlap.
+    #[serde(default)]
+    pub delegation_workspace_lock: bool,
+    /// Whether a build-file edit additionally locks its build module. Default
+    /// on.
+    ///
+    /// With this on, a workspace organised into build modules (Cargo crates,
+    /// Gradle subprojects, Maven modules, npm workspaces) lets one agent own a
+    /// module while agents in sibling modules proceed. Only a module map that
+    /// parsed completely is used: a partial map would place files in the wrong
+    /// module while looking authoritative, and a wrong map fails silently —
+    /// two agents would run in one module with no lock reporting anything.
+    #[serde(default = "default_true")]
+    pub workspace_module_locks: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Default wait for the shared workspace lock: long enough to outlast an
+/// ordinary sibling delegation, short enough that a stale lock is reported
+/// rather than experienced as a hang.
+fn default_workspace_lock_wait_secs() -> u64 {
+    120
 }
 
 pub type BoundaryConfig = BoundarySection;
@@ -334,6 +572,9 @@ impl Default for BoundarySection {
                 "**/secrets/**".into(),
                 "**/*.pem".into(),
                 "**/id_rsa*".into(),
+                // B3: Pangu-owned storage (journal, checkpoints, conversation
+                // store, memory queue) is never tool-writable.
+                "**/.pangu/**".into(),
             ],
             approval: ApprovalSection::default(),
             max_tool_output_bytes: 16_384,
@@ -344,6 +585,12 @@ impl Default for BoundarySection {
             env: EnvSection::default(),
             max_write_bytes: 4_194_304,
             max_paths_per_action: 64,
+            extra_readonly_commands: Vec::new(),
+            allow_delegation: false,
+            workspace_lock_wait_secs: default_workspace_lock_wait_secs(),
+            workspace_path_locks: true,
+            delegation_workspace_lock: false,
+            workspace_module_locks: true,
         }
     }
 }
@@ -411,6 +658,15 @@ pub struct GoalSection {
     pub require_evidence: bool,
     pub min_successful_tool_calls: u32,
     pub system_prompt: String,
+    /// D3/D4: declared deliverables. Empty = no deliverable semantics, runs
+    /// behave exactly as before.
+    #[serde(default)]
+    pub deliverable: Vec<pangu_core::DeliverableSpec>,
+    /// F4: when true, the run starts in a read-only plan phase; the model's
+    /// `begin_act` control call is the only way into the act phase, where
+    /// every mutating action is still individually approved. Default false:
+    /// single-phase runs behave exactly as before.
+    pub plan_first: bool,
 }
 
 impl Default for GoalSection {
@@ -419,6 +675,8 @@ impl Default for GoalSection {
             require_evidence: true,
             min_successful_tool_calls: 1,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            plan_first: false,
+            deliverable: Vec::new(),
         }
     }
 }
@@ -603,6 +861,140 @@ impl Config {
             }
             pangu_core::Glob::new(pattern)?;
         }
+        // D3/D4: deliverable declarations must be well-formed and unique.
+        let mut deliverable_names = std::collections::HashSet::new();
+        for deliverable in &self.goal.deliverable {
+            if deliverable.name.is_empty()
+                || deliverable.name.len() > 64
+                || !deliverable
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(Error::Config(format!(
+                    "goal.deliverable name `{}` is invalid (lowercase letters, digits, hyphen; 1-64 chars)",
+                    deliverable.name
+                )));
+            }
+            if !deliverable_names.insert(deliverable.name.as_str()) {
+                return Err(Error::Config(format!(
+                    "goal.deliverable name `{}` is declared twice",
+                    deliverable.name
+                )));
+            }
+            pangu_core::deliverable::validate_relative_path(&deliverable.path)?;
+            if deliverable.kind.trim().is_empty() || deliverable.kind.len() > 32 {
+                return Err(Error::Config(format!(
+                    "goal.deliverable `{}` kind must be 1-32 chars",
+                    deliverable.name
+                )));
+            }
+            if deliverable.min_bytes == 0 || deliverable.min_bytes > 16_777_216 {
+                return Err(Error::Config(format!(
+                    "goal.deliverable `{}` min_bytes must be between 1 and 16777216",
+                    deliverable.name
+                )));
+            }
+        }
+        // F5: a declared evaluation profile must name its issue document;
+        // an undeclared profile must not carry a stray issue path.
+        let eval = &self.eval;
+        if eval.is_declared() {
+            if eval.profile.len() > 64
+                || !eval
+                    .profile
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(Error::Config(
+                    "eval.profile is invalid (lowercase letters, digits, hyphen; 1-64 chars)"
+                        .into(),
+                ));
+            }
+            if eval.issue_path.trim().is_empty() {
+                return Err(Error::Config(
+                    "eval.issue_path must be set when eval.profile is declared".into(),
+                ));
+            }
+            pangu_core::deliverable::validate_relative_path(&eval.issue_path)
+                .map_err(|error| Error::Config(format!("eval.issue_path: {error}")))?;
+        } else if !eval.issue_path.trim().is_empty() {
+            return Err(Error::Config(
+                "eval.issue_path is set but eval.profile is empty (half-declared evaluation)"
+                    .into(),
+            ));
+        }
+        // B2: bounded skill registry behavior + a well-formed pinned key.
+        let skills = &self.skills;
+        if skills.enabled {
+            if skills.max_skills == 0 || skills.max_skills > 1_024 {
+                return Err(Error::Config(
+                    "skills.max_skills must be between 1 and 1024".into(),
+                ));
+            }
+            if skills.max_files == 0 || skills.max_files > 1_024 {
+                return Err(Error::Config(
+                    "skills.max_files must be between 1 and 1024".into(),
+                ));
+            }
+            if skills.max_file_bytes < 64 || skills.max_file_bytes > 16_777_216 {
+                return Err(Error::Config(
+                    "skills.max_file_bytes must be between 64 and 16777216".into(),
+                ));
+            }
+            if skills.max_doc_bytes < 64 || skills.max_doc_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "skills.max_doc_bytes must be between 64 and 1048576".into(),
+                ));
+            }
+            if skills.max_index_skills > 512 {
+                return Err(Error::Config(
+                    "skills.max_index_skills must be at most 512".into(),
+                ));
+            }
+            if skills.max_index_bytes < 256 || skills.max_index_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "skills.max_index_bytes must be between 256 and 1048576".into(),
+                ));
+            }
+            let key = skills.verify_key.trim();
+            if !key.is_empty() && (key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit())) {
+                return Err(Error::Config(
+                    "skills.verify_key must be 64 hex chars (an ed25519 public key) or empty"
+                        .into(),
+                ));
+            }
+        }
+        // B3: bounded memory behavior. The bounds must themselves be bounded
+        // so a misconfigured store cannot silently disable the guarantees.
+        let memory = &self.memory;
+        if memory.enabled {
+            if memory.max_pending == 0 {
+                return Err(Error::Config(
+                    "memory.max_pending must be at least 1".into(),
+                ));
+            }
+            if memory.max_content_bytes < 64 || memory.max_content_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "memory.max_content_bytes must be between 64 and 1048576".into(),
+                ));
+            }
+            if memory.max_kind_bytes == 0 || memory.max_kind_bytes > 256 {
+                return Err(Error::Config(
+                    "memory.max_kind_bytes must be between 1 and 256".into(),
+                ));
+            }
+            if memory.max_injected > 1_000 {
+                return Err(Error::Config(
+                    "memory.max_injected must be at most 1000".into(),
+                ));
+            }
+            if memory.max_injected_bytes < 256 || memory.max_injected_bytes > 1_048_576 {
+                return Err(Error::Config(
+                    "memory.max_injected_bytes must be between 256 and 1048576".into(),
+                ));
+            }
+        }
         for host in &self.boundary.network.hosts {
             if host.chars().any(char::is_control) {
                 return Err(Error::Config(
@@ -721,11 +1113,186 @@ impl Config {
             ));
         }
         // Construct the effective sandbox once during validation so roots,
+        // B4: provider resolution and capability cross-checks. Fails closed at
+        // config time for unknown providers, keyed providers without a key
+        // variable, tool-less models, and budgets that exceed the model's
+        // context window.
+        let resolved = self.resolve_provider()?;
+        // B5: when a fallback chain is declared, every candidate is fully
+        // resolved and capability-checked here, and the primary must have
+        // resolvable prices (resolve_fallbacks enforces both).
+        if !self.model.fallback.is_empty() {
+            self.resolve_fallbacks()?;
+        }
+        if let Some(capabilities) = resolved.capabilities {
+            if self.budget.max_input_tokens > capabilities.context_window_tokens {
+                return Err(Error::Config(format!(
+                    "budget.max_input_tokens ({}) exceeds the `{}` context window ({}) on provider `{}`; lower budget.max_input_tokens",
+                    self.budget.max_input_tokens,
+                    capabilities.name,
+                    capabilities.context_window_tokens,
+                    resolved.preset.expect("preset").name,
+                )));
+            }
+            if let Some(max_output) = self.model.max_output_tokens {
+                if max_output as u64 > capabilities.max_output_tokens {
+                    return Err(Error::Config(format!(
+                        "model.max_output_tokens ({max_output}) exceeds the `{}` output limit ({}) on provider `{}`",
+                        capabilities.name,
+                        capabilities.max_output_tokens,
+                        resolved.preset.expect("preset").name,
+                    )));
+                }
+            }
+        }
+        // C5: validate the execution declaration.
+        self.execution.validate()?;
+        // F3: extra programs join the read-only argv allow-list, so each
+        // entry must be a bare program name. Declaring one does not weaken
+        // path, flag, or host checks.
+        for command in &self.boundary.extra_readonly_commands {
+            if command.is_empty()
+                || command.len() > 128
+                || command.starts_with('-')
+                || command.contains('/')
+                || command.contains('\\')
+                || command.contains("..")
+                || command.chars().any(char::is_control)
+            {
+                return Err(Error::Config(format!(
+                    "boundary.extra_readonly_commands entries must be bare program names: {command}"
+                )));
+            }
+        }
+        for argument in &self.verify.command {
+            if argument.is_empty()
+                || argument.len() > 4_096
+                || argument.chars().any(char::is_control)
+            {
+                return Err(Error::Config(
+                    "verify.command entries must be non-empty, bounded, and free of control characters"
+                        .into(),
+                ));
+            }
+        }
+        if self.verify.command.len() > 32 {
+            return Err(Error::Config(
+                "verify.command must not exceed 32 argv entries".into(),
+            ));
+        }
         // symlink components, globs, limits, and network filters cannot drift
-        // between configuration and runtime enforcement.
-        Sandbox::from_config(&self.boundary)?;
+        // between configuration and runtime enforcement. Building the Sandbox
+        // here also fail-closes an unrunnable verify command: its program must
+        // be on the read-only argv allow-list (built-in or declared through
+        // extra_readonly_commands) and every flag must pass the same argv
+        // rules as `run_command`.
+        let sandbox = Sandbox::from_config(&self.boundary)?;
+        if !self.verify.command.is_empty() {
+            sandbox.validate_argv(&self.verify.command)?;
+        }
         Policy::new(self.rules.clone())?;
         Ok(())
+    }
+
+    /// B4: resolve the effective provider endpoint, key variable, prices and
+    /// capabilities from config + built-in registry. Pure function: nothing is
+    /// mutated, so digest semantics are unchanged (the contract digest already
+    /// covers the effective price).
+    pub fn resolve_provider(&self) -> Result<crate::registry::ResolvedProvider> {
+        crate::registry::resolve(
+            self.model.provider.as_deref(),
+            self.model.model.as_deref(),
+            self.model.protocol.as_deref(),
+            self.model.base_url.as_deref(),
+            self.model.api_key_env.as_deref(),
+            self.model.input_usd_per_mtok,
+            self.model.output_usd_per_mtok,
+        )
+    }
+
+    /// B5: fully resolve every declared fallback candidate. Fails closed at
+    /// config time unless every candidate is compatible (registry-declared,
+    /// tool-capable, context window fits the budget, prices resolvable) and
+    /// distinct from the primary and from each other.
+    pub fn resolve_fallbacks(&self) -> Result<Vec<ResolvedFallback>> {
+        // An undeclared chain means a single-provider run: nothing to check,
+        // and the primary's missing price must not fail legacy configs here.
+        if self.model.fallback.is_empty() {
+            return Ok(Vec::new());
+        }
+        let primary = self.resolve_provider()?;
+        let primary_key = (
+            primary.base_url.clone(),
+            primary.model.clone().unwrap_or_default(),
+        );
+        // Cost integrity: the primary must have resolvable prices, otherwise
+        // a switch to a priced fallback would start an unpriceable run.
+        if primary.input_usd_per_mtok.is_none() {
+            return Err(Error::Config(
+                "model.fallback requires the primary model to have resolvable prices".into(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::from([primary_key]);
+        let mut resolved_candidates = Vec::new();
+        for (index, candidate) in self.model.fallback.iter().enumerate() {
+            let resolved = crate::registry::resolve(
+                candidate.provider.as_deref(),
+                candidate.model.as_deref(),
+                None,
+                candidate.base_url.as_deref(),
+                candidate.api_key_env.as_deref(),
+                candidate.input_usd_per_mtok,
+                candidate.output_usd_per_mtok,
+            )?;
+            let model = resolved.model.clone().ok_or_else(|| {
+                Error::Config(format!("model.fallback[{index}].model is required"))
+            })?;
+            // W-10: compatibility must be provable, not assumed. A candidate
+            // outside the registry has no capability declaration, so it
+            // cannot be verified tool-capable or window-fitting.
+            let capabilities = resolved.capabilities.ok_or_else(|| {
+                Error::Config(format!(
+                    "model.fallback[{index}] model `{model}` is not in the registry; \
+                     fallback candidates must have declared capabilities"
+                ))
+            })?;
+            if !capabilities.supports_tools {
+                return Err(Error::Config(format!(
+                    "model.fallback[{index}] model `{model}` does not support tool calling"
+                )));
+            }
+            if self.budget.max_input_tokens > capabilities.context_window_tokens {
+                return Err(Error::Config(format!(
+                    "model.fallback[{index}] model `{model}` context window ({}) is smaller \
+                     than budget.max_input_tokens ({})",
+                    capabilities.context_window_tokens, self.budget.max_input_tokens,
+                )));
+            }
+            let (input, output) = match (resolved.input_usd_per_mtok, resolved.output_usd_per_mtok)
+            {
+                (Some(input), Some(output)) => (input, output),
+                _ => {
+                    return Err(Error::Config(format!(
+                        "model.fallback[{index}] model `{model}` has no resolvable prices; \
+                         the cost gate refuses unknown-cost fallbacks"
+                    )));
+                }
+            };
+            let key = (resolved.base_url.clone(), model.clone());
+            if !seen.insert(key) {
+                return Err(Error::Config(format!(
+                    "model.fallback[{index}] duplicates the primary model or an earlier candidate"
+                )));
+            }
+            resolved_candidates.push(ResolvedFallback {
+                model,
+                base_url: resolved.base_url,
+                api_key_env: resolved.api_key_env,
+                input_usd_per_mtok: input,
+                output_usd_per_mtok: output,
+            });
+        }
+        Ok(resolved_candidates)
     }
 
     pub fn workspace_abs(&self) -> PathBuf {
@@ -813,12 +1380,134 @@ impl Config {
                 object.insert("checkpoint".into(), checkpoint);
             }
         }
+        // Same compatibility rule as the checkpoint: an unconfigured verify
+        // tool must not change the digest of an existing v1 run. Once either
+        // F3 field is set, the exact command and the extended allow-list are
+        // part of the effective boundary.
+        if !self.verify.command.is_empty() || !self.boundary.extra_readonly_commands.is_empty() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "verify".into(),
+                    serde_json::json!({
+                        "command": &self.verify.command,
+                        "extra_readonly_commands": &self.boundary.extra_readonly_commands,
+                    }),
+                );
+            }
+        }
+        // Same compatibility rule: the default local profile is undeclared and
+        // must not change the digest of an existing deployment. A declared
+        // backend is part of the effective boundary claims.
+        if self.execution.is_declared() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "execution".into(),
+                    serde_json::json!({
+                        "profile": self.execution.profile.as_str(),
+                        "description": &self.execution.description,
+                    }),
+                );
+            }
+        }
         pangu_core::hex_sha256(&serde_json::to_string(&value).unwrap_or_default())
     }
 
     pub fn explain(&self) -> String {
+        let plan_line = if self.goal.plan_first {
+            "plan_first      : true — run starts read-only; the model's `begin_act` control call starts the act phase\n"
+                .to_string()
+        } else {
+            String::new()
+        };
+        let execution_line = if self.execution.is_declared() {
+            let description = self
+                .execution
+                .description
+                .as_deref()
+                .map(|description| format!(" ({description})"))
+                .unwrap_or_default();
+            format!(
+                "execution       : {}{description}\n                  {}\n",
+                self.execution.profile.as_str(),
+                self.execution.profile.scope_statement(),
+            )
+        } else {
+            String::new()
+        };
+        let resolved = self.resolve_provider().ok();
+        let provider_line = match &resolved {
+            Some(resolved) => {
+                let preset = resolved
+                    .preset
+                    .map(|preset| preset.name.to_string())
+                    .unwrap_or_else(|| "(default)".to_string());
+                let model = resolved
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "unset".to_string());
+                let prices = match resolved.input_usd_per_mtok {
+                    Some(input) => format!(
+                        "{input:.2}/{:.2} USD per MTok",
+                        resolved.output_usd_per_mtok.unwrap_or(f64::NAN)
+                    ),
+                    None => "unset: fail closed".to_string(),
+                };
+                let price_source = match resolved.price_source {
+                    crate::registry::PriceSource::Explicit => "explicit".to_string(),
+                    crate::registry::PriceSource::Registry(as_of) => {
+                        format!("registry as of {as_of}; verify before relying")
+                    }
+                    crate::registry::PriceSource::Absent => "no price".to_string(),
+                };
+                let capabilities = match resolved.capabilities {
+                    Some(caps) => format!(
+                        "context {}, max out {}, tools {}",
+                        caps.context_window_tokens, caps.max_output_tokens, caps.supports_tools
+                    ),
+                    None => "unknown (not in registry)".to_string(),
+                };
+                format!(
+                    "provider       : {preset} / {model}\nendpoint       : {} ({})\nprices         : {prices} ({price_source})\ncapabilities   : {capabilities}\n",
+                    resolved.base_url,
+                    resolved.base_url_source.as_str()
+                )
+            }
+            None => "provider       : <unresolvable>\n".to_string(),
+        };
+        let memory_line = if self.memory.enabled {
+            "memory         : enabled — proposals queue under .pangu/memory; accept/reject via `pangu memory`\n"
+                .to_string()
+        } else {
+            String::new()
+        };
+        let delegation_line = if self.boundary.allow_delegation {
+            "delegation     : enabled - the model may delegate bounded subtasks; a sub-agent's \
+                  budget is clamped to the parent's remaining budget and its contract is \
+                  derived from the parent's (never wider)\n"
+                .to_string()
+        } else {
+            String::new()
+        };
+        let eval_line = if self.eval.is_declared() {
+            format!(
+                "eval           : profile `{}` — issue `{}`; records under .pangu/eval; scores never replace acceptance\n",
+                self.eval.profile, self.eval.issue_path
+            )
+        } else {
+            String::new()
+        };
+        let skills_line = if self.skills.enabled {
+            let key = if self.skills.verify_key.trim().is_empty() {
+                "no pinned key (unsigned/signed-unverified only)"
+            } else {
+                "verify_key pinned"
+            };
+            format!("skills         : enabled — registry under .pangu/skills; {key}\n")
+        } else {
+            String::new()
+        };
         format!(
-            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n\nrules:\n{}\n",
+            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{memory_line}{skills_line}{eval_line}{delegation_line}\nrules:\n{}\n",
             self.boundary_digest(),
             self.workspace_abs().display(),
             self.boundary.writable_roots,
@@ -1085,6 +1774,377 @@ mod tests {
         assert!(loaded.conversation.artifact_root.is_relative());
     }
 
+    /// F3: an old config has no `[verify]` section; it must load with the
+    /// tool absent.
+    #[test]
+    fn old_config_without_verify_section_loads_with_defaults() {
+        let base = Config::embedded().unwrap();
+        let mut value = toml::Value::try_from(&base).unwrap();
+        value.as_table_mut().unwrap().remove("verify");
+        let loaded = Config::from_toml(&toml::to_string(&value).unwrap()).unwrap();
+        assert!(
+            loaded.verify.command.is_empty(),
+            "an absent section must not configure a verify command"
+        );
+    }
+
+    fn config_with_verify(
+        extras: Vec<String>,
+        command: Vec<String>,
+    ) -> std::result::Result<Config, Error> {
+        let base = Config::embedded().unwrap();
+        let mut value = toml::Value::try_from(&base).unwrap();
+        {
+            let table = value.as_table_mut().unwrap();
+            let boundary = table.get_mut("boundary").unwrap().as_table_mut().unwrap();
+            boundary.insert(
+                "extra_readonly_commands".into(),
+                toml::Value::Array(
+                    extras
+                        .into_iter()
+                        .map(toml::Value::String)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+            table.insert(
+                "verify".into(),
+                toml::Value::Table(
+                    [(
+                        "command".into(),
+                        toml::Value::Array(
+                            command
+                                .into_iter()
+                                .map(toml::Value::String)
+                                .collect::<Vec<_>>(),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
+        }
+        let config = Config::from_toml(&toml::to_string(&value).unwrap())?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn extra_readonly_commands_must_be_bare_program_names() {
+        for bad in ["a/b", "a\\b", "..", "-x"] {
+            let error = config_with_verify(vec![bad.to_string()], Vec::new())
+                .expect_err("must reject non-bare extra command");
+            assert!(
+                error.to_string().contains("bare program names"),
+                "unexpected error for {bad}: {error}"
+            );
+        }
+        config_with_verify(vec!["cargo".into()], Vec::new()).expect("bare name is accepted");
+    }
+
+    #[test]
+    fn verify_command_must_use_allowlisted_programs() {
+        let error = config_with_verify(Vec::new(), vec!["python".into(), "-c".into()])
+            .expect_err("undeclared program must fail at config time");
+        assert!(
+            error.to_string().contains("allow-list"),
+            "unexpected error: {error}"
+        );
+        config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "-q".into()],
+        )
+        .expect("declared program with a safe flag passes");
+    }
+
+    #[test]
+    fn verify_command_flags_follow_run_command_rules() {
+        let error = config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "--quiet".into()],
+        )
+        .expect_err("flags outside the safe list must fail at config time");
+        assert!(
+            error.to_string().contains("not allowed"),
+            "unexpected error: {error}"
+        );
+        let error = config_with_verify(Vec::new(), vec!["cat".into(), "/etc/passwd".into()])
+            .expect_err("absolute path arguments must fail");
+        assert!(
+            error.to_string().contains("not allowed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unconfigured_verify_does_not_change_boundary_digest() {
+        let base = Config::embedded().unwrap();
+        let mut stripped = toml::Value::try_from(&base).unwrap();
+        stripped.as_table_mut().unwrap().remove("verify");
+        let kept = Config::from_toml(&toml::to_string(&base).unwrap()).unwrap();
+        let stripped = Config::from_toml(&toml::to_string(&stripped).unwrap()).unwrap();
+        assert_eq!(
+            kept.boundary_digest(),
+            stripped.boundary_digest(),
+            "an empty verify section must not change the digest of an existing deployment"
+        );
+        let configured = config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "-q".into()],
+        )
+        .unwrap();
+        assert_ne!(configured.boundary_digest(), kept.boundary_digest());
+    }
+
+    /// F3 binding: a contract built with an extended allow-list must refuse a
+    /// Sandbox that does not carry the same extension, exactly like any other
+    /// effective-boundary field.
+    #[test]
+    fn contract_refuses_sandbox_with_different_extra_readonly_commands() {
+        use crate::goal::GoalContract;
+
+        let with_extras = config_with_verify(
+            vec!["cargo".into()],
+            vec!["cargo".into(), "test".into(), "-q".into()],
+        )
+        .unwrap();
+        let without = Config::embedded().unwrap();
+        let contract = GoalContract::from_config("binding test", &with_extras).unwrap();
+        let sandbox = Sandbox::from_config(&without.boundary).unwrap();
+        assert!(contract.validate_against(&sandbox).is_err());
+        let matching = Sandbox::from_config(&with_extras.boundary).unwrap();
+        contract
+            .validate_against(&matching)
+            .expect("same-config contract and sandbox agree");
+    }
+
+    /// B4: naming a provider in config fills the endpoint, the key variable,
+    /// and the registry price for a known model; the contract inherits it.
+    #[test]
+    fn provider_resolution_fills_endpoint_and_prices() {
+        use crate::goal::GoalContract;
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o-mini".into());
+        config.budget.max_input_tokens = 100_000; // below the 128k context window
+        config.validate().expect("valid");
+        let resolved = config.resolve_provider().unwrap();
+        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+        assert_eq!(resolved.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(resolved.input_usd_per_mtok, Some(0.15));
+        let contract = GoalContract::from_config("b4", &config).unwrap();
+        let price = contract.price.expect("registry price reaches the contract");
+        assert_eq!(price.input_usd_per_mtok, 0.15);
+        assert_eq!(price.output_usd_per_mtok, 0.60);
+    }
+
+    #[test]
+    fn context_window_smaller_than_input_budget_fails() {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o".into()); // 128k context
+                                                    // Embedded budget is 200k input tokens: impossible for this model.
+        let error = config
+            .validate()
+            .expect_err("budget exceeds context window");
+        assert!(error.to_string().contains("context window"), "{error}");
+    }
+
+    #[test]
+    fn max_output_tokens_above_capability_fails() {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o".into());
+        config.model.max_output_tokens = Some(999_999);
+        config.budget.max_input_tokens = 100_000;
+        config.budget.max_output_tokens = 1_000_000; // avoid the budget-vs-request-cap check first
+        let error = config
+            .validate()
+            .expect_err("request cap exceeds model output limit");
+        assert!(error.to_string().contains("output limit"), "{error}");
+    }
+
+    #[test]
+    fn unknown_provider_fails_with_known_names() {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("nope".into());
+        let error = config.validate().expect_err("unknown provider");
+        assert!(error.to_string().contains("known providers"), "{error}");
+    }
+
+    /// C5: the default local profile is undeclared; removing the section (or
+    /// never having had one) must not change the digest of an existing
+    /// deployment. Declaring a backend does.
+    #[test]
+    fn execution_declaration_changes_digest_only_when_declared() {
+        let base = Config::embedded().unwrap();
+        let mut stripped = toml::Value::try_from(&base).unwrap();
+        stripped.as_table_mut().unwrap().remove("execution");
+        let kept = Config::from_toml(&toml::to_string(&base).unwrap()).unwrap();
+        let stripped = Config::from_toml(&toml::to_string(&stripped).unwrap()).unwrap();
+        assert_eq!(
+            kept.boundary_digest(),
+            stripped.boundary_digest(),
+            "an undeclared execution section must not change the digest"
+        );
+        let mut declared = Config::embedded().unwrap();
+        declared.execution.profile = crate::execution::ExecutionProfile::Container;
+        declared.execution.description = Some("docker:ubuntu-24.04".into());
+        declared.validate().unwrap();
+        assert_ne!(declared.boundary_digest(), kept.boundary_digest());
+    }
+
+    #[test]
+    fn execution_description_is_validated_at_config_time() {
+        let mut config = Config::embedded().unwrap();
+        config.execution.profile = crate::execution::ExecutionProfile::Remote;
+        config.execution.description = Some(
+            "bad
+control"
+                .into(),
+        );
+        let error = config.validate().expect_err("control characters refused");
+        assert!(
+            error.to_string().contains("execution.description"),
+            "{error}"
+        );
+    }
+
+    /// B5 helper: a config whose primary is a known registry model with a
+    /// budget that fits, plus the given fallback candidates.
+    fn config_with_fallback(
+        candidates: Vec<FallbackCandidate>,
+    ) -> std::result::Result<Config, Error> {
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o-mini".into());
+        config.budget.max_input_tokens = 60_000; // fits every candidate window
+        config.model.fallback = candidates;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn candidate(provider: &str, model: &str) -> FallbackCandidate {
+        FallbackCandidate {
+            provider: Some(provider.into()),
+            model: Some(model.into()),
+            ..FallbackCandidate::default()
+        }
+    }
+
+    #[test]
+    fn fallback_chain_validates_and_resolves() {
+        let config = config_with_fallback(vec![
+            candidate("openai", "gpt-4.1-mini"),
+            candidate("deepseek", "deepseek-chat"),
+        ])
+        .unwrap();
+        let resolved = config.resolve_fallbacks().unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].model, "gpt-4.1-mini");
+        assert_eq!(resolved[0].input_usd_per_mtok, 0.40);
+        assert_eq!(resolved[1].model, "deepseek-chat");
+        assert_eq!(resolved[1].base_url, "https://api.deepseek.com/v1");
+    }
+
+    #[test]
+    fn fallback_candidates_fail_closed() {
+        // Unknown provider.
+        let error =
+            config_with_fallback(vec![candidate("nope", "x")]).expect_err("unknown provider");
+        assert!(error.to_string().contains("known providers"), "{error}");
+        // Missing model.
+        let error =
+            config_with_fallback(vec![FallbackCandidate::default()]).expect_err("model required");
+        assert!(error.to_string().contains("model is required"), "{error}");
+        // Model outside the registry: capabilities cannot be proven.
+        let error = config_with_fallback(vec![candidate("openai", "gpt-9x-future")])
+            .expect_err("registry-declared capabilities required");
+        assert!(error.to_string().contains("not in the registry"), "{error}");
+        // Tool-less model.
+        let error = config_with_fallback(vec![candidate("deepseek", "deepseek-reasoner")])
+            .expect_err("tool-less fallback");
+        assert!(
+            error.to_string().contains("does not support tool calling"),
+            "{error}"
+        );
+        // Context window smaller than the input budget (100k vs 64k).
+        let mut config = Config::embedded().unwrap();
+        config.model.provider = Some("openai".into());
+        config.model.model = Some("gpt-4o-mini".into());
+        config.budget.max_input_tokens = 100_000;
+        config.model.fallback = vec![candidate("deepseek", "deepseek-chat")];
+        let error = config.validate().expect_err("context window too small");
+        assert!(error.to_string().contains("context window"), "{error}");
+        // Duplicate of the primary.
+        let error = config_with_fallback(vec![candidate("openai", "gpt-4o-mini")])
+            .expect_err("duplicate of primary");
+        assert!(error.to_string().contains("duplicates"), "{error}");
+        // Duplicate between candidates.
+        let error = config_with_fallback(vec![
+            candidate("openai", "gpt-4.1-mini"),
+            candidate("openai", "gpt-4.1-mini"),
+        ])
+        .expect_err("duplicate candidate");
+        assert!(error.to_string().contains("duplicates"), "{error}");
+    }
+
+    #[test]
+    fn fallback_requires_primary_prices() {
+        // Embedded config has no model and no prices: the primary price is
+        // unresolvable, so declaring a fallback must fail at config time.
+        let mut config = Config::embedded().unwrap();
+        config.model.fallback = vec![candidate("openai", "gpt-4.1-mini")];
+        let error = config.validate().expect_err("unpriceable primary");
+        assert!(
+            error
+                .to_string()
+                .contains("requires the primary model to have resolvable prices"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn contract_carries_the_fallback_chain() {
+        use crate::goal::GoalContract;
+        let declared = config_with_fallback(vec![candidate("openai", "gpt-4.1-mini")]).unwrap();
+        let contract = GoalContract::from_config("b5", &declared).unwrap();
+        assert_eq!(contract.fallbacks.len(), 1);
+        assert_eq!(contract.fallbacks[0].model, "gpt-4.1-mini");
+        assert_eq!(contract.fallbacks[0].input_usd_per_mtok, 0.40);
+        // The digest carries the chain.
+        let single = config_with_fallback(vec![]).unwrap();
+        let single = GoalContract::from_config("b5", &single).unwrap();
+        assert_ne!(contract.digest(), single.digest());
+    }
+
+    #[test]
+    fn contract_carries_the_execution_declaration() {
+        use crate::goal::GoalContract;
+        let mut config = Config::embedded().unwrap();
+        config.execution.profile = crate::execution::ExecutionProfile::Container;
+        config.execution.description = Some("docker:ubuntu-24.04".into());
+        let contract = GoalContract::from_config("c5", &config).unwrap();
+        assert_eq!(
+            contract.execution().profile,
+            crate::execution::ExecutionProfile::Container
+        );
+        // The contract digest carries the declaration.
+        let mut undeclared_config = config.clone();
+        undeclared_config.execution = crate::execution::ExecutionSection::default();
+        let undeclared = GoalContract::from_config("c5", &undeclared_config).unwrap();
+        assert_ne!(contract.digest(), undeclared.digest());
+    }
+
+    #[test]
+    fn unnamed_provider_keeps_legacy_resolution() {
+        let config = Config::embedded().unwrap();
+        let resolved = config.resolve_provider().unwrap();
+        assert!(resolved.preset.is_none());
+        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+        assert_eq!(resolved.price_source, crate::registry::PriceSource::Absent);
+        assert!(resolved.capabilities.is_none());
+    }
+
     #[test]
     fn contract_and_sandbox_preserve_configured_root_order() {
         let root = test_temp_root().join(format!(
@@ -1191,5 +2251,221 @@ mod tests {
         // same directory written two ways would produce two digests.
         assert!(excluded.checkpoint.exclude_roots[0].is_absolute());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// B3: memory enabled changes the digest; the default (disabled) keeps
+    /// historical digests. The frozen bounds ride with the contract.
+    #[test]
+    fn memory_section_freezes_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        let disabled = crate::goal::GoalContract::from_config("b3 off", &base).unwrap();
+        assert!(!disabled.memory().enabled);
+        assert!(!base.explain().contains("memory: enabled"));
+
+        let mut enabled_config = base.clone();
+        enabled_config.memory.enabled = true;
+        enabled_config.memory.max_pending = 7;
+        let enabled = crate::goal::GoalContract::from_config("b3 on", &enabled_config).unwrap();
+        assert!(enabled.memory().enabled);
+        assert_eq!(enabled.memory().max_pending, 7);
+        assert_ne!(disabled.digest(), enabled.digest());
+    }
+
+    /// F5: a declared eval profile freezes into the contract and changes the
+    /// digest; half-declared profiles fail at config time.
+    #[test]
+    fn eval_profile_freezes_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        assert!(!base.eval.is_declared());
+        let plain = crate::goal::GoalContract::from_config("no eval", &base).unwrap();
+        assert!(!plain.eval().is_declared());
+
+        let mut declared = base.clone();
+        declared.eval.profile = "issue-fix".into();
+        declared.eval.issue_path = "issues/001.md".into();
+        declared.validate().expect("valid eval declaration");
+        let with_eval = crate::goal::GoalContract::from_config("with eval", &declared).unwrap();
+        assert_eq!(with_eval.eval().profile, "issue-fix");
+        assert_ne!(plain.digest(), with_eval.digest());
+
+        // Half-declared: issue path without a profile name.
+        let mut stray = base.clone();
+        stray.eval.issue_path = "issues/001.md".into();
+        let error = stray.validate().expect_err("stray issue path");
+        assert!(error.to_string().contains("half-declared"), "{error}");
+
+        // Missing issue path with a declared profile.
+        let mut no_issue = base.clone();
+        no_issue.eval.profile = "issue-fix".into();
+        let error = no_issue.validate().expect_err("missing issue path");
+        assert!(
+            error.to_string().contains("issue_path must be set"),
+            "{error}"
+        );
+
+        // Unsafe issue path.
+        let mut escape = base.clone();
+        escape.eval.profile = "issue-fix".into();
+        escape.eval.issue_path = ".pangu/issue.md".into();
+        let error = escape.validate().expect_err(".pangu issue path");
+        assert!(error.to_string().contains("eval.issue_path"), "{error}");
+    }
+
+    /// D3/D4: declared deliverables change the digest; bad declarations
+    /// fail at config time.
+    #[test]
+    fn deliverables_freeze_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        let plain = crate::goal::GoalContract::from_config("no deliverables", &base).unwrap();
+        assert!(plain.deliverables().deliverables.is_empty());
+
+        let mut declared = base.clone();
+        declared.goal.deliverable = vec![pangu_core::DeliverableSpec {
+            name: "report".into(),
+            path: "out/report.md".into(),
+            kind: "report".into(),
+            acceptor: pangu_core::Acceptor::Manual,
+            min_bytes: 1,
+        }];
+        declared.validate().expect("valid declaration");
+        let with_deliverable =
+            crate::goal::GoalContract::from_config("with deliverable", &declared).unwrap();
+        assert_eq!(with_deliverable.deliverables().deliverables.len(), 1);
+        assert_ne!(plain.digest(), with_deliverable.digest());
+
+        // Duplicate names and unsafe paths fail at config time.
+        declared.goal.deliverable.push(pangu_core::DeliverableSpec {
+            name: "report".into(),
+            path: "out/other.md".into(),
+            kind: "report".into(),
+            acceptor: pangu_core::Acceptor::Manual,
+            min_bytes: 1,
+        });
+        let error = declared.validate().expect_err("duplicate name");
+        assert!(error.to_string().contains("twice"), "{error}");
+
+        declared.goal.deliverable[1].name = "other".into();
+        declared.goal.deliverable[1].path = "../escape.md".into();
+        let error = declared.validate().expect_err("path escape");
+        assert!(
+            error.to_string().contains("safe workspace-relative"),
+            "{error}"
+        );
+
+        declared.goal.deliverable[1].path = ".pangu/x.md".into();
+        let error = declared.validate().expect_err(".pangu path");
+        assert!(error.to_string().contains(".pangu"), "{error}");
+    }
+
+    /// B2: skills enabled changes the digest and freezes the loaded set.
+    #[test]
+    fn skills_freeze_into_the_contract_and_digest() {
+        let base = crate::Config::embedded().unwrap();
+        let disabled = crate::goal::GoalContract::from_config("b2 off", &base).unwrap();
+        assert!(!disabled.skills().enabled);
+
+        let mut enabled_config = base.clone();
+        enabled_config.skills.enabled = true;
+        let enabled = crate::goal::GoalContract::from_config("b2 on", &enabled_config).unwrap();
+        assert!(enabled.skills().enabled);
+        assert!(enabled.skills().skills.is_empty()); // nothing installed here
+        assert_ne!(disabled.digest(), enabled.digest());
+
+        // A malformed pinned key fails at config time.
+        enabled_config.skills.verify_key = "not-hex".into();
+        let error = enabled_config.validate().expect_err("bad verify_key");
+        assert!(error.to_string().contains("verify_key"), "{error}");
+    }
+
+    /// B3: the memory bounds must themselves be sane when the queue is on.
+    #[test]
+    fn memory_limits_fail_closed_when_enabled() {
+        let mut config = crate::Config::embedded().unwrap();
+        config.memory.enabled = true;
+        config.memory.max_pending = 0;
+        let error = config.validate().expect_err("max_pending must be >= 1");
+        assert!(error.to_string().contains("max_pending"), "{error}");
+
+        config.memory.max_pending = 256;
+        config.memory.max_content_bytes = 8;
+        let error = config
+            .validate()
+            .expect_err("max_content_bytes must be >= 64");
+        assert!(error.to_string().contains("max_content_bytes"), "{error}");
+
+        // Disabled runs do not care about the limits.
+        let mut disabled = crate::Config::embedded().unwrap();
+        disabled.memory.max_pending = 0;
+        disabled
+            .validate()
+            .expect("disabled queue skips limit checks");
+    }
+
+    /// D1: the delegation flag freezes into the contract (digest only when
+    /// enabled) and derive_sub_contract produces a strictly-narrowed child.
+    #[test]
+    fn delegation_freezes_into_the_contract_and_derives_narrower_children() {
+        let base = crate::Config::embedded().unwrap();
+        let plain = crate::goal::GoalContract::from_config("d1 off", &base).unwrap();
+        assert!(!plain.allows_delegation());
+
+        let mut enabled_config = base.clone();
+        enabled_config.boundary.allow_delegation = true;
+        let enabled = crate::goal::GoalContract::from_config("d1 on", &enabled_config).unwrap();
+        assert!(enabled.allows_delegation());
+        assert_ne!(plain.digest(), enabled.digest());
+
+        // A derived child copies every enforcement field from the parent and
+        // strips the run-scoped features: a sub-agent is a bounded worker.
+        let parent_budget = enabled.budget().clone();
+        let child = enabled
+            .derive_sub_contract("fix the parser", parent_budget.clone())
+            .unwrap();
+        assert!(child.goal.starts_with("[delegated subtask]"));
+        assert_eq!(child.workspace(), enabled.workspace());
+        assert_eq!(child.readable_roots, enabled.readable_roots);
+        assert_eq!(child.writable_roots, enabled.writable_roots);
+        assert_eq!(child.forbidden_globs, enabled.forbidden_globs);
+        assert_eq!(child.approval_mode, enabled.approval_mode);
+        assert_eq!(child.budget(), &parent_budget);
+        assert_eq!(child.price, enabled.price);
+        assert_eq!(child.policy_digest, enabled.policy_digest);
+        assert_eq!(child.fallbacks, enabled.fallbacks);
+        assert!(
+            !child.allows_delegation(),
+            "depth-1 delegation by construction"
+        );
+        assert!(!child.memory().enabled);
+        assert!(!child.skills().enabled);
+        assert!(child.deliverables().deliverables.is_empty());
+        assert!(!child.eval().is_declared());
+        assert!(!child.plan_first());
+        assert!(!child.checkpoint.enabled);
+        assert!(!child.conversation.enabled);
+
+        // Widening any budget dimension beyond the parent's is refused —
+        // the caller clamps, the constructor is defense in depth.
+        let mut wider = parent_budget.clone();
+        wider.max_turns += 1;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_cost_usd += 0.01;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_input_tokens += 1;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_output_tokens += 1;
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+        let mut wider = parent_budget.clone();
+        wider.max_wall_clock_secs += std::time::Duration::from_secs(1);
+        assert!(enabled.derive_sub_contract("t", wider).is_err());
+
+        // A narrowed budget derives cleanly.
+        let mut narrower = parent_budget.clone();
+        narrower.max_turns = (parent_budget.max_turns / 2).max(1);
+        narrower.max_cost_usd = parent_budget.max_cost_usd / 2.0;
+        narrower.max_wall_clock_secs = parent_budget.max_wall_clock_secs / 2;
+        assert!(enabled.derive_sub_contract("t", narrower).is_ok());
     }
 }

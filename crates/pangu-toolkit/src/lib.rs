@@ -13,29 +13,220 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use pangu_agent::{
-    EffectDescriptor, EffectScope, Reversibility, ToolAssessment, ToolExecutor, ToolOutput,
-    VerifiedAction,
+    Capability, CapabilityManifest, EffectDescriptor, EffectScope, Reversibility, ToolAssessment,
+    ToolExecutor, ToolOutput, VerifiedAction,
 };
 use pangu_boundary::{Risk, Sandbox};
-use pangu_core::{short_hash, ToolCall, ToolSpec};
+use pangu_core::{short_hash, MemoryStore, SkillRegistry, ToolCall, ToolSpec};
 
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_ENTRIES: usize = 10_000;
 const MAX_LIST_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Default)]
-pub struct Toolkit;
+pub struct Toolkit {
+    /// F3: the operator-configured verification command. Empty = the verify
+    /// tool is not advertised and every call to it is rejected, exactly as if
+    /// F3 were not compiled in.
+    verify_command: Vec<String>,
+    /// B3: the controlled memory candidate queue. `None` = the
+    /// `propose_memory` tool does not exist, exactly as if B3 were not
+    /// compiled in.
+    memory: Option<std::sync::Arc<MemoryStore>>,
+    /// B2: the skill registry. `None` = the `read_skill` tool does not
+    /// exist, exactly as if B2 were not compiled in.
+    skills: Option<std::sync::Arc<SkillRegistry>>,
+}
 
 impl Toolkit {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Build a toolkit whose `verify` tool runs exactly this argv. The command
+    /// comes from `[verify] command` in the config, never from model output;
+    /// the model can only trigger it as a whole.
+    pub fn with_verify_command(command: Vec<String>) -> Self {
+        Self {
+            verify_command: command,
+            memory: None,
+            skills: None,
+        }
+    }
+
+    /// B3: attach the memory candidate queue. The model can only *propose*
+    /// through it; acceptance, rejection, and revocation are operator-only
+    /// CLI actions outside any run.
+    pub fn with_memory(mut self, store: std::sync::Arc<MemoryStore>) -> Self {
+        self.memory = Some(store);
+        self
+    }
+
+    /// B2: attach the skill registry. The model can only read a skill's
+    /// instruction document; scripts are registered but never executed.
+    pub fn with_skills(mut self, registry: std::sync::Arc<SkillRegistry>) -> Self {
+        self.skills = Some(registry);
+        self
+    }
+
+    /// B3: the memory store handle, if attached.
+    pub fn memory_store(&self) -> Option<&std::sync::Arc<MemoryStore>> {
+        self.memory.as_ref()
+    }
+
+    /// B1: the static declaration of every capability this toolkit can
+    /// dispatch. `specs()` and `manifest()` must stay in lockstep — a test
+    /// asserts that the names match 1:1.
+    pub fn manifest(&self) -> CapabilityManifest {
+        let empty = || Vec::new();
+        let mut capabilities = vec![
+            Capability {
+                name: "read_file".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "list_dir".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "search".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "write_file".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: vec!["workspace".into()],
+                writes: vec!["workspace".into()],
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "http_fetch".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ExternalRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: vec!["allowlisted".into()],
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "finish".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Session, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "git_diff".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: Vec::new(),
+                hosts: Vec::new(),
+                processes: vec!["git".into()],
+                timeout_ms: None,
+            },
+            Capability {
+                name: "run_command".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: empty(),
+                processes: vec!["allowlisted".into()],
+                timeout_ms: None,
+            },
+        ];
+        // F3: the verify capability mirrors the configured command. It exists
+        // in the manifest only when the operator configured one, keeping the
+        // manifest in lockstep with `specs()`.
+        if !self.verify_command.is_empty() {
+            capabilities.push(Capability {
+                name: "verify".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: empty(),
+                processes: vec![self.verify_command[0].clone()],
+                timeout_ms: None,
+            });
+        }
+        // B3: proposing a memory only appends an inert pending candidate —
+        // nothing reads it into a prompt until an operator accepts it, and it
+        // can be rejected. The write target is Pangu-owned storage that is
+        // excluded from every generic tool I/O path.
+        if self.memory.is_some() {
+            capabilities.push(Capability {
+                name: "propose_memory".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: empty(),
+                writes: vec![".pangu/memory/candidates.json".into()],
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            });
+        }
+        // B2: read_skill reads one installed skill's instruction document.
+        // The registry lives under the `.pangu` forbidden glob; the tool's
+        // read target comes from operator-installed state, never from model
+        // output.
+        if self.skills.is_some() {
+            capabilities.push(Capability {
+                name: "read_skill".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec![".pangu/skills".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            });
+        }
+        CapabilityManifest::new(capabilities)
     }
 }
 
 #[async_trait]
 impl ToolExecutor for Toolkit {
     fn specs(&self) -> Vec<ToolSpec> {
-        vec![
+        let mut specs = vec![
             ToolSpec::new(
                 "read_file",
                 "Read a UTF-8 file inside the readable boundary.",
@@ -97,6 +288,18 @@ impl ToolExecutor for Toolkit {
                 }),
             ),
             ToolSpec::new(
+                "git_diff",
+                "Show the working-tree or staged diff of the workspace (read-only git).",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "staged": {"type": "boolean"},
+                        "path": {"type": "string"}
+                    }
+                }),
+            ),
+            ToolSpec::new(
                 "run_command",
                 "Run one allow-listed read-only command without a shell.",
                 json!({
@@ -109,7 +312,58 @@ impl ToolExecutor for Toolkit {
                     }
                 }),
             ),
-        ]
+        ];
+        // F3: advertise the verify tool only when the operator configured a
+        // command. The model gets no arguments to control: it can trigger the
+        // configured command as a whole, never change it.
+        if !self.verify_command.is_empty() {
+            specs.push(ToolSpec::new(
+                "verify",
+                "Run the operator-configured verification command (e.g. lint/test/compile) and return its output and exit status.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {}
+                }),
+            ));
+        }
+        // B2: advertise read_skill only when the registry is attached.
+        if self.skills.is_some() {
+            specs.push(ToolSpec::new(
+                "read_skill",
+                "Read the instruction document (SKILL.md) of one installed skill by name.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name"],
+                    "properties": {"name": {"type": "string", "minLength": 1}}
+                }),
+            ));
+        }
+        // B3: advertise the memory proposal tool only when the operator
+        // enabled the queue. Proposals are inert until an operator accepts
+        // them through the CLI.
+        if self.memory.is_some() {
+            specs.push(ToolSpec::new(
+                "propose_memory",
+                "Propose a memory candidate for the operator to review. It is NOT written into any prompt until the operator accepts it, and it never changes permissions or boundaries.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["content"],
+                    "properties": {
+                        "content": {"type": "string", "minLength": 1},
+                        "kind": {"type": "string", "description": "short slug like note/preference/lesson"}
+                    }
+                }),
+            ));
+        }
+        specs
+    }
+
+    fn verify_command(&self) -> Vec<String> {
+        self.verify_command.clone()
     }
 
     async fn assess(&self, call: &ToolCall, sandbox: &Sandbox) -> Result<ToolAssessment> {
@@ -241,6 +495,105 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "verify" => {
+                // The model gets no arguments to control: any key is a
+                // rejection. The argv is the contract-frozen configured one.
+                ensure_allowed_keys(&call.args, &[])?;
+                if self.verify_command.is_empty() {
+                    bail!("verify tool is not configured");
+                }
+                sandbox.validate_argv(&self.verify_command)?;
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman).with_effect(
+                    EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                );
+                assessment.argv = self.verify_command.clone();
+                assessment.preview = format!(
+                    "verify {} args_sha256={}",
+                    self.verify_command[0],
+                    short_hash(&self.verify_command[1..].join(" "))
+                );
+                Ok(assessment)
+            }
+            "read_skill" => {
+                ensure_allowed_keys(&call.args, &["name"])?;
+                let registry = self
+                    .skills
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("read_skill tool is not configured"))?;
+                let name = required_string(&call.args, "name")?;
+                if name.len() > 64 {
+                    bail!("skill name is too long");
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                    EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                );
+                assessment = assessment.read(registry.dir().to_path_buf());
+                assessment.preview = format!("read_skill name={}", name);
+                Ok(assessment)
+            }
+            "propose_memory" => {
+                ensure_allowed_keys(&call.args, &["content", "kind"])?;
+                let store = self
+                    .memory
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("propose_memory tool is not configured"))?;
+                let content = required_string(&call.args, "content")?;
+                let kind = call
+                    .args
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("note");
+                let mut assessment = ToolAssessment::new(Risk::Reversible).with_effect(
+                    EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                );
+                // The write target is the store's own file — the same file
+                // every generic tool I/O path is forbidden to touch.
+                assessment = assessment.write(store.path().to_path_buf());
+                // Preview carries the digest, never the raw content: the
+                // content is model text and may contain secrets.
+                assessment.preview = format!(
+                    "propose_memory kind={} bytes={} sha256={}",
+                    kind,
+                    content.len(),
+                    short_hash(&content)
+                );
+                Ok(assessment)
+            }
+            "git_diff" => {
+                ensure_allowed_keys(&call.args, &["staged", "path"])?;
+                let staged = call
+                    .args
+                    .get("staged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut argv = vec!["git".to_string(), "diff".to_string()];
+                if staged {
+                    argv.push("--cached".to_string());
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                    EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                );
+                if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                    if path.is_empty() || path.contains("..") || path.starts_with('/') {
+                        bail!("path must be a relative in-workspace path");
+                    }
+                    argv.push("--".to_string());
+                    argv.push(path.to_string());
+                    assessment = assessment.read(PathBuf::from(path));
+                }
+                sandbox.validate_argv(&argv)?;
+                assessment.argv = argv.clone();
+                assessment.preview = format!(
+                    "git diff{}{}",
+                    if staged { " --cached" } else { "" },
+                    call.args
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(|p| format!(" -- {p}"))
+                        .unwrap_or_default()
+                );
+                Ok(assessment)
+            }
             other => bail!("unknown tool `{other}`"),
         }
     }
@@ -252,7 +605,23 @@ impl ToolExecutor for Toolkit {
             "search" => execute_search(action).await,
             "write_file" => execute_write(action).await,
             "http_fetch" => execute_http(action).await,
+            "git_diff" => execute_command(action).await,
             "run_command" => execute_command(action).await,
+            "verify" => execute_verify(action).await,
+            "propose_memory" => {
+                let store = self
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("propose_memory tool is not configured"))?;
+                execute_propose_memory(action, &store)
+            }
+            "read_skill" => {
+                let registry = self
+                    .skills
+                    .clone()
+                    .ok_or_else(|| anyhow!("read_skill tool is not configured"))?;
+                execute_read_skill(action, &registry)
+            }
             other => bail!("tool `{other}` has no executor"),
         }
     }
@@ -672,6 +1041,60 @@ fn resolve_executable(program: &str, sandbox: &Sandbox) -> Result<PathBuf> {
 }
 
 async fn execute_command(action: &VerifiedAction) -> Result<ToolOutput> {
+    execute_command_tagged(action, "command").await
+}
+
+/// F3: verify shares the run_command subprocess discipline (no shell, cleaned
+/// env, closed stdin, timeout, bounded output); only the evidence tag differs.
+async fn execute_verify(action: &VerifiedAction) -> Result<ToolOutput> {
+    execute_command_tagged(action, "verify").await
+}
+
+/// B3: append a pending memory candidate. The output carries the id and the
+/// content digest only — the agent audits the proposal into the journal
+/// without the raw content.
+/// B2: return one skill's instruction document. The model supplies only the
+/// name; the path comes from the operator-installed registry.
+fn execute_read_skill(action: &VerifiedAction, registry: &SkillRegistry) -> Result<ToolOutput> {
+    let call = action.call();
+    let name = call
+        .args
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("read_skill name is missing"))?;
+    let doc = registry.read_doc(name)?;
+    Ok(ToolOutput {
+        content: doc,
+        evidence: Some(format!("skill:{}", name)),
+    })
+}
+
+fn execute_propose_memory(action: &VerifiedAction, store: &MemoryStore) -> Result<ToolOutput> {
+    let call = action.call();
+    let content = call
+        .args
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("propose_memory content is missing"))?
+        .to_string();
+    let kind = call
+        .args
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("note");
+    let candidate = store.propose(&content, kind)?;
+    Ok(ToolOutput {
+        content: serde_json::to_string(&serde_json::json!({
+            "id": candidate.id,
+            "status": candidate.status.as_str(),
+            "content_sha256": candidate.content_digest,
+            "review": "queued for operator review; it is not active and carries no effect until accepted",
+        }))?,
+        evidence: Some(format!("memory:{}", candidate.id)),
+    })
+}
+
+async fn execute_command_tagged(action: &VerifiedAction, tag: &str) -> Result<ToolOutput> {
     let argv = &action.resources().argv;
     if argv.is_empty() {
         bail!("empty command");
@@ -732,7 +1155,7 @@ async fn execute_command(action: &VerifiedAction) -> Result<ToolOutput> {
     }
     Ok(ToolOutput::evidenced(
         text,
-        format!("command:{}", short_hash(&argv.join(" "))),
+        format!("{tag}:{}", short_hash(&argv.join(" "))),
     ))
 }
 
@@ -765,5 +1188,46 @@ mod tests {
         let specs = Toolkit::new().specs();
         assert!(specs.iter().any(|spec| spec.name == "finish"));
         assert!(!specs.iter().any(|spec| spec.name == "verify_claims"));
+    }
+
+    #[test]
+    fn manifest_matches_specs_one_to_one() {
+        let specs = Toolkit::new().specs();
+        let manifest = Toolkit::new().manifest();
+        manifest.validate().expect("manifest validates");
+        let mut spec_names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let mut manifest_names: Vec<&str> = manifest.names();
+        spec_names.sort();
+        manifest_names.sort();
+        assert_eq!(spec_names, manifest_names);
+    }
+
+    #[test]
+    fn verify_tool_is_advertised_only_when_configured() {
+        let default = Toolkit::new();
+        assert!(!default.specs().iter().any(|spec| spec.name == "verify"));
+        assert!(!default.manifest().names().contains(&"verify"));
+        assert!(default.verify_command().is_empty());
+
+        let configured = Toolkit::with_verify_command(vec!["cargo".into(), "test".into()]);
+        assert!(configured.specs().iter().any(|spec| spec.name == "verify"));
+        assert!(configured.manifest().names().contains(&"verify"));
+        assert_eq!(
+            configured.verify_command(),
+            vec!["cargo".to_string(), "test".to_string()]
+        );
+    }
+
+    #[test]
+    fn manifest_matches_specs_one_to_one_with_verify() {
+        let toolkit = Toolkit::with_verify_command(vec!["cargo".into(), "test".into()]);
+        let specs = toolkit.specs();
+        let manifest = toolkit.manifest();
+        manifest.validate().expect("manifest validates");
+        let mut spec_names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let mut manifest_names: Vec<&str> = manifest.names();
+        spec_names.sort();
+        manifest_names.sort();
+        assert_eq!(spec_names, manifest_names);
     }
 }

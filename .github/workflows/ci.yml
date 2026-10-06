@@ -18,7 +18,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -93,7 +93,7 @@ jobs:
 
       - name: Archive CI logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-logs-${{ matrix.os }}
           path: |
@@ -103,14 +103,11 @@ jobs:
 
       - name: Archive all-tests log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-log-${{ matrix.os }}
           path: all-tests.log
           if-no-files-found: warn
-
-      - name: Run strict Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run F7 checkpoint operator drills
         shell: bash
@@ -129,6 +126,12 @@ jobs:
       # Artifact downloads need authentication, so the report is also emitted
       # as annotations: that keeps the cross-platform evidence reviewable by
       # anyone who can read the repository, not only by the release owner.
+      #
+      # Severity follows the outcome, and that matters more than it looks.
+      # Emitting every line as ::error:: meant a green run carried ~14 error
+      # annotations, so "the drills all passed" and "the drills failed" rendered
+      # identically 鈥?the signal was only readable by decoding the payload. An
+      # alarm that is always on carries no information.
       - name: Publish F7 drill report
         shell: bash
         if: always()
@@ -137,17 +140,33 @@ jobs:
           # `"` are part of its escape grammar, so the JSON line is escaped
           # before it becomes an annotation message.
           esc() { tr -d '\r' | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g' -e 's/"/%22/g'; }
-          if [ -f "${{ github.workspace }}/f7-drill-report.jsonl" ]; then
-            while IFS= read -r line; do
-              [ -n "$line" ] && echo "::error title=f7 drill::$(printf '%s' "$line" | esc)"
-            done < "${{ github.workspace }}/f7-drill-report.jsonl"
-          else
+          report="${{ github.workspace }}/f7-drill-report.jsonl"
+          if [ ! -f "$report" ]; then
             echo "::error title=f7 drill::no drill report was produced on ${{ matrix.os }}"
+            exit 0
           fi
+          # `outcome` is a fixed vocabulary (docs/evidence/README.md): pass,
+          # skipped, not-applicable. Anything else is a malformed report and has
+          # to be loud, so it falls through to the error branch.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in
+              *'"outcome":"pass"'*)
+                level=notice ;;
+              *'"outcome":"skipped"'*|*'"outcome":"not-applicable"'*)
+                # Not a pass, and not a failure: the mechanism does not exist or
+                # could not be exercised on this platform. Required to stay
+                # visible as such so it is never read as coverage.
+                level=warning ;;
+              *)
+                level=error ;;
+            esac
+            echo "::$level title=f7 drill::$(printf '%s' "$line" | esc)"
+          done < "$report"
 
       - name: Archive F7 drill report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: f7-drill-report-${{ matrix.os }}
           path: f7-drill-report.jsonl

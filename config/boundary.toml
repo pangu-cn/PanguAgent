@@ -17,13 +17,111 @@ max_output_tokens = 4_096
 workspace = "."
 readable_roots = ["."]
 writable_roots = ["."]
-forbidden_globs = ["**/.git/**", "**/.env", "**/.env.*", "**/secrets/**", "**/*.pem", "**/id_rsa*"]
+forbidden_globs = ["**/.git/**", "**/.env", "**/.env.*", "**/secrets/**", "**/*.pem", "**/id_rsa*", "**/.pangu/**"]
 max_tool_output_bytes = 16_384
 max_arg_bytes = 8_192
 subprocess_timeout_secs = 45
 subprocess_output_limit = 200_000
 max_write_bytes = 4_194_304
 max_paths_per_action = 64
+# F3: 追加到只读 argv 白名单的裸程序名（如 cargo/npm），供 verify 命令使用。
+# 只接受裸名；不放宽路径、flag 和 host 检查。默认空。
+extra_readonly_commands = []
+
+# B3: 受控记忆候选队列。默认关闭：关闭时 propose_memory 工具不存在、
+# 不注入任何记忆、digest 不变。开启后模型只能提出候选（写入
+# .pangu/memory/，该目录同时对一切工具 I/O 禁区），接受/拒绝/撤销
+# 只能由操作者通过 `pangu memory ...` 完成；被接受的记忆以后续运行的
+# system prompt 注入，并明确标注不可信、不承载授权。
+# B2: 技能注册表。默认关闭：不加载、不注入、digest 不变。开启后运行时只
+# 注入技能索引（名称/版本/签名状态/描述），模型经 read_skill 工具读说明
+# 正文（SKILL.md）；技能包由操作者经 `pangu skills install` 安装到
+# .pangu/skills/（对一切工具 I/O 禁区）。verify_key 为 ed25519 公钥 hex，
+# 留空 = 不验签（包如实标注 unsigned）。技能清单里的 scripts 只登记和
+# 校验 hash，B2 不提供任何脚本执行原语——模型执行任何命令仍只能走
+# run_command（NeedsHuman + argv 白名单）。
+# D3/D4: 交付物声明。默认空 = 无交付物语义、digest 不变。声明后 complete
+# 成为验收闸门：每个交付物检查（存在/非空/验收器）通过才接受，失败详情
+# 回灌给模型修复重试；完成时产物快照登记进 .pangu/deliverables/（工具禁
+# 区）；人工签收 pangu deliverable accept|reject 只在 run 外，complete 不
+# 等于 accepted。
+# [[goal.deliverable]]
+# name = "migration-report"
+# path = "out/report.md"
+# kind = "report"
+# acceptor = "manual"     # manual | verify | json | jsonl
+# min_bytes = 1
+
+# F5: 评测 profile。默认空 = 无评测语义、digest 不变。声明后 `pangu eval
+# run` 会把 issue 内容 digest（run 开始时钉取）、workspace git 版本、
+# contract digest、终态、成本、verify 证据计数和交付物快照固定成一条
+# pangu-eval/1 记录（.pangu/eval/records.json）。记录没有 score 字段——
+# 机器事实不断言修复；验收 = verify 证据 + 人工签收。
+# [eval]
+# profile = "issue-fix"
+# issue_path = "issues/001.md"
+
+# 并发写入：每个工具调用按**路径**加锁，因此改同一个文件的 Agent 串行排队、
+# 改不同文件的 Agent 并行推进（互不阻塞）。
+#
+# workspace_path_locks：默认 true。关闭后同一个 workspace 上的写入不再串行
+# 化，两个 Agent 可能同时改一个文件，结果与任何一方记录的动作都不一致；只在
+# 部署方已用别的方式保证只有一个写入者时才关。
+#
+# workspace_lock_wait_secs：等待锁的上限。等待是挂起式的（拿到锁就继续），
+# 但有上限——若持锁进程被强杀、锁文件残留，等待到点即失败关闭并报告持锁者，
+# 而不是无限挂起。锁文件位于 .pangu/locks/（Pangu 自有存储，不会出现在你的
+# git status 里）。长编译/长测试可调高此值。
+# workspace_path_locks = true
+# workspace_lock_wait_secs = 120
+#
+# delegation_workspace_lock：默认 false。开启后委派的子 Agent 会独占**整个**
+# workspace（而非只锁它实际碰到的路径），会让同一仓库里文件不重叠的两个
+# Agent 也互相阻塞。只在需要"让其它一切先停下"时才开。
+# delegation_workspace_lock = false
+#
+# workspace_module_locks：默认 true。按构建模块加锁，支持 Cargo crates、
+# Gradle 子项目、Maven modules、npm workspaces。
+#
+# 为什么"改构建文件"要升级成模块锁：改 Cargo.toml / build.gradle / pom.xml /
+# package.json 会改变**这个模块拥有哪些文件**（新增 workspace 成员、新增依赖、
+# 新增源码根）。所以它不是普通文件编辑——它必须排除该模块内所有 Agent，而不
+# 只是排除改同一个构建文件的 Agent。
+#
+# 效果：一个模块一个 Agent。改 alpha crate 的 Cargo.toml 不会挡住改 beta crate
+# 的 Agent（实测等待 3ms），但同一 crate 的第二个写入者会等锁释放（实测 675ms）。
+#
+# 只读得懂才用：模块图若无法完整解析（构建文件语法错误、Gradle 用变量计算
+# include、pom.xml 里是 ${} 模板、Cargo 用了 /** 这类不展开的 glob），则**不**
+# 用它来划分锁，而是回退到纯文件锁并在 stderr 报告"未识别"。原因是错的模块图
+# 会**静默失效**：两个 Agent 被判定为不同模块就并发了，而没有任何锁会报错。
+# 宁可退化成较粗的文件锁，也不要给出看似权威的错误模块边界。
+# workspace_module_locks = true
+
+# D1: 受限子 Agent。默认 false = 无 delegate_task 工具、digest 不变。开启
+# 后模型可把子任务交给受限子 Agent：子 contract 由父 contract 派生（预算
+# 钳到父级剩余，拒绝任何加宽），子事件进同一 Journal、花费聚合进父级账
+# 本，深度 1（子不能再委派）。
+# allow_delegation = true
+# workspace_lock_wait_secs = 120
+
+[skills]
+enabled = false
+verify_key = ""
+max_skills = 64
+max_files = 64
+max_file_bytes = 262_144
+max_doc_bytes = 65_536
+max_index_skills = 48
+max_index_bytes = 8_192
+
+[memory]
+enabled = false
+max_pending = 256
+max_content_bytes = 4_096
+max_kind_bytes = 32
+max_injected = 24
+max_injected_bytes = 16_384
 
 [boundary.approval]
 mode = "destructive_and_above"
@@ -52,6 +150,9 @@ rollback_requires_approval = true
 [goal]
 require_evidence = true
 min_successful_tool_calls = 1
+# F4: true = 运行从只读 plan 阶段开始；模型只能用 begin_act 控制调用进入
+# act 阶段，act 内每个变更动作仍逐项走 L1-L4 审批。默认 false。
+plan_first = false
 system_prompt = """
 你是 Pangu，一个在显式边界内工作的自主 agent。
 只能通过提供的工具改变外部世界；一次只执行一个可审计动作。
@@ -99,3 +200,25 @@ id = "ask-command"
 effect = "ask"
 tool = "run_command"
 reason = "子进程前需要确认"
+
+[[rules]]
+id = "ask-verify"
+effect = "ask"
+tool = "verify"
+reason = "验证命令会执行项目代码，运行前需要确认"
+
+[verify]
+# F3: 验证命令（lint/test/compile 等）。留空 = 不向模型广告 verify 工具。
+# 程序名必须在只读 argv 白名单（内置命令或 extra_readonly_commands）上，
+# flag 受与 run_command 相同的限制；启动时冻结进 GoalContract，
+# 模型只能触发整条命令，不能增改参数。示例：
+# command = ["cargo", "test", "-q"]
+command = []
+
+[execution]
+# C5: 声明运行所在的执行后端（local/container/remote）。这是操作者声明，
+# 不是 Pangu 验证过的事实：Pangu 不启动、不管理、不验证容器或远程后端，
+# 任何 profile 下 L1-L4 链完全相同。声明会冻结进 contract 并记入 RunStarted。
+# description 可选，用于审计（脱敏、限长 512 字节）。
+profile = "local"
+# description = "docker:ubuntu-24.04 image sha256:..."

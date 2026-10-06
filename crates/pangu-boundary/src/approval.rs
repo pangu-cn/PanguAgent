@@ -63,6 +63,37 @@ impl std::str::FromStr for ApprovalMode {
     }
 }
 
+/// Structured impact of an approved call, shown before the human says yes.
+/// A3: the machine-checkable parts (command, network targets, read/write
+/// scope) have a stable shape. F4 adds bounded file-content diffs for
+/// `write_file` approvals — already redacted and length-capped by the agent
+/// before they reach this struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalImpact {
+    /// The exact subprocess preview, e.g. `git status`. Redacted and
+    /// truncated; `None` when the tool does not spawn subprocesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Network targets summary (hosts and/or redacted URL), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Paths the call may read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    /// Paths the call may write/create/remove.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    /// Working directory the call runs in, if distinct from the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// F4: unified diff of existing vs. requested content, per write target,
+    /// for content previews. Redacted, length-capped, and absent when a diff
+    /// is impossible (new file metadata, non-UTF-8, too large) — the text
+    /// says which and why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diffs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
@@ -76,6 +107,9 @@ pub struct ApprovalRequest {
     pub preview: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<(String, String)>,
+    /// A3 structured impact. Default-empty keeps old wire payloads parseable.
+    #[serde(default)]
+    pub impact: ApprovalImpact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +260,37 @@ impl StdinApproval {
                 safe_display(value, 4_096)
             ));
         }
+        let impact = &request.impact;
+        if impact.command.is_some()
+            || impact.network.is_some()
+            || !impact.reads.is_empty()
+            || !impact.writes.is_empty()
+            || impact.cwd.is_some()
+            || !impact.diffs.is_empty()
+        {
+            output.push_str("  影响范围 :\n");
+            if let Some(command) = &impact.command {
+                output.push_str(&format!("    命令 : {}\n", safe_display(command, 4_096)));
+            }
+            if let Some(network) = &impact.network {
+                output.push_str(&format!("    网络 : {}\n", safe_display(network, 4_096)));
+            }
+            for path in &impact.reads {
+                output.push_str(&format!("    读取 : {}\n", safe_display(path, 4_096)));
+            }
+            for path in &impact.writes {
+                output.push_str(&format!("    写入 : {}\n", safe_display(path, 4_096)));
+            }
+            if let Some(cwd) = &impact.cwd {
+                output.push_str(&format!("    目录 : {}\n", safe_display(cwd, 4_096)));
+            }
+            for diff in &impact.diffs {
+                output.push_str(&format!(
+                    "    差异 :\n{}",
+                    indent(&safe_display(diff, 8_192))
+                ));
+            }
+        }
         output.push_str(&format!(
             "  预览 :\n{}\n",
             indent(&safe_display(&request.preview, 16_384))
@@ -303,8 +368,30 @@ mod tests {
             target: None,
             invariant: None,
             preview: "path=README.md".into(),
+            impact: ApprovalImpact::default(),
             args: Vec::new(),
         }
+    }
+
+    #[test]
+    fn render_shows_structured_impact() {
+        let handler = StdinApproval::new(ApprovalMode::Always, std::time::Duration::from_secs(1));
+        let mut request = request();
+        request.impact = ApprovalImpact {
+            command: Some("npm test".into()),
+            network: Some("example.com".into()),
+            reads: vec!["src/lib.rs".into()],
+            writes: vec!["dist/".into()],
+            cwd: None,
+            diffs: vec!["--- dist/x\n+++ dist/x\n@@ -1 +1 @@\n-old\n+new\n".into()],
+        };
+        let rendered = handler.render(&request);
+        assert!(rendered.contains("影响范围"));
+        assert!(rendered.contains("npm test"));
+        assert!(rendered.contains("example.com"));
+        assert!(rendered.contains("src/lib.rs"));
+        assert!(rendered.contains("dist/"));
+        assert!(rendered.contains("+new"));
     }
 
     #[test]

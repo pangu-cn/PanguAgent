@@ -4,46 +4,69 @@
 //! runtime, provider, and toolkit layers. Policy decisions belong in
 //! `pangu-boundary`; this crate does not decide whether an action is allowed.
 
-pub mod assemble;
 pub mod artifact;
+pub mod assemble;
 pub mod checkpoint;
 pub mod conversation;
+pub mod deliverable;
+pub mod diff;
 pub mod error;
+pub mod eval;
 pub mod events;
+pub mod export;
 pub mod glob;
 pub mod inspect;
 pub mod journal;
 pub mod json;
+pub mod lockfile;
+pub mod memory;
 pub mod messages;
+pub mod modules;
 pub mod replay;
+pub mod repomap;
 pub mod session;
+pub mod skills;
 pub mod slice;
 pub mod stream;
 pub mod summary;
 pub mod util;
 
-pub use assemble::{
-    assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,
-    DegradeMode, Omission, SecondStageSelector, Seam, SelectionReason, SliceSelection,
-};
 pub use artifact::{
     ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
     RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,
     FAILED_PATH_LEDGER_FILE, ROLLBACK_OPERATION_SCHEMA_VERSION,
 };
+pub use assemble::{
+    assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,
+    DegradeMode, Omission, Seam, SecondStageSelector, SelectionReason, SliceSelection,
+};
 pub use checkpoint::{
     ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
     ExternalEffectSummary, FailedPathRecord, FailedPathStatus, FailureClass, RollbackRequest,
-    SessionNode, CHECKPOINT_SCHEMA_VERSION, FAILED_PATH_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+    SessionNode, CHECKPOINT_SCHEMA_VERSION, FAILED_PATH_SCHEMA_VERSION, ROOT_NODE_PREFIX,
+    SESSION_SCHEMA_VERSION,
 };
 pub use conversation::{
     redact_messages, validate_encoded_size, CompactionRecord, ConversationSnapshot,
     MAX_CONVERSATION_BYTES, MAX_CONVERSATION_MESSAGES,
 };
+pub use deliverable::{
+    Acceptance, Acceptor, CheckOutcome, DeliverableRecord, DeliverableSpec, DeliverableStore,
+    DeliverableTransition, DELIVERABLES_SCHEMA,
+};
+pub use diff::unified_diff;
 pub use error::{Error, Result};
+pub use eval::{
+    EvalContext, EvalDeliverable, EvalIssue, EvalRecord, EvalRunFacts, EvalStore,
+    EVAL_NOT_ACCEPTANCE, EVAL_SCHEMA,
+};
 pub use events::{
     redact_event, redact_text, redact_value, Event, EventKind, EventSink, JournalMeta, MemSink,
     NullSink, Price, TeeSink, Usage, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
+};
+pub use export::{
+    export_snapshot, ExportPolicy, Exported, Finding, FindingKind, PrivacyReport,
+    LARGE_OBJECT_BYTES,
 };
 pub use glob::Glob;
 pub use inspect::{
@@ -52,7 +75,28 @@ pub use inspect::{
     TransactionLockEvidence, ARTIFACT_INSPECTION_SCHEMA,
 };
 pub use journal::{ConsoleSink, Journal};
+pub use lockfile::{
+    describe_lock, lock_file_path, module_lock_key, path_lock_dir, path_lock_file, peek_lock_file,
+    LockHolder, LockMode, PathLock, WorkspaceLock, PATH_LOCK_DIR, WORKSPACE_LOCK_DIR,
+    WORKSPACE_LOCK_FILE,
+};
+pub use memory::{
+    MemoryCandidate, MemoryLimits, MemoryStatus, MemoryStore, MemoryTransition, MEMORY_SCHEMA,
+};
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
+pub use modules::{
+    build_file_index, discover, module_dir, owning_module_of_build_file, summary as module_summary,
+    BuildSystem, Module, ModuleMap,
+};
+pub use repomap::{
+    build as build_repomap, fingerprint as repomap_fingerprint, view as repomap_view, FileEntry,
+    MapView, RepoMap, RepoMapOptions, Symbol,
+};
+pub use skills::{
+    RejectedSkill, SkillFileEntry, SkillLimits, SkillLock, SkillManifest, SkillRegistry,
+    SkillSignatureState, SKILL_DOC_FILE, SKILL_LOCK_FILE, SKILL_LOCK_SCHEMA, SKILL_MANIFEST_FILE,
+    SKILL_MANIFEST_SCHEMA,
+};
 pub use slice::{
     extend as extend_slices, slice, verify as verify_slices, ConversationSlices, SliceEntry,
     SliceKind, SLICE_SCHEMA_VERSION,

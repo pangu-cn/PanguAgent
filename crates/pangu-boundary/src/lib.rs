@@ -4,26 +4,33 @@
 pub mod approval;
 pub mod budget;
 pub mod config;
+pub mod execution;
 pub mod explain;
 pub mod goal;
 pub mod policy;
+pub mod registry;
 pub mod risk;
 pub mod sandbox;
 
 pub use approval::{
-    ApprovalHandler, ApprovalMode, ApprovalRequest, ApprovalResponse, ScriptedApproval,
-    StdinApproval, Unattended,
+    ApprovalHandler, ApprovalImpact, ApprovalMode, ApprovalRequest, ApprovalResponse,
+    ScriptedApproval, StdinApproval, Unattended,
 };
 pub use budget::{Breach, Budget};
 pub use config::{
     BoundaryConfig, BoundarySection, CheckpointBackend, CheckpointFailurePolicy, CheckpointSection,
-    CliOverrides, Config, EnvSection,
+    CliOverrides, Config, EnvSection, EvalSection, FallbackCandidate, MemorySection, SkillsSection,
 };
+pub use execution::{ExecutionProfile, ExecutionSection};
 pub use explain::{
     explain_action, DeadRule, ExplainContext, ExplainReport, ExplainRequest, Layer, LayerOutcome,
     LayerReport, Projection, RuleStatus, RuleTrace, EXPLAIN_SCHEMA,
 };
-pub use goal::{GoalContract, GoalStatus};
+pub use goal::{ContractEval, GoalContract, GoalStatus};
 pub use policy::{ActionRequest, Decision, Effect, Policy, Rule};
+pub use registry::{
+    preset, preset_model, presets, FieldSource, PriceSource, ProviderPreset, RegistryModel,
+    ResolvedProvider, REGISTRY_VERSION,
+};
 pub use risk::Risk;
 pub use sandbox::{ResolveOutcome, ResourceRequest, Sandbox, ValidatedResources};

@@ -632,24 +632,60 @@ mod tests {
     /// Excluding a path outside the workspace is a way to write a rule that
     /// silently does nothing, or that reaches into state the boundary does not
     /// own. Either way it should not be accepted quietly.
+    ///
+    /// Both spellings must produce the *same* verdict and the same message.
+    /// `../elsewhere` used to be reported as "parent traversal is not allowed",
+    /// which is a different diagnosis for the same operator mistake — and on
+    /// Windows the config passed this test while failing on Linux, because a
+    /// canonicalized workspace plus `..` normalized away before the traversal
+    /// check ran. A config verdict must not depend on the host's path
+    /// normalization.
     #[test]
     fn an_exclusion_outside_the_workspace_is_rejected() {
         let root = test_temp_root().join("checkpoint-exclude-outside");
         std::fs::create_dir_all(&root).unwrap();
+
+        for spelling in ["../elsewhere", "../../elsewhere"] {
+            let mut config = Config::embedded().unwrap();
+            config.boundary.workspace = root.clone();
+            config.boundary.readable_roots = vec![root.clone()];
+            config.boundary.writable_roots = vec![root.clone()];
+            config.checkpoint.enabled = true;
+            config.checkpoint.artifact_root = PathBuf::from(".pangu/checkpoints");
+            config.checkpoint.exclude_roots = vec![PathBuf::from(spelling)];
+            let error = config
+                .validate()
+                .expect_err("excluding outside the workspace");
+            assert!(
+                error.to_string().contains("subdirectory of the workspace"),
+                "`{spelling}` must be reported as pointing outside the workspace, \
+                 not as a traversal bug: {error}"
+            );
+        }
+
+        // An absolute exclusion outside the workspace must not silently pass
+        // just because it does not spell `..`. (An absolute path *inside* the
+        // workspace is legitimate — the contract normalizes exclusions that way
+        // itself — so this case has to actually leave the workspace.)
         let mut config = Config::embedded().unwrap();
         config.boundary.workspace = root.clone();
         config.boundary.readable_roots = vec![root.clone()];
         config.boundary.writable_roots = vec![root.clone()];
         config.checkpoint.enabled = true;
         config.checkpoint.artifact_root = PathBuf::from(".pangu/checkpoints");
-        config.checkpoint.exclude_roots = vec![PathBuf::from("../elsewhere")];
+        let outside = root
+            .parent()
+            .expect("temp root has a parent")
+            .join("definitely-not-the-workspace");
+        config.checkpoint.exclude_roots = vec![outside];
         let error = config
             .validate()
-            .expect_err("excluding outside the workspace");
+            .expect_err("an absolute exclusion outside the workspace");
         assert!(
             error.to_string().contains("subdirectory of the workspace"),
             "unexpected error: {error}"
         );
+
         clean(root);
     }
 

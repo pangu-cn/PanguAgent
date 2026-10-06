@@ -290,6 +290,11 @@ impl ConsoleSink {
             EventKind::RollbackFailed => "  × ",
             EventKind::FailedPathRecorded => "  ! ",
             EventKind::ContextAssembled => "◧ ctx ",
+            EventKind::PhaseChanged => "⇄ phase",
+            EventKind::ProviderSwitched => "⇄ prov ",
+            EventKind::MemoryProposed => "✎ mem ",
+            EventKind::DeliverableRecorded => "◇ del  ",
+            EventKind::TaskDelegated => "⇒ sub  ",
         };
         let mut output = format!("{tag} ");
         if let Some(tool) = &event.tool {

@@ -101,6 +101,16 @@ pub enum StreamKind {
     RollbackFailed,
     FailedPathRecorded,
     ContextAssembled,
+    /// F4: plan -> act phase transition (the `begin_act` control call).
+    PhaseChanged,
+    /// B5: switch to a declared fallback provider after a failure.
+    ProviderSwitched,
+    /// B3: a memory candidate was proposed (digest only, never content).
+    MemoryProposed,
+    /// D3/D4: a declared deliverable was recorded (digest only).
+    DeliverableRecorded,
+    /// D1: a bounded subtask was delegated to a restricted sub-agent.
+    TaskDelegated,
 }
 
 impl StreamKind {
@@ -155,6 +165,11 @@ impl StreamKind {
             Self::RollbackFailed,
             Self::FailedPathRecorded,
             Self::ContextAssembled,
+            Self::PhaseChanged,
+            Self::ProviderSwitched,
+            Self::MemoryProposed,
+            Self::DeliverableRecorded,
+            Self::TaskDelegated,
         ]
     }
 
@@ -189,6 +204,11 @@ impl StreamKind {
             EventKind::RollbackFailed => Self::RollbackFailed,
             EventKind::FailedPathRecorded => Self::FailedPathRecorded,
             EventKind::ContextAssembled => Self::ContextAssembled,
+            EventKind::PhaseChanged => Self::PhaseChanged,
+            EventKind::ProviderSwitched => Self::ProviderSwitched,
+            EventKind::MemoryProposed => Self::MemoryProposed,
+            EventKind::DeliverableRecorded => Self::DeliverableRecorded,
+            EventKind::TaskDelegated => Self::TaskDelegated,
         })
     }
 }
@@ -755,6 +775,11 @@ mod tests {
                 StreamKind::RollbackFailed => EventKind::RollbackFailed,
                 StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
                 StreamKind::ContextAssembled => EventKind::ContextAssembled,
+                StreamKind::PhaseChanged => EventKind::PhaseChanged,
+                StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
+                StreamKind::MemoryProposed => EventKind::MemoryProposed,
+                StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
+                StreamKind::TaskDelegated => EventKind::TaskDelegated,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -800,6 +825,11 @@ mod tests {
                     StreamKind::RollbackFailed => EventKind::RollbackFailed,
                     StreamKind::FailedPathRecorded => EventKind::FailedPathRecorded,
                     StreamKind::ContextAssembled => EventKind::ContextAssembled,
+                    StreamKind::PhaseChanged => EventKind::PhaseChanged,
+                    StreamKind::TaskDelegated => EventKind::TaskDelegated,
+                    StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
+                    StreamKind::MemoryProposed => EventKind::MemoryProposed,
+                    StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
                 },
                 0,
                 "hello",

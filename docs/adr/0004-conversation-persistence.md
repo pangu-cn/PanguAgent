@@ -16,7 +16,9 @@ ROADMAP 把 A1 写成"支持 resume、branch、fork、compaction；每个节点�
 
 **Journal 也不足以重建对话。** `ModelRequest` 只写 `messages=2 tools=7` 这样的计数，`ModelResponse` 只写 `"provider response received"`，都不带消息内容，也没有 `payload`。历史无法从 Journal 回放。
 
-**附带发现：`history_digest` 是死字段。** `SessionNode` 声明并校验它（`pangu-core/src/checkpoint.rs`），但全仓库没有任何一处赋非 `None` 的值。本文曾写“本 ADR 开始给它真正的含义”——**这句是错的**：真正被赋值的是 `ConversationSnapshot.history_digest`，那是一个新结构上的新字段；`SessionNode.history_digest` 截至本文**依然没有任何非 `None` 赋值**，仍是死字段（现状见 §7 实现状态末尾）。
+**附带发现：`history_digest` 是死字段。** `SessionNode` 声明并校验它（`pangu-core/src/checkpoint.rs`），但全仓库没有任何一处赋非 `None` 的值。本文曾写“本 ADR 开始给它真正的含义”——**这句是错的**：真正被赋值的是 `ConversationSnapshot.history_digest`，那是一个新结构上的新字段；`SessionNode.history_digest` 当时**依然没有任何非 `None` 赋值**，仍是死字段。
+
+> **后续（2026-10-05）**：该字段已打通，运行时在提交每个 session node 时赋值。细节与两个易错点在 §7 实现状态末尾。
 
 ## 2. 决策
 
@@ -43,7 +45,8 @@ ID：A1 会话持久化与恢复
 影响面：新增 ConversationSnapshot 概念（pangu-core）+ Artifact store 存取方法
       + agent 侧 save/restore 钩子 + CLI；门禁路径零改动（resume 后仍走完整
       Policy → Sandbox → Approval）；`ConversationSnapshot.history_digest` 开始
-      被真正赋值（`SessionNode.history_digest` 仍为死字段，见 §1 附带发现）；
+      被真正赋值（`SessionNode.history_digest` 当时仍为死字段，见 §1 附带发现；
+      该字段已于 2026-10-05 打通，见 §7 末尾）；
 
 数据/隐私：对话内容经 redact_text/redact_value 脱敏后存储；单条与总体积有界；
       不存凭据原值；导出时受 A5 的隐私检查约束；
@@ -83,7 +86,7 @@ ConversationSnapshot {
 }
 ```
 
-`history_digest` 由此**第一次**被真正赋值，`SessionNode.history_digest` 从死字段变成有效引用。
+`ConversationSnapshot.history_digest` 由此**第一次**被真正赋值。（`SessionNode.history_digest` 是**另一个**结构上的字段，当时仍未赋值——这一点曾被混淆，见 §1 附带发现；它已于 2026-10-05 打通。）
 
 ### 4.3 resume 的门禁保证（本 ADR 最重要的一条）
 
@@ -175,7 +178,7 @@ ConversationSnapshot {
 | 账本列举 | 完成 | `ArtifactStore::list_session_nodes()`；`MAX_SESSION_NODES = 100_000` 上界。**解析失败即报错而不是跳过**——静默丢一条分支会让"这里发生过什么"答错 |
 | 树导航 | 完成 | `session::SessionTree`（`crates/pangu-core/src/session.rs`，7 个单测）：`roots` / `children` / `ancestors` / `common_ancestor` / `by_checkpoint` / `render` |
 | **环检测** | 完成 | `ancestors()` 双重限界：visited 集合 + 步数上限。账本是手改的 JSON 目录，`parent` 指回祖先就会让朴素遍历**永久挂死**；现在按损坏账本报错。`render()` 同样有环保护 |
-| **孤儿不隐藏** | 完成 | `orphans()` + `ensure_complete()`。缺失的 parent **不提升为 root**——否则一次停在缺口上的遍历，看起来和一次走到历史开头完全一样 |
+| **孤儿不隐藏** | 完成 | `orphans()` + `ensure_complete()`。缺失的 parent **不提升为 root**——否则一次停在缺口上的遍历，看起来和一次走到历史开头完全一样。**已细化（2026-10-05）**：预期缺口与账本损坏分开报告，见下 |
 | 对话挂到节点 | 完成 | **接线前 `run_inner` 两处都传 `None`**，`session_node_id` 参数是死的。已接上 `checkpoint_state.session_node_id`；`invariant_i_a_saved_conversation_names_a_session_node_that_exists` 钉住 |
 | 每节点回放 | 完成 | `ConversationRuntime::at_node` / `replay_at`；只返回 `Vec<Message>`，**不恢复工作区**（那是 `pangu rollback`），`invariant_i_replaying_a_node_restores_no_workspace_and_grants_nothing` |
 | CLI | 完成 | `pangu session tree [--json]` / `pangu session replay NODE [--full] [--json]`；checkpoint 关闭时明确报错而非列空树 |
@@ -185,12 +188,23 @@ ConversationSnapshot {
 `SessionNode` 只在**提交检查点**时写进账本，而 `node_root_…` 只存在于 `RunCheckpointState` 内存里。结果是每次普通运行产生的树都**恰好有一个孤儿**：首个提交的节点其 parent 指向一个不在账本里的 id。
 
 - **不影响 rollback**：`rollback_transition_node_id` 是输入的确定性哈希（`hex_sha256(run_id:checkpoint_id:source_node:rollback_id)`），不查账本。账本原本就是为 rollback 记账设计的（见 `load_session_node_by_id` 的注释），不是为浏览而设计的。
-- **修不了**：`EventRef.event_id` 是**写 Journal 时才分配**的（`events.rs:264`），运行开始时拿不到真实 event id。给根节点编一个就是在可审计结构里塞假值，所以不编。
-- **处理方式**：`SessionTree` 如实报告缺口（`orphans()` / `ensure_complete()` / `render()` 标注 `orphan`），CLI 打 `WARNING`，`session replay` 直接拒绕。`invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden` 钉住这个行为。
-- **待决**：要么接受"运行起点不可回溯"（F7 契约不动），要么改 F7 让 `EventRef` 在事件发出时就分配 `event_id`（影响 Journal 写入路径，F7 仍为 `provisional`）。
+- **修不了**：`EventRef.event_id` 是**写 Journal 时才分配**的（真实的推导见 `journal.rs:177`：`event_id = evt_sha256(prev_sha, "event-id:{seq}:{canonical}")`，依赖 Journal 写入时的 `seq` 与 `prev_sha`）。运行开始时这两者都不存在，所以拿不到真实 event id。给根节点编一个就是在可审计结构里塞假值，**而且编出来的值必然与 Journal 事后算出的值冲突**——那不是记录缺口，是制造一条会被验证拒绝的假记录。
+- **已决（2026-10-05）：接受"运行起点不可回溯"**，并停止把预期缺口与账本损坏混为一谈。
+  - 新增 `ROOT_NODE_PREFIX` 作为单一定义源；`SessionTree` 拆成 `run_root_gaps()`（每次运行都会有的那个）与 `unexplained_orphans()`（真正的洞）。
+  - `ensure_complete()` **只在存在未解释缺口时拒绝**。理由：每次运行都产生这一种孤儿，把它叫"损坏"等于训练操作者忽略真正重要的告警——那正是真缺口会被漏掉的方式。
+  - **报告没有减弱**：缺口仍在 `orphans()` 里、仍在 `render()` 里标注 `orphan`、`session tree --json` 新增 `run_root_gaps` 与 `unexplained_orphans` 两字段、CLI 用 note 明说这是本版本的工作方式。
+  - `session replay` 仍对**未解释**缺口拒绝；对预期缺口放行（它并不说明目标节点自身的 history 是否可走）。
+- **不变量已相应更新**：`invariant_i_a_session_tree_with_a_missing_root_is_reported_not_hidden` 现在断言的是**披露**（节点仍命名缺失的 parent、仍被归类、仍被渲染），而不是"必须拒绝导航"。原断言与它自己上方的文档注释互相矛盾——注释早就写明这是"每次普通运行"的常态。
 
 **CLI 接线时发现的两个既有 bug（非本次引入，均已修）**：
 - ① `demo()` 只应用了 `CliOverrides { unattended: true }`，**没应用 `--checkpoint` / `--no-checkpoint`**。用户要求了却没得到，**连警告都没有**，而且两个方向都错：`pangu --checkpoint --demo` 静默不开检查点，`--config cfg(enabled=true) --no-checkpoint --demo` 静默照开。
 - ② 曾记为“自定义相对 `checkpoint.artifact_root` 会让 `--demo` 报 `checkpoint creation failed`”——**这条描述是错的，已纠正**。真实原因：快照遍历整个工作区，而默认 `forbidden_globs` 只有 `.git` / `.env` / secrets / 私钥，**不排除构建产物**，本仓库动辄数 GB 的 `target/` 必然撞上 64 MiB 上限。与 `artifact_root` 写相对还是绝对**无关**——用默认的 `.pangu/checkpoints` 一样失败。修法是新增 `checkpoint.exclude_roots`，并把超限错误改成指出具体是哪个文件越界。
 
-**本阶段未做**：`branch` / `fork`。**fork 的工作区隔离完全未解决**，见第 6 节。`SessionNode.history_digest` 依然是死字段——现在有真实的节点与对话可供它记录，赋值仍待做。
+**本阶段未做**：`branch` / `fork`。**fork 的工作区隔离完全未解决**，见第 6 节。
+
+**死字段已打通（2026-10-05）**：`SessionNode.history_digest` 此前声明、序列化、校验俱全，却**没有任何非 `None` 赋值**——一个永远缺席的字段比没有更糟，它读起来像"这个节点没有对话"，而真相是"从来没有人填过"。现在运行时在提交每个节点时赋值（`pangu-agent/src/checkpoint.rs::commit_after_success`），digest 由 `ConversationSnapshot::new` 生成——与写快照用的是**同一个构造器**（含同一步脱敏），所以节点上的值与存储的快照值可比。
+
+两个容易做错的点，都已按正确做法落地并被测试钉住（`crates/pangu/tests/session_node_digest.rs`）：
+
+- **时序**：tool result 在 checkpoint 提交**之后**才 `history.push`，所以 digest 必须在 push 之前、用"即将落地的那条 tool result"做投影计算。用 push 前的 history 算，节点就会指向一个会话**从未处于**的状态，`session replay` 随后报出的 digest 匹配不上任何快照。
+- **节点 digest ≠ replay 输出**：一个节点上会有多个快照（逐 turn 一次 + 终局一次），`replay` 按设计报**最新**那个，而节点记录的是**创建它那一刻**的状态。所以正确的不变量是"节点 digest 等于存于该节点的**某一个**快照"，**不是**"等于 replay 的输出"——后者是这个设计从未承诺过的事，断言它只会得到一个假失败。
