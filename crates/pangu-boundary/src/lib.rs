@@ -2,6 +2,7 @@
 //! approval. The crate owns decisions but never performs tool side effects.
 
 pub mod approval;
+pub mod browser;
 pub mod budget;
 pub mod config;
 pub mod execution;

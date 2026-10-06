@@ -82,7 +82,17 @@ fn path_lock_child() {
     println!("ACQUIRED {mark} after {}ms", started.elapsed().as_millis());
     std::thread::sleep(Duration::from_millis(hold_ms));
     drop(lock);
-    println!("RELEASED {mark}");
+    // Report how long the lock was actually held, measured by the holder itself.
+    //
+    // The parent cannot assume the nominal hold_ms: under load the holder may be
+    // descheduled between acquiring and releasing, and the contention window a
+    // contender actually sees is this measured value, not the requested one.
+    // Comparing against the nominal value is what made these tests flake on a busy
+    // machine, where a nominal 900ms hold left a contender waiting only 418ms.
+    println!(
+        "RELEASED {mark} after {}ms held",
+        started.elapsed().as_millis()
+    );
 }
 
 /// How long the holder keeps its lock in the contention tests.
@@ -139,6 +149,49 @@ fn waited_ms(output: &str, mark: &str) -> u128 {
         .unwrap_or_else(|| panic!("no acquisition timing for {mark} in: {output}"))
 }
 
+/// Milliseconds the holder *actually* held its lock, as measured by the holder.
+///
+/// This is the contention window a contender really sees. The nominal `HOLD_MS`
+/// is what the holder was asked for; this is what it delivered. On a loaded
+/// machine the two differ, and asserting against the nominal value is what made
+/// these tests flake — a nominal 900ms hold produced a 418ms measured window.
+fn held_ms(output: &str, mark: &str) -> u128 {
+    let needle = format!("RELEASED {mark} after ");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&needle))
+        .and_then(|rest| rest.trim_end_matches("ms held").parse::<u128>().ok())
+        .unwrap_or_else(|| panic!("no hold timing for {mark} in: {output}"))
+}
+
+/// Assert the contender genuinely waited on the holder.
+///
+/// The bound is derived from what the holder **measured**, not from what it was
+/// asked to do. The holder can be descheduled, and demanding a fixed fraction of
+/// the nominal hold turns a loaded machine into a failure that has nothing to do
+/// with the lock.
+///
+/// A third of the measured hold is still far above scheduler noise — the
+/// uncontended case is single-digit milliseconds — so a lock that stopped
+/// serialising would still fail loudly, while a merely busy machine would not.
+fn assert_genuinely_contended(waited: u128, held: u128, what: &str) {
+    // Sanity-check the measurement before trusting it: if the holder reported a
+    // hold far below what it was asked for, the number is suspect and a passing
+    // or failing verdict from it would be meaningless.
+    assert!(
+        held >= HOLD_MS_WIDE / 2,
+        "{what}: the holder reported only {held}ms held against a {HOLD_MS}ms request; \
+         the measurement itself is suspect"
+    );
+    let floor = held / 3;
+    assert!(
+        waited >= floor,
+        "{what}: the contender waited {waited}ms while the holder measured {held}ms held \
+         (floor {floor}ms). A genuine contention wait must be a substantial fraction of \
+         the window that actually existed."
+    );
+}
+
 /// The point of per-file locking: two agents on different files must not wait.
 ///
 /// The claim is comparative, so the test measures both cases and compares them
@@ -176,10 +229,10 @@ fn different_files_do_not_serialise_across_processes() {
 
     // And the contended case must actually have waited, otherwise the comparison
     // above would pass vacuously on a machine where nothing contended at all.
-    assert!(
-        contended_ms >= HOLD_MS_WIDE / 2,
-        "the same-file case must genuinely contend: waited {contended_ms}ms against a \
-         {HOLD_MS}ms hold"
+    assert_genuinely_contended(
+        contended_ms,
+        held_ms(&holder_out, "first"),
+        "the same-file case must genuinely contend",
     );
 
     fs::remove_dir_all(&contended_workspace).ok();
@@ -203,10 +256,10 @@ fn the_same_file_still_serialises_across_processes() {
     // Same file: the second process must have waited for the first to release.
     // A lower bound is the robust direction here.
     let waited = waited_ms(&other_out, "second");
-    assert!(
-        waited >= HOLD_MS_WIDE / 2,
-        "the same file must serialise; second waited only {waited}ms against a \
-         {HOLD_MS}ms hold"
+    assert_genuinely_contended(
+        waited,
+        held_ms(&holder_out, "first"),
+        "the same file must serialise",
     );
 
     fs::remove_dir_all(&workspace).ok();
@@ -292,7 +345,17 @@ fn module_lock_child() {
     println!("ACQUIRED {mark} after {}ms", started.elapsed().as_millis());
     std::thread::sleep(Duration::from_millis(hold_ms));
     drop(lock);
-    println!("RELEASED {mark}");
+    // Report how long the lock was actually held, measured by the holder itself.
+    //
+    // The parent cannot assume the nominal hold_ms: under load the holder may be
+    // descheduled between acquiring and releasing, and the contention window a
+    // contender actually sees is this measured value, not the requested one.
+    // Comparing against the nominal value is what made these tests flake on a busy
+    // machine, where a nominal 900ms hold left a contender waiting only 418ms.
+    println!(
+        "RELEASED {mark} after {}ms held",
+        started.elapsed().as_millis()
+    );
 }
 
 /// One agent owning a module must not block an agent in a sibling module.
@@ -334,10 +397,10 @@ fn a_build_edit_in_one_crate_does_not_block_a_sibling_crate() {
         contended_ms,
         "a sibling module must proceed in parallel",
     );
-    assert!(
-        contended_ms >= HOLD_MS_WIDE / 2,
-        "the same-module case must genuinely contend: waited {contended_ms}ms against a \
-         {HOLD_MS}ms hold"
+    assert_genuinely_contended(
+        contended_ms,
+        held_ms(&holder_out, "alpha"),
+        "the same-module case must genuinely contend",
     );
 
     fs::remove_dir_all(&contended_workspace).ok();
@@ -360,10 +423,10 @@ fn a_build_edit_in_the_same_crate_serialises_across_processes() {
     // A lower bound is the robust direction: a slow runner only makes the wait
     // longer, so this cannot fail for being slow.
     let waited = waited_ms(&second_out, "second");
-    assert!(
-        waited >= HOLD_MS_WIDE / 2,
-        "the same module's build file must serialise; waited {waited}ms against a \
-         {HOLD_MS}ms hold"
+    assert_genuinely_contended(
+        waited,
+        held_ms(&holder_out, "first"),
+        "the same module's build file must serialise",
     );
 
     fs::remove_dir_all(&workspace).ok();

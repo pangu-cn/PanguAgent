@@ -1,6 +1,7 @@
 //! Built-in tools. Every executor is an adapter around the Agent capability
 //! protocol; no public method accepts an unverified model call for execution.
 
+pub mod browser;
 pub mod mcp_executor;
 pub mod mcp_stdio;
 
@@ -47,6 +48,16 @@ pub struct Toolkit {
     /// command instead of falling back to the host. Preventing that fallback is
     /// the reason this field exists.
     runtime: Option<std::sync::Arc<pangu_boundary::runtime::Runtime>>,
+    /// F9: the browser session, when a browser is configured.
+    ///
+    /// `None` means the browser tools do not exist, exactly as if F9 were not
+    /// compiled in — the same discipline as `memory` and `skills`. A tool that
+    /// is advertised but cannot run is worse than an absent one.
+    browser: Option<std::sync::Arc<browser::BrowserSlot>>,
+    /// F9: the resolved browser configuration.
+    browser_config: Option<std::sync::Arc<pangu_boundary::browser::BrowserConfig>>,
+    /// F9: where screenshots are written, inside the writable boundary.
+    browser_artifact_dir: Option<std::sync::Arc<PathBuf>>,
 }
 
 impl Toolkit {
@@ -63,6 +74,9 @@ impl Toolkit {
             memory: None,
             skills: None,
             runtime: None,
+            browser: None,
+            browser_config: None,
+            browser_artifact_dir: None,
         }
     }
 
@@ -97,6 +111,49 @@ impl Toolkit {
     /// F8: the attached runtime, if any.
     pub fn runtime(&self) -> Option<&std::sync::Arc<pangu_boundary::runtime::Runtime>> {
         self.runtime.as_ref()
+    }
+
+    /// F9: attach a browser.
+    ///
+    /// Until this is called the browser tools are **not advertised at all**:
+    /// a model cannot call a capability the operator did not enable, and an
+    /// operator who did not configure a browser should not see browser tools in
+    /// the list.
+    ///
+    /// `artifact_dir` receives screenshots. It must be inside a writable root,
+    /// so screenshots are covered by the same rules as every other run artifact.
+    pub fn with_browser(
+        mut self,
+        config: pangu_boundary::browser::BrowserConfig,
+        artifact_dir: PathBuf,
+    ) -> Self {
+        self.browser = Some(std::sync::Arc::new(browser::BrowserSlot::new()));
+        self.browser_config = Some(std::sync::Arc::new(config));
+        self.browser_artifact_dir = Some(std::sync::Arc::new(artifact_dir));
+        self
+    }
+
+    /// F9: whether a browser is configured.
+    pub fn has_browser(&self) -> bool {
+        self.browser.is_some()
+    }
+
+    /// F9: whether a browser session is currently open.
+    pub fn browser_is_open(&self) -> bool {
+        self.browser
+            .as_ref()
+            .map(|slot| slot.is_open())
+            .unwrap_or(false)
+    }
+
+    /// F9: close the browser session, releasing the process and its profile.
+    ///
+    /// Called at the end of a run so a headless browser is not left holding a
+    /// profile directory and a port into the next run.
+    pub fn close_browser(&self) {
+        if let Some(slot) = &self.browser {
+            slot.close();
+        }
     }
 
     /// B3: the memory store handle, if attached.
@@ -251,6 +308,194 @@ impl Toolkit {
         }
         CapabilityManifest::new(capabilities)
     }
+
+    /// F9: the risk and effect of a browser action.
+    ///
+    /// `browser_open` is the interesting case: it is an **outbound network
+    /// action**, so it declares its host exactly as `http_fetch` does. Without
+    /// that, the network boundary would never see where the browser went, and a
+    /// page could be loaded from a host the operator never allowed.
+    ///
+    /// `browser_click` and `browser_type` are **not** read-only: the page
+    /// decides what a click does, so classifying them as observations would let
+    /// a state-changing action skip the human gate.
+    fn assess_browser(&self, call: &ToolCall, sandbox: &Sandbox) -> Result<ToolAssessment> {
+        // The effect kind decides the branch; whether a host is declared is
+        // expressed by declaring one below, not by a flag checked separately.
+        let (kind, _) = browser::describe(&call.name)
+            .ok_or_else(|| anyhow!("`{}` is not a browser tool", call.name))?;
+        if self.browser.is_none() {
+            // The spec is not advertised in this case, so reaching here means a
+            // caller invented the tool name.
+            bail!(
+                "`{}` is not available: no browser is configured ([browser] enabled)",
+                call.name
+            );
+        }
+
+        match kind {
+            "read" => {
+                ensure_allowed_keys(&call.args, &[])?;
+                Ok(
+                    ToolAssessment::new(Risk::ReadOnly).with_effect(EffectDescriptor::new(
+                        EffectScope::ProcessRead,
+                        Reversibility::NoEffect,
+                    )),
+                )
+            }
+            "external_mutation" => {
+                let mut assessment = ToolAssessment::new(Risk::Reversible).with_effect(
+                    EffectDescriptor::new(EffectScope::ExternalMutation, Reversibility::Reversible),
+                );
+                match call.name.as_str() {
+                    "browser_click" => {
+                        ensure_allowed_keys(&call.args, &["selector"])?;
+                        let selector = browser::required_selector(&call.args)?;
+                        assessment.preview = format!("click {selector}");
+                    }
+                    _ => {
+                        ensure_allowed_keys(&call.args, &["text"])?;
+                        let text = required_string(&call.args, "text")?;
+                        // The text is previewed in a bounded, redacted form: it
+                        // can contain anything, including a secret the operator
+                        // would not expect to see echoed into a journal.
+                        assessment.preview = format!("type {:?}", truncate_preview(&text, 200));
+                    }
+                }
+                Ok(assessment)
+            }
+            "external_read" => {
+                ensure_allowed_keys(&call.args, &["url"])?;
+                let url = required_string(&call.args, "url")?;
+                let parsed = url::Url::parse(&url)
+                    .map_err(|error| anyhow!("`url` is not a valid URL: {error}"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    bail!(
+                        "browser navigation only supports http and https; got `{}`",
+                        parsed.scheme()
+                    );
+                }
+                if parsed.host_str().is_none() {
+                    bail!("the URL has no host");
+                }
+                let host_name = parsed
+                    .host_str()
+                    .expect("checked above")
+                    .to_ascii_lowercase();
+                let port = parsed.port_or_known_default().unwrap_or(443);
+                let host = if host_name.contains(':') {
+                    format!("[{host_name}]:{port}")
+                } else {
+                    format!("{host_name}:{port}")
+                };
+                // Validate the host through the same boundary `http_fetch`
+                // uses: navigation is an outbound request.
+                sandbox.check_host(&host)?;
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::ExternalRead,
+                        Reversibility::NoEffect,
+                    ))
+                    .host(host);
+                assessment.preview = format!("GET {} (browser)", url_preview(&url));
+                Ok(assessment)
+            }
+            other => bail!("unhandled browser effect kind `{other}`"),
+        }
+    }
+
+    /// F9: run a browser action against the session.
+    ///
+    /// The session is opened lazily on first use and kept for the rest of the
+    /// run: a session per call would lose the page between a click and the read
+    /// that follows it, and that sequence is what computer use consists of.
+    fn execute_browser(&self, action: &VerifiedAction) -> Result<ToolOutput> {
+        let slot = self
+            .browser
+            .as_ref()
+            .ok_or_else(|| anyhow!("no browser is configured"))?;
+        let config = self
+            .browser_config
+            .as_ref()
+            .ok_or_else(|| anyhow!("no browser is configured"))?;
+        let artifact_dir = self
+            .browser_artifact_dir
+            .as_ref()
+            .ok_or_else(|| anyhow!("no browser artifact directory is configured"))?;
+
+        let name = action.call().name.as_str();
+        let args = action.call().args.clone();
+
+        slot.with(
+            config,
+            self.runtime.as_deref(),
+            artifact_dir.as_ref().clone(),
+            |handle| match name {
+                "browser_open" => {
+                    let url = required_string(&args, "url")?;
+                    let session = handle.session()?;
+                    session.navigate(&url)?;
+                    // Returning the page immediately saves a round trip: an
+                    // `open` that yielded only "ok" would oblige the model to
+                    // read next, doubling the calls for the common case.
+                    let snapshot = session.snapshot()?;
+                    Ok(browser::output(
+                        browser::render_snapshot(
+                            &snapshot.url,
+                            &snapshot.title,
+                            &snapshot.text,
+                            snapshot.truncated,
+                        ),
+                        Some(format!("navigated to {}", snapshot.url)),
+                    ))
+                }
+                "browser_read" => {
+                    let session = handle.session()?;
+                    let snapshot = session.snapshot()?;
+                    Ok(browser::output(
+                        browser::render_snapshot(
+                            &snapshot.url,
+                            &snapshot.title,
+                            &snapshot.text,
+                            snapshot.truncated,
+                        ),
+                        None,
+                    ))
+                }
+                "browser_screenshot" => {
+                    let session = handle.session()?;
+                    let png = session.screenshot()?;
+                    let bytes = png.len();
+                    let name = handle.save_screenshot(&png)?;
+                    Ok(browser::output(
+                        format!("screenshot saved as {name} ({bytes} bytes, PNG)"),
+                        // The evidence is the file that now exists, not a claim
+                        // that a capture happened.
+                        Some(format!("screenshot:{name}:{bytes}")),
+                    ))
+                }
+                "browser_click" => {
+                    let selector = browser::required_selector(&args)?;
+                    let session = handle.session()?;
+                    session.click(&selector)?;
+                    Ok(browser::output(
+                        format!("clicked {selector}"),
+                        Some(format!("clicked:{selector}")),
+                    ))
+                }
+                "browser_type" => {
+                    let text = required_string(&args, "text")?;
+                    let session = handle.session()?;
+                    session.type_text(&text)?;
+                    Ok(browser::output(
+                        format!("typed {} characters", text.chars().count()),
+                        Some(format!("typed:{}", text.chars().count())),
+                    ))
+                }
+                other => bail!("`{other}` has no browser handler"),
+            },
+        )
+    }
 }
 
 #[async_trait]
@@ -388,6 +633,19 @@ impl ToolExecutor for Toolkit {
                     }
                 }),
             ));
+        }
+        // F9: advertise the browser tools only when the operator configured a
+        // browser. Until then they do not exist, so the model cannot call a
+        // capability that was never enabled.
+        if self.browser.is_some() {
+            for name in browser::BROWSER_TOOLS {
+                let (description, schema) = browser::description(name)
+                    .zip(browser::schema(name))
+                    .unwrap_or_else(|| {
+                        unreachable!("every browser tool has a description and a schema")
+                    });
+                specs.push(ToolSpec::new(name, description, schema));
+            }
         }
         specs
     }
@@ -624,6 +882,7 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            name if browser::is_browser_tool(name) => self.assess_browser(call, sandbox),
             other => bail!("unknown tool `{other}`"),
         }
     }
@@ -638,6 +897,7 @@ impl ToolExecutor for Toolkit {
             "git_diff" => execute_command(action, self.runtime.as_deref()).await,
             "run_command" => execute_command(action, self.runtime.as_deref()).await,
             "verify" => execute_verify(action, self.runtime.as_deref()).await,
+            name if browser::is_browser_tool(name) => self.execute_browser(action),
             "propose_memory" => {
                 let store = self
                     .memory
@@ -668,6 +928,24 @@ fn url_preview(raw: &str) -> String {
         url.set_path(&format!("/[path_sha256={}]", short_hash(&path)));
     }
     url.to_string()
+}
+
+/// Bound a string for display, marking clearly when it was cut.
+///
+/// A preview is a claim about what an action will do, so a silently shortened
+/// one would misrepresent the action. The marker makes the omission visible.
+///
+/// Slicing respects character boundaries: cutting mid-codepoint would panic on
+/// the next `chars()` call, and the input here is model- and page-controlled.
+fn truncate_preview(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(max_chars).collect();
+    format!(
+        "{kept}…({} more characters)",
+        value.chars().count() - max_chars
+    )
 }
 
 fn ensure_allowed_keys(args: &Value, allowed: &[&str]) -> Result<()> {

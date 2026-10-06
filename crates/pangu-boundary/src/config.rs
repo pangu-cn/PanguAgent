@@ -54,6 +54,93 @@ pub struct Config {
     /// no digest change.
     #[serde(default)]
     pub eval: EvalSection,
+    /// F9: the built-in browser. Disabled by default: the browser tools are
+    /// not advertised, so the model cannot call a capability the operator did
+    /// not enable.
+    #[serde(default)]
+    pub browser: BrowserSection,
+}
+
+/// F9: built-in browser configuration.
+///
+/// Disabled by default. When enabled, the browser tools become part of the
+/// advertised tool set and pass through the same L1–L4 chain as every other
+/// tool: navigation declares its host, and a click is a mutation rather than an
+/// observation.
+///
+/// `Default` is derived rather than written out: the default is "off, search for
+/// a browser, no network, no extra flags", and every field's own default already
+/// says exactly that — so a hand-written `impl` could only drift from it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserSection {
+    pub enabled: bool,
+    /// Absolute path to a Chromium-based browser. `None` = search the usual
+    /// locations.
+    pub executable: Option<String>,
+    /// Whether the page may reach the network. `false` (the default) restricts
+    /// what a loaded page can do on its own initiative; it is **not** a sandbox
+    /// — that is `[execution] runtime`'s job.
+    pub network: bool,
+    /// Extra command-line flags, appended verbatim after the built-in ones.
+    pub args: Vec<String>,
+}
+
+impl BrowserSection {
+    /// Validate the section, refusing a configuration that cannot work.
+    ///
+    /// Checked at config time rather than at first use, because an operator who
+    /// enabled the browser and pointed it at a missing executable should hear
+    /// about it at startup — not when a model first tries to click.
+    pub fn validate(&self) -> pangu_core::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if let Some(executable) = &self.executable {
+            let trimmed = executable.trim();
+            if trimmed.is_empty() {
+                return Err(pangu_core::Error::Config(
+                    "[browser] executable is set but empty; remove it to search the default \
+                     locations, or give an absolute path"
+                        .into(),
+                ));
+            }
+            if trimmed.chars().any(char::is_control) {
+                return Err(pangu_core::Error::Config(
+                    "[browser] executable contains a control character".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(pangu_core::Error::Config(
+                    "[browser] executable is longer than 4096 bytes".into(),
+                ));
+            }
+            let path = std::path::Path::new(trimmed);
+            if !path.is_absolute() {
+                return Err(pangu_core::Error::Config(format!(
+                    "[browser] executable must be an absolute path; got `{trimmed}`"
+                )));
+            }
+            if !path.is_file() {
+                return Err(pangu_core::Error::Config(format!(
+                    "[browser] executable points at {trimmed}, which is not a file"
+                )));
+            }
+        }
+        for argument in &self.args {
+            if argument.trim().is_empty() {
+                return Err(pangu_core::Error::Config(
+                    "[browser] args contains an empty entry".into(),
+                ));
+            }
+            if argument.chars().any(char::is_control) {
+                return Err(pangu_core::Error::Config(format!(
+                    "[browser] args contains a control character in `{argument}`"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// B3: controlled memory candidate queue configuration. Disabled by default:
@@ -746,6 +833,9 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.budget.validate()?;
+        // F9: a browser that cannot start must be reported at config time, not
+        // when a model first clicks.
+        self.browser.validate()?;
         if self.unattended && self.boundary.approval.mode != ApprovalMode::Never {
             return Err(Error::Config(
                 "unattended runs must use approval.mode = never".into(),

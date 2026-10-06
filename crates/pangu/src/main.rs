@@ -2044,6 +2044,7 @@ async fn rollback_command(
             None => base,
         };
         let base = attach_runtime(base, &config, contract.workspace());
+        let base = attach_browser(base, &config, contract.workspace())?;
         Arc::new(base)
     };
     let mut agent = Agent::new(
@@ -2177,6 +2178,39 @@ fn attach_runtime(toolkit: Toolkit, config: &Config, workspace: &std::path::Path
         .runtime_config(workspace.to_path_buf())
         .resolve();
     toolkit.with_runtime(Arc::new(runtime))
+}
+
+/// F9: attach the browser when the operator enabled it.
+///
+/// Returns the toolkit unchanged when `[browser] enabled = false` (the default),
+/// in which case the browser tools are **not advertised at all** — the model
+/// cannot call a capability the operator did not turn on.
+///
+/// A configuration error is reported rather than degraded: an operator who
+/// enabled the browser and pointed it at a missing executable should hear about
+/// it at startup, not discover it when a model first clicks.
+fn attach_browser(
+    toolkit: Toolkit,
+    config: &Config,
+    workspace: &std::path::Path,
+) -> Result<Toolkit> {
+    if !config.browser.enabled {
+        return Ok(toolkit);
+    }
+    let profile = pangu_boundary::browser::profile_dir_under(
+        &workspace.join(".pangu").join("runs"),
+        &format!("browser-{}", unix_nanos()),
+    );
+    let browser_config = pangu_toolkit::browser::resolve_config(
+        config.browser.executable.as_deref(),
+        profile,
+        config.browser.network,
+        config.browser.args.clone(),
+    )?;
+    // Screenshots go inside the run's own storage so they are covered by the
+    // same rules as every other artifact, and are cleaned up with the run.
+    let artifacts = workspace.join(".pangu").join("artifacts").join("browser");
+    Ok(toolkit.with_browser(browser_config, artifacts))
 }
 
 /// registry lives under `<workspace>/.pangu/skills/` (tool-forbidden); the
@@ -2339,6 +2373,7 @@ async fn execute_goal(
             None => base,
         };
         let base = attach_runtime(base, &config, contract.workspace());
+        let base = attach_browser(base, &config, contract.workspace())?;
         Arc::new(base)
     };
     let mut agent = Agent::with_chain(
