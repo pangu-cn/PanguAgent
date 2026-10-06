@@ -91,17 +91,39 @@ pub fn lock_file_path(workspace: &Path) -> PathBuf {
 /// Create the `.pangu` directory if needed and return the lock file path.
 fn prepare_lock_dir(workspace: &Path) -> Result<PathBuf> {
     let dir = workspace.join(WORKSPACE_LOCK_DIR);
-    fs::create_dir_all(&dir)?;
+    create_dir_all_tolerant(&dir)?;
     Ok(dir.join(WORKSPACE_LOCK_FILE))
+}
+
+/// Create a directory tree, tolerating a concurrent creator.
+///
+/// `fs::create_dir_all` is not atomic across processes: on Windows two threads
+/// or processes creating the same tree at once make the loser fail with
+/// `PermissionDenied` (os error 5) rather than succeeding, even though the
+/// directory now exists and is perfectly usable. That surfaced as a spurious
+/// failure in a 20-thread contention test.
+///
+/// A directory that exists after the call is the condition that matters, so the
+/// error is re-checked against that: if the path is a directory now, the call
+/// succeeded regardless of what it reported.
+fn create_dir_all_tolerant(dir: &Path) -> Result<()> {
+    match fs::create_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // The race is benign only if someone else completed the work.
+            if dir.is_dir() {
+                Ok(())
+            } else {
+                Err(error.into())
+            }
+        }
+    }
 }
 
 /// Create the parent directory of an explicit lock file path.
 fn prepare_parent(path: &Path) -> Result<()> {
     match path.parent() {
-        Some(parent) => {
-            fs::create_dir_all(parent)?;
-            Ok(())
-        }
+        Some(parent) => create_dir_all_tolerant(parent),
         None => Err(Error::Config(format!(
             "lock file path has no parent directory: {}",
             path.display()
