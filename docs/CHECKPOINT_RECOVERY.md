@@ -200,6 +200,7 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 - snapshot 不记录 snapshot root 目录自身的权限/元数据，只记录 root 下的子项。
 - 目录权限计入 snapshot digest，因此 Unix 上的 `chmod`（包括为恢复而调整权限）会被当作 drift 拒绝，且拒绝发生在写 operation 记录之前（见第 4.4 节）。
 - Git backend 未实现，也不会隐式创建 commit、branch、tag、stash 或修改 index。
+- **symlink 与目录权限的验证只在 Unix 上存在**：相关测试是 `#[cfg(unix)]` 条件编译的，在 Windows 上根本不会被收集。因此 Windows 部署无论如何都拿不到这两栏证据（见 §9.1 的平台条件编译表）。判定"snapshot 会拒绝 symlink 而不是静默忽略"这类行为**只有 POSIX 证据**。
 - 快照遍历整个工作区，`forbidden_globs` 默认只挡 `.git`/`.env`/secrets/私钥，**不挡构建产物**。仓库里若有巨大的 `target/`，checkpoint 会撞上 `max_snapshot_bytes` 并按 `failure_policy` 终止运行；错误信息会指出具体是哪个文件越界。处理办法是在 `checkpoint.exclude_roots` 里声明该目录，或调高上限。
   - 排除是有代价的，不是免费的性能开关：被排除的目录**不会被回退**，所以只能排除真正可重建的内容。排除前拍的旧 checkpoint 会在 restore 时**明确失败并指出是哪个排除根挡住的**，不会部分回退。
 - `pangu artifact inspect` 只读且有界：条目数、深度、checkpoint/operation 数量和 replacement backup 数量都有上限，截断时显式报告；它不判断 CAS 漂移，也不替代 `pangu rollback` 的前置校验。
@@ -216,7 +217,7 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 - [x] 配置、CLI、Journal、Artifact schema、inspection schema 和恢复手册版本相互匹配，并在 ADR/ROADMAP/README 中一致标为实验性 opt-in。
 - [x] 默认配置仍关闭 checkpoint，Git backend 仍明确未实现。
 - [x] Ubuntu 与 Windows CI 完成 `cargo fmt --check`、`cargo check/test/clippy --workspace --all-targets --all-features` 并保存跨平台 drill 报告（run 36210280753，提交 `1b0245d`，见 8.1）。
-- [ ] **目标部署平台**单独通过 snapshot/restore、symlink、权限测试。（Windows 与 Ubuntu 已有 CI 证据；replacement hand-off 只在 Windows 成立，POSIX 上该 drill 为 `not-applicable`，见 8.1）→ **见 §9.1**
+- [ ] **目标部署平台**单独通过 snapshot/restore、symlink、权限测试。（Windows 与 Ubuntu 已有 CI 证据；replacement hand-off 只在 Windows 成立，POSIX 上该 drill 为 `not-applicable`；symlink 与目录权限测试为 `#[cfg(unix)]`，Windows 上不存在，见 §9.1 的表）→ **见 §9.1**
 - [ ] 由 operator/发布负责人明确批准激活；未批准前继续保持实验性 opt-in。→ **见 §9.4**
 
 ### 8.1 跨平台验收记录
@@ -264,25 +265,46 @@ CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/run
 
 **为什么不能靠 CI 代替**：CI 的 Windows/Ubuntu runner 不是目标部署平台。§7 已记录平台差异（Unix 无 replacement hand-off、目录权限计入 digest），这些差异在目标平台上可能又不一样。
 
-**怎么做**：
+**两件事都要做，缺一不算完成**。只跑下面第 1 步会留下一个空洞：`operator_drills` 覆盖的是**事故分支**（stale lock、CAS drift…），并不覆盖清单第 219 行点名的 snapshot/restore 正常路径、symlink 与权限；这三项在第 2 步的测试里，且**部分是平台条件编译的**（见下表）。
 
 ```bash
-# 在目标平台、用目标工具链，把仓库自身的演练跑一遍并留证。
+# 第 1 步：事故分支演练，产出可归档的 jsonl 证据。
 # 报告必须是绝对路径（cargo test 在包目录运行测试二进制）。
 PANGU_DRILL_REPORT="/绝对路径/f7-drill-$(hostname)-$(date +%Y%m%d).jsonl" \
 PANGU_DRILL_COMMIT="$(git rev-parse HEAD)" \
   cargo test -p pangu --test operator_drills -- --nocapture
+
+# 第 2 步：snapshot/restore、symlink、权限——清单第 219 行点名的三项。
+cargo test -p pangu-core --lib -- artifact::tests::restore_ \
+                                       artifact::tests::corrupt_blob_fails_before_restore \
+                                       artifact::tests::snapshot_rejects
+cargo test -p pangu --test rollback_cli
 ```
+
+第 2 步必须**看输出里的实际通过项数**，不能只看退出码为 0：条件编译的测试在被跳过的平台上根本不会被收集，过滤到一个空集合也会返回成功。至少要能对上表里适用本平台的条目。
+
+**平台条件编译（实测，非推断）**——以下几项只在对应平台上编译，另一个平台**不可能**产出该证据：
+
+| 测试 | 门槛 | Windows | Unix |
+|------|------|---------|------|
+| `artifact::tests::snapshot_rejects_symlinks_instead_of_silently_omitting_them` | `#[cfg(unix)]` | 不适用 | 应通过 |
+| `artifact::tests::snapshot_rejects_special_filesystem_entries`（Unix socket 等） | `#[cfg(unix)]` | 不适用 | 应通过 |
+| `artifact::tests::restore_applies_directory_permissions_after_children` | `#[cfg(unix)]` | 不适用 | 应通过 |
+| `artifact::tests::restore_*`（其余 restore 用例）| 无 | 应通过 | 应通过 |
+| `artifact::tests::corrupt_blob_fails_before_restore` | 无 | 应通过 | 应通过 |
+| `rollback_cli::rollback_subcommand_restores_a_checkpoint_in_a_real_process` | 无 | 应通过 | 应通过 |
+
+**因此**：如果在 Windows 上做本项验收，symlink 与目录权限两栏只能记 `not-applicable`（机制由 POSIX 语义定义），**不能记为通过**；要同时拿到这两栏的证据，必须在 Unix 目标平台上另跑一次。这与 §6 对 `replace-backup` 的处理是同一原则。
 
 **判读规则（照抄 §6 的平台差异章节，不要"统一"成通过）**：
 
 | 结果 | 含义 |
 |------|------|
 | `pass` | 该分支在目标平台被演练到 |
-| `not-applicable` | 机制在该平台不存在（如 POSIX 的 replace-backup）。**不是通过**，也不构成对其它平台该保护的验证 |
+| `not-applicable` | 机制在该平台不存在（如 POSIX 的 replace-backup、Windows 上的 POSIX 目录权限）。**不是通过**，也不构成对其它平台该保护的验证 |
 | `skipped` | 未能演练（如以 root 运行导致权限机制失效）。**不是通过**；换成非特权账户重跑 |
 
-**留证**：把 jsonl 转录到 [`docs/evidence/`](evidence/)（格式见该目录 README），并在 §8.1 表格加一行。任何一个 drill 为 `not-applicable` 或 `skipped` 时，必须在该行注明原因，不能只写"通过"。
+**留证**：把 jsonl 转录到 [`docs/evidence/`](evidence/)（格式见该目录 README），并在 §8.1 表格加一行；第 2 步的通过项数与平台条件编译的适用情况一并写进该行的说明。任何一个 drill 为 `not-applicable` 或 `skipped` 时，必须在该行注明原因，不能只写"通过"。
 
 ### 9.2 并发 writer、外部 effect、无人工输入时的停止策略（需部署者书面确认）
 
