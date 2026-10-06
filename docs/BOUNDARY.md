@@ -201,14 +201,32 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
   - **发现范围有限且明示**：只读命名模块的声明（`[workspace] members`、`include`、`<modules>`、`workspaces`），**不**运行任何构建工具、不解析依赖、不执行插件逻辑。需要执行 Gradle 脚本才能得到的模块列表就得不到——猜一个比报告"没有"更糟。嵌套模块以最内层声明为准（更具体）。无模块声明的仓库是**单一单元**（`single_unit`，正常形态），不是"发现失败"——两者由 `single_unit` 与 `is_confident` 分别表达，不可混同。
   - **模块锁键与路径锁键不会碰撞**：模块键在 `module:` 命名空间下（真实相对路径不可能以该拼写开头，名为 `module` 的目录会产生 `module/...`，哈希不同），两者共用同一套排序取锁，因此"同时改构建文件与普通文件"和"按相反顺序改"不会死锁。
 
-### 执行后端声明（C5）
+### 执行后端声明（C5）与 OS 级沙箱（F8）
 
-`[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
+`[execution]` 有两个**承诺不同**的字段，必须分开读：
 
-- **声明不是验证**。Pangu 不启动、不管理、不验证容器、VM 或远程后端；从进程内部看它们与 local 无法区分。声明只进入 contract（digest 仅在声明时携带）、`RunStarted` 审计载荷和 `doctor`/`explain` 输出。
-- **声明不改变任何闸门**。L1–L4 在所有 profile 下逐位相同；容器/VM 边界由部署者的运行时提供，网络与凭据隔离由部署者负责——这不是 Pangu 提供的保证（见第 5 节非目标）。
+| 字段 | 含义 | 是否强制 |
+|------|------|----------|
+| `profile` | 操作者声明进程在哪里运行（`local` 默认 / `container` / `remote`） | 否——仅审计 |
+| `runtime` | 命令真正在哪个 OS 级沙箱里执行（F8） | **是** |
+
+关于 `profile`：
+
+- **声明不是验证**。Pangu 不启动、不管理、不验证 `profile` 所声称的后端；从进程内部看它们与 local 无法区分。声明只进入 contract（digest 仅在声明时携带）、`RunStarted` 审计载荷和 `doctor`/`explain` 输出。
+- **声明不改变任何闸门**。L1–L4 在所有 profile 下逐位相同。
 - 各 profile 的真实保护范围由 `doctor`/`explain` 引用固定话术陈述（见 `ExecutionProfile::scope_statement`）；修改话术与修改代码同等对待。
 - 提醒部署者：checkpoint 的 Artifact store 存在于声明的后端内；container/remote profile 下应确保 artifact_root 位于持久化存储，否则后端被替换时恢复点随之丢失。
+
+关于 `runtime`（F8，与上面的声明分开）：
+
+- **这是强制字段**。声明非 `local` 后，Pangu 会真正启动该运行时并在其中执行命令，而不是只写一行日志。
+- **探测后才可用**：只看二进制是否存在不够，必须在沙箱里真正跑通一条命令。探测报告的是**观察到的行为**，不是无法支撑的安全断言。
+- **fail-closed，无宿主机退回**：探测失败即**拒绝执行命令**。理由见下条。
+- **为什么没有退回**：运行记录里写着操作者声明的运行时，实际却在宿主机上跑，会让这条记录变成假的——操作者会以为自己拥有并不存在的隔离。`local` 仍然可用且诚实，但必须是主动选择的，不能是失败后的兜底。
+- **`auto` 的优先级按内核边界强度**：firecracker > gvisor > oci。这个顺序是规范的一部分，不是实现细节。
+- **明确选择不会被降级**：要求 firecracker 而机器上只有 docker，是错误而不是静默降级——降级会给比操作者接受的更弱的隔离。
+- **Firecracker 尚不能驱动到完成**（缺 vsock/串口通道），因此当前始终报告不可用。声称一个从不启动的微 VM，正是本节要消除的那类失败。
+- **探测不验证隔离是否无法逃逸**：那是运行时自身的属性，启动器无法证明。
 
 阶段二实现和测试已经存在，但在正式激活/支持声明前，本节和第 4.1 节是条件性实验规范；部署者仍须遵守第 4.1 节的 operator recovery 限制。
 
@@ -265,12 +283,17 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 24. **I-Deliverable-Evidence-Before-Complete**：仅当 goal 声明了交付物时生效。`complete` 必须通过每个交付物的运行时检查，检查失败回灌而非静默；交付快照（digest/时间/run）必须登记成功才算完成；人工签收只存在于 run 外，模型没有任何签收路径；`complete` 与 `accepted` 是两个不同的状态，不得混用。
 25. **I-Eval-Record-Not-Acceptance**：仅当 `[eval]` 已声明时生效。评测记录只含机器事实（终态、token、成本、证据计数、产物 digest），**没有 score 字段**，每条记录携带固定免责声明；记录中的状态不断言 issue 已修复；验收仍然只由 verify evidence 与人工签收构成；不声明 `[eval]` 时行为与 digest 完全不变。
 26. **I-Sub-Agent-Never-Wider**：仅当 `[boundary] allow_delegation` 已开启时生效。子 Agent 的 contract 由父 contract 派生，任何一维预算超过父级即拒绝；子的 sandbox/policy/审批面与父级相同，run 作用域特性全部剥离；子的事件进同一中央 Journal，花费聚合进父级账本；子不能再委派（深度 1，结构性）；委派事件只携带 task digest，不携带原文；关闭开关时行为与 digest 完全不变。
+27. **I-Sandbox-Declared-Means-Enforced**：仅当 `[execution] runtime` 非 `local` 时生效。声明的运行时必须**先探测通过**（在沙箱内真正跑通一条命令）才允许任何命令执行；探测失败即拒绝，**不存在**任何退回宿主机执行的路径——否则审计里记录的运行时与实际执行不符，记录即为假。探测报告的是观察到的行为，不是"隔离攻不破"的断言。`auto` 按 firecracker > gvisor > oci 的内核边界强度择优；显式选择不得静默降级为更弱的运行时。`runtime = "local"`（默认）不进入本不变量，行为与 digest 完全不变。
 
 ## 5. 非目标
 
 - 不做通用聊天、角色扮演或“什么都问一句”的助手壳。
 - 不做多 agent DAG、工作流 SaaS 或模型训练/微调平台。
-- 不做 OS 级 seccomp、Landlock、容器或 VM 隔离。
+- **不再把 OS 级隔离列为非目标**（F8 起）：`[execution] runtime` 会真正启动
+  Firecracker/gVisor/OCI 并在其中执行命令。仍然不做的是：
+  - **不内置 seccomp/Landlock 过滤器**；要更强边界就声明 runtime，让运行时去提供。
+  - **不保证隔离无法逃逸**。我们保证的是"命令确实在声明的边界内执行"，不是
+    "该边界攻不破"——后者是运行时自身的属性，启动器无法证明。
 - 不承诺“永远不被绕过”，也不把 Pangu 当作运行不受信任代码的完整安全边界。
 - 不做遥测；除用户配置的 provider endpoint 和显式允许的 HTTP 工具外，不主动出站。
 - 不实现 Anthropic 专用 provider；需要其他模型时使用 OpenAI-compatible endpoint。

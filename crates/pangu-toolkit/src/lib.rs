@@ -39,6 +39,14 @@ pub struct Toolkit {
     /// B2: the skill registry. `None` = the `read_skill` tool does not
     /// exist, exactly as if B2 were not compiled in.
     skills: Option<std::sync::Arc<SkillRegistry>>,
+    /// F8: the resolved OS-level sandbox runtime. `None` means no runtime was
+    /// declared, which is the `local` profile: commands run on the host exactly
+    /// as before.
+    ///
+    /// When present this is **enforced**: an unusable runtime refuses the
+    /// command instead of falling back to the host. Preventing that fallback is
+    /// the reason this field exists.
+    runtime: Option<std::sync::Arc<pangu_boundary::runtime::Runtime>>,
 }
 
 impl Toolkit {
@@ -54,6 +62,7 @@ impl Toolkit {
             verify_command: command,
             memory: None,
             skills: None,
+            runtime: None,
         }
     }
 
@@ -70,6 +79,24 @@ impl Toolkit {
     pub fn with_skills(mut self, registry: std::sync::Arc<SkillRegistry>) -> Self {
         self.skills = Some(registry);
         self
+    }
+
+    /// F8: attach a resolved sandbox runtime.
+    ///
+    /// Callers pass the result of `RuntimeConfig::resolve`, which has already
+    /// probed. An attached runtime that turns out to be unusable makes every
+    /// command **fail** rather than run on the host.
+    pub fn with_runtime(
+        mut self,
+        runtime: std::sync::Arc<pangu_boundary::runtime::Runtime>,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// F8: the attached runtime, if any.
+    pub fn runtime(&self) -> Option<&std::sync::Arc<pangu_boundary::runtime::Runtime>> {
+        self.runtime.as_ref()
     }
 
     /// B3: the memory store handle, if attached.
@@ -608,9 +635,9 @@ impl ToolExecutor for Toolkit {
             "search" => execute_search(action).await,
             "write_file" => execute_write(action).await,
             "http_fetch" => execute_http(action).await,
-            "git_diff" => execute_command(action).await,
-            "run_command" => execute_command(action).await,
-            "verify" => execute_verify(action).await,
+            "git_diff" => execute_command(action, self.runtime.as_deref()).await,
+            "run_command" => execute_command(action, self.runtime.as_deref()).await,
+            "verify" => execute_verify(action, self.runtime.as_deref()).await,
             "propose_memory" => {
                 let store = self
                     .memory
@@ -670,15 +697,34 @@ fn required_path(args: &Value, key: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
+/// Paths a read-only command is expected to read.
+///
+/// # Why `git` needs its own rule
+///
+/// For most commands the first non-flag argument is a path (`cat notes.txt`).
+/// For `git` it is a **subcommand**: in `git diff`, `diff` is not a file, and
+/// treating it as one made the sandbox try to resolve
+/// `<workspace>/diff`, fail with `os error 2` (the path does not exist), and
+/// deny the action. No `git` command could run through `run_command`.
+///
+/// Paths after a subcommand are still collected (`git diff -- src/main.rs`), and
+/// a bare `git diff` reads no named path — it reads the repository, which the
+/// sandbox cannot enumerate, so the read set is empty and correct: the action is
+/// still gated by `validate_argv`, which limits `git` to its read-only
+/// subcommands.
 fn command_read_paths(command: &str, args: &[String]) -> Result<Vec<PathBuf>> {
     let command = command.to_ascii_lowercase();
     if matches!(command.as_str(), "pwd" | "") {
         return Ok(Vec::new());
     }
+    // For `git`, skip the subcommand before collecting paths. Every other
+    // command's first bare argument is a path.
+    let subcommand_seen = command != "git";
     let mut paths = Vec::new();
     let mut pattern_seen = command != "grep";
     let mut skip_next = false;
     let mut after_separator = false;
+    let mut skipped_subcommand = subcommand_seen;
     for argument in args {
         if after_separator {
             paths.push(PathBuf::from(argument));
@@ -704,6 +750,10 @@ fn command_read_paths(command: &str, args: &[String]) -> Result<Vec<PathBuf>> {
             if matches!(argument.as_str(), "-e" | "--regexp") {
                 skip_next = true;
             }
+            continue;
+        }
+        if !skipped_subcommand {
+            skipped_subcommand = true;
             continue;
         }
         if skip_next {
@@ -1043,14 +1093,20 @@ fn resolve_executable(program: &str, sandbox: &Sandbox) -> Result<PathBuf> {
     bail!("executable `{program}` was not found outside the workspace")
 }
 
-async fn execute_command(action: &VerifiedAction) -> Result<ToolOutput> {
-    execute_command_tagged(action, "command").await
+async fn execute_command(
+    action: &VerifiedAction,
+    runtime: Option<&pangu_boundary::runtime::Runtime>,
+) -> Result<ToolOutput> {
+    execute_command_tagged(action, "command", runtime).await
 }
 
 /// F3: verify shares the run_command subprocess discipline (no shell, cleaned
 /// env, closed stdin, timeout, bounded output); only the evidence tag differs.
-async fn execute_verify(action: &VerifiedAction) -> Result<ToolOutput> {
-    execute_command_tagged(action, "verify").await
+async fn execute_verify(
+    action: &VerifiedAction,
+    runtime: Option<&pangu_boundary::runtime::Runtime>,
+) -> Result<ToolOutput> {
+    execute_command_tagged(action, "verify", runtime).await
 }
 
 /// B3: append a pending memory candidate. The output carries the id and the
@@ -1097,16 +1153,81 @@ fn execute_propose_memory(action: &VerifiedAction, store: &MemoryStore) -> Resul
     })
 }
 
-async fn execute_command_tagged(action: &VerifiedAction, tag: &str) -> Result<ToolOutput> {
+/// F8: the enforcement decision, as a pure function.
+///
+/// Split out of the executor so it can be tested directly. The property that
+/// matters — *a declared sandbox that does not work refuses the command* — is
+/// the one this feature exists for, and a test that only read
+/// `Runtime::refusal()` would still pass if the executor stopped calling it.
+///
+/// `Ok(())` means "proceed". There is deliberately no branch returning `Ok` for
+/// an unusable runtime, so no edit here can reintroduce a silent host fallback
+/// without breaking a test.
+pub fn sandbox_admits(runtime: Option<&pangu_boundary::runtime::Runtime>) -> Result<()> {
+    match runtime {
+        // No runtime declared: the `local` profile, unchanged behaviour.
+        None => Ok(()),
+        Some(runtime) => {
+            if runtime.allows_execution() {
+                Ok(())
+            } else {
+                // Its own message, so operator and audit trail can tell "the
+                // sandbox refused" from "the command failed".
+                Err(anyhow!("{}", runtime.refusal()))
+            }
+        }
+    }
+}
+
+/// Describe what a spawn was about to run, for the failure message.
+fn launcher_program_for_error(launcher: Option<(&str, &[String])>, argv0: &str) -> String {
+    match launcher {
+        Some((program, args)) => format!("{program} {args:?}"),
+        None => format!("resolved `<{argv0}>` on PATH"),
+    }
+}
+
+async fn execute_command_tagged(
+    action: &VerifiedAction,
+    tag: &str,
+    runtime: Option<&pangu_boundary::runtime::Runtime>,
+) -> Result<ToolOutput> {
     let argv = &action.resources().argv;
     if argv.is_empty() {
         bail!("empty command");
     }
-    let executable = resolve_executable(&argv[0], action.sandbox())?;
-    let mut command = tokio::process::Command::new(executable);
+    // F8: enforce the declared sandbox before anything is spawned.
+    //
+    // This is where "declared" becomes "enforced". An unusable runtime refuses
+    // here; it does not fall through to the host, because the run's audit trail
+    // records the declaration and executing outside it would make that record
+    // false — the operator would believe they had isolation they did not have.
+    sandbox_admits(runtime)?;
+    // Inside a usable runtime the command is launched **through** the sandbox,
+    // not on the host. The argv comes from the same `RuntimeConfig::command_for`
+    // the probe used, so a runtime that passed the probe is invoked identically
+    // here.
+    let launcher = runtime.and_then(|runtime| runtime.launcher());
+    let mount = runtime.and_then(|runtime| runtime.workspace_mount());
+    let mut command = match launcher {
+        Some((program, leading)) => {
+            let mut command = tokio::process::Command::new(program);
+            command.args(leading);
+            // The host path of the workspace is not what the sandbox sees, so
+            // the command runs from the mount point rather than the host cwd.
+            command.args(argv).current_dir(mount.unwrap_or("."));
+            command
+        }
+        None => {
+            let executable = resolve_executable(&argv[0], action.sandbox())?;
+            let mut command = tokio::process::Command::new(executable);
+            command
+                .args(&argv[1..])
+                .current_dir(&action.resources().cwd);
+            command
+        }
+    };
     command
-        .args(&argv[1..])
-        .current_dir(&action.resources().cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1118,9 +1239,18 @@ async fn execute_command_tagged(action: &VerifiedAction, tag: &str) -> Result<To
     let timeout = Duration::from_secs(action.sandbox().subprocess_timeout_secs);
     let deadline = tokio::time::Instant::now() + timeout;
     let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn {}", argv[0]))?;
+    let mut child = command.spawn().map_err(|error| {
+        // Report the whole decision, not just the failing call: which program,
+        // from where, in which directory, and with which environment. `anyhow`
+        // context would be dropped by `Display` at the event boundary, so the
+        // facts go into the message itself.
+        anyhow!(
+            "spawn failed: {error} | program={:?} | cwd={} (exists={})",
+            launcher_program_for_error(launcher, &argv[0]),
+            action.resources().cwd.display(),
+            action.resources().cwd.is_dir(),
+        )
+    })?;
     let stdout = child
         .stdout
         .take()

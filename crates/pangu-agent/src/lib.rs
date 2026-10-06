@@ -1466,7 +1466,7 @@ impl Agent {
         match self.run_inner().await {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
-                let message = redact_text(&error.to_string());
+                let message = redact_text(&describe_error(&error));
                 if let Err(event_error) = self
                     .emit(
                         self.event(EventKind::RunFinished, 0, format!("run failed: {message}"))
@@ -3338,6 +3338,33 @@ impl Agent {
             pangu_core::ConversationSnapshot::new("node-digest-projection", "", projected)?;
         Ok(Some(snapshot.history_digest))
     }
+}
+
+/// Describe an error including its cause chain.
+///
+/// `anyhow::Error`'s `Display` prints only the outermost message, so a failure
+/// reported through a context wrapper loses the actual cause: an operator sees
+/// `io: os error 2` with no indication of which path or program produced it. The
+/// chain is what makes a failure diagnosable.
+///
+/// Only the chain is added — no backtrace, no internal types — so the result
+/// stays safe for the journal and for a model-visible message.
+fn describe_error(error: &anyhow::Error) -> String {
+    let mut text = error.to_string();
+    for (index, cause) in error.chain().skip(1).enumerate() {
+        // Bounded: a deep or repetitive chain must not produce an unbounded
+        // message.
+        if index >= 4 {
+            text.push_str(" | (further causes omitted)");
+            break;
+        }
+        let next = cause.to_string();
+        if !next.is_empty() && !text.contains(&next) {
+            text.push_str(" | caused by: ");
+            text.push_str(&next);
+        }
+    }
+    text
 }
 
 fn sanitized_text(value: &str, max_bytes: usize, fallback: &str) -> String {

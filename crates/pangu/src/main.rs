@@ -2043,6 +2043,7 @@ async fn rollback_command(
             Some(registry) => base.with_skills(registry.clone()),
             None => base,
         };
+        let base = attach_runtime(base, &config, contract.workspace());
         Arc::new(base)
     };
     let mut agent = Agent::new(
@@ -2156,6 +2157,28 @@ fn build_memory_store(
 }
 
 /// B2: build the run-side skill registry when the contract enables it. The
+/// F8: resolve and attach the declared OS-level sandbox.
+///
+/// Resolution **probes** the runtime, so an operator learns at startup whether
+/// the sandbox they asked for actually works — rather than from every command
+/// being refused mid-run, or worse, from believing they had isolation they did
+/// not have.
+///
+/// An unresolvable runtime is attached anyway rather than silently dropped: the
+/// toolkit then refuses commands, which is the intended fail-closed behaviour.
+/// Dropping it here would quietly restore host execution, which is exactly the
+/// failure this feature removes.
+fn attach_runtime(toolkit: Toolkit, config: &Config, workspace: &std::path::Path) -> Toolkit {
+    if !config.execution.isolates() {
+        return toolkit;
+    }
+    let runtime = config
+        .execution
+        .runtime_config(workspace.to_path_buf())
+        .resolve();
+    toolkit.with_runtime(Arc::new(runtime))
+}
+
 /// registry lives under `<workspace>/.pangu/skills/` (tool-forbidden); the
 /// contract already froze the loaded skill set, and the run compares against
 /// it at startup.
@@ -2315,6 +2338,7 @@ async fn execute_goal(
             Some(registry) => base.with_skills(registry.clone()),
             None => base,
         };
+        let base = attach_runtime(base, &config, contract.workspace());
         Arc::new(base)
     };
     let mut agent = Agent::with_chain(

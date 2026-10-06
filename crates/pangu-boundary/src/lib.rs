@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod policy;
 pub mod registry;
 pub mod risk;
+pub mod runtime;
 pub mod sandbox;
 
 pub use mcp::{

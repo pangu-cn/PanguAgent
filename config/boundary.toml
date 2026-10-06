@@ -222,3 +222,26 @@ command = []
 # description 可选，用于审计（脱敏、限长 512 字节）。
 profile = "local"
 # description = "docker:ubuntu-24.04 image sha256:..."
+
+# F8: OS 级沙箱。与上面的 profile 不同，这个字段是**强制**的，不是审计声明。
+#
+#   runtime = "local"       在宿主机上直接执行（默认，行为与以前一致）
+#   runtime = "auto"        按强度择优：firecracker > gvisor > oci
+#   runtime = "firecracker" 微 VM（独立内核，最强边界）
+#   runtime = "gvisor"      runsc 用户态内核
+#   runtime = "oci"         Docker/Podman 容器（命名空间 + cgroup）
+#
+# 声明非 local 后，Pangu 会**探测**该运行时（真正在里面跑一条命令），
+# 探测通过才执行；探测失败则**拒绝执行命令**，绝不静默退回宿主机。
+#
+# 为什么不做退回：审计日志里记着操作者声明的运行时，实际却在宿主机上跑，
+# 会让这条记录变成假的 —— 操作者会以为自己拥有并不存在的隔离。
+# local 仍然可用且诚实，但必须是**主动选择**的，不能是失败后的兜底。
+#
+# 换 runtime 必须同时把 profile 改成 container/remote，否则配置校验会报错：
+# 审计声明与实际强制不一致是矛盾，不该被静默接受。
+# runtime = "oci"
+# image = "alpine:3.20"     沙箱里执行命令所用的镜像/rootfs
+# network = false           沙箱是否需要网络（默认 false；给了网络就少了一层边界）
+# memory_mib = 512          内存上限（运行时支持时生效）
+# cpus = 1                  CPU 数（运行时支持时生效）
