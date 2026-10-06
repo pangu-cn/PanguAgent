@@ -19,6 +19,38 @@
 
 `f7-drills-windows-8f60878.jsonl` 同样是**本机**记录，用于证明该套 drill 在 F8/F9 改动之后仍可复现（7 pass）。它**不构成** §9.1 的目标平台验收，理由同上。
 
+## F8 沙箱"真拉起执行"的证据
+
+§9.3 之外，F8 的"真拉起执行"也需要可信证据，而它有个难点：目标机器上**可能没有可用
+的容器运行时**（本机 Docker Desktop 的 Linux 引擎即不可用，见下）。
+
+`crates/pangu-toolkit/tests/runtime_dispatch.rs` 与
+`crates/pangu-boundary/tests/runtime_dispatch.rs` 用**记录 argv 的桩**替换运行时二进制，
+桩放在 `PATH` 上、走真实的 `find_program` 查找，因此生产代码路径一字未改。实测记录：
+
+```
+RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
+  "--cap-drop=ALL" "--security-opt=no-new-privileges" alpine:3.20 pwd
+```
+
+不声明运行时则记录为 `RAN pangu-local-wrapper`——**没有任何容器包装**，这条反向用例
+防止"把每条命令都塞进运行时"的改法悄悄通过。
+
+桩**不能**证明、也不声称：Docker 对这些标志的实现真的隔离了什么。那是运行时自身的
+属性。
+
+**本机的真实运行时状态（不是测试结论，是环境事实）**：
+
+```
+oci started but the probe command did not produce the expected output; saw:
+docker: error during connect: ... open //./pipe/dockerDesktopLinuxEngine: Access is denied.
+```
+
+`docker version` 在本机 30s 无响应，Docker Desktop 的 Linux 引擎处于不可用状态；WSL
+无发行版、无 Podman。因此**本机无法完成 OCI 运行时的真实容器内执行验证**，该验证在
+CI 的 `ubuntu-latest` 上才有条件进行。这不是通过，也不是跳过——它是未执行，且已如实
+标注。
+
 ## §9.3 备份可读性 drill
 
 `crates/pangu/tests/backup_drill.rs` 是 §9.3 要求的**可执行程序**，验证"恢复点搬到别处还能用"：
