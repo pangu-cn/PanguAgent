@@ -151,6 +151,12 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 - **子运行面复制父级**（同一 sandbox/policy/审批处理器/provider 链/中央 Journal），剥离 run 作用域特性（memory/skills/deliverables/eval/checkpoint/委派本身）；深度 1 是结构性的。
 - **花费聚合**：子的 token 与成本 merge 进父级账本，每 turn 预算检查覆盖子消耗；委派不能用来逃出父级预算。
 - 委派事件（`TaskDelegated`，provisional）只带 task digest 与钳制后的子预算；子终态与脱敏汇总作为工具结果回传，委派失败对父 run 永不致命。
+- **workspace 读写锁**：子 Agent 与父共用同一个 workspace，因此子运行期间持有 workspace **写锁**（`<workspace>/.pangu-workspace.lock`），保证任一时刻只有一个写入者。规则：
+  - **锁只串行化，不扩权**：它不改变 L1–L4 的任何判定，也不给子 Agent 任何它本来没有的权限；`子 ⊆ 父`（I-Sub-Agent-Never-Wider）不因加锁而改变。
+  - **读锁可共享，写锁排他**：多个读可并存；读与写、写与写互斥。
+  - **等待有上限，且超时是失败而不是抢锁**：等待者挂起直到锁释放；若在期限内未取得（典型是持锁进程崩溃后 `Drop` 未运行，锁文件永久残留），委派**失败关闭**并把持锁者身份写进错误。**删除锁文件来让运行继续是被禁止的**——那会让两个写入者同时改 workspace，正是锁要防的事，且会销毁 operator 需要的证据。
+  - **持锁者身份只是线索**：`pid=` 不证明进程存活（pid 会被复用），存活探测只用于诊断，不作为夺锁依据。
+  - **与 rollback 事务锁是两把锁**：`artifact` 的 `.rollback-operation.lock` 守护回滚事务，语义是 fail-closed 拒绝等待，由 `stale-lock` drill 断言，不因本项而改动。
 
 ### 执行后端声明（C5）
 

@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How many trailing turns are always in the assembled window (§3.2 FORCED).
 const RECENT_TURNS: usize = 8;
@@ -400,6 +400,15 @@ pub struct Agent {
     /// enables delegation; builds the restricted executor each child runs
     /// with.
     delegation: Option<Arc<dyn SubtoolFactory>>,
+    /// D1/D2: whether a delegated child must hold the workspace write lock.
+    /// Defaults on: a child shares the parent's workspace, so concurrent
+    /// children would otherwise race. Kept as a field so a deployment that
+    /// serialises its own writers can turn the wait off.
+    delegation_workspace_lock: bool,
+    /// How long a delegated child waits for the workspace lock before the
+    /// delegation fails closed. Bounded on purpose: a holder that died without
+    /// releasing leaves an unreleasable file (see `pangu_core::lockfile`).
+    delegation_lock_timeout: std::time::Duration,
 }
 
 impl Agent {
@@ -504,6 +513,8 @@ impl Agent {
             tools,
             approval,
             delegation: None,
+            delegation_workspace_lock: true,
+            delegation_lock_timeout: std::time::Duration::from_secs(30),
             event_sink,
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
@@ -544,6 +555,23 @@ impl Agent {
     pub fn with_delegation(mut self, factory: Arc<dyn SubtoolFactory>) -> Self {
         self.delegation = Some(factory);
         self
+    }
+
+    /// Configure the workspace lock a delegated child must hold while running.
+    ///
+    /// `timeout` bounds the wait. It is deliberately not `Option<Duration>`:
+    /// an unbounded wait cannot be satisfied when the previous holder died
+    /// without releasing, so there is no useful sense in which it is "more
+    /// permissive" — it only converts a reportable failure into a hang.
+    pub fn with_delegation_workspace_lock(mut self, enabled: bool, timeout: Duration) -> Self {
+        self.delegation_workspace_lock = enabled;
+        self.delegation_lock_timeout = timeout;
+        self
+    }
+
+    /// Whether a delegated child must take the workspace write lock.
+    fn delegation_needs_workspace_lock(&self) -> bool {
+        self.delegation_workspace_lock
     }
 
     /// Continue from a stored conversation.
@@ -2201,9 +2229,33 @@ impl Agent {
 
         // The child writes into the same journal and approval surface as
         // the parent; nothing about the delegation bypasses the gates.
+        //
+        // A sub-agent shares the parent's workspace, so it must hold the
+        // workspace write lock while it runs: two writers touching the same
+        // files would race, and the resulting state would match neither run's
+        // recorded actions. The lock is taken here rather than inside the child
+        // so that the wait is attributable to the delegation as a whole.
+        //
+        // Waiting is bounded. A holder that died without releasing (crash,
+        // SIGKILL) leaves the file behind and nothing will ever remove it, so an
+        // unbounded wait would hang the parent run forever instead of reporting
+        // a problem. On expiry this is a normal tool error: the delegation fails
+        // closed, the parent keeps running, and the message names the holder so
+        // an operator can act. The lock file is never deleted to force progress.
+        let _workspace_lock = if self.delegation_needs_workspace_lock() {
+            Some(pangu_core::WorkspaceLock::acquire(
+                &self.sandbox.workspace,
+                pangu_core::LockMode::Write,
+                self.delegation_lock_timeout,
+            )?)
+        } else {
+            None
+        };
+
         // Boxed because a parent run containing a child run is (bounded)
         // structural recursion.
         let outcome = Box::pin(child.run()).await?;
+        drop(_workspace_lock);
         usage.merge(&outcome.usage);
         if let Some(cost) = outcome.cost_usd {
             *spent += cost;

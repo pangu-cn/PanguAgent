@@ -18,6 +18,7 @@ pub mod glob;
 pub mod inspect;
 pub mod journal;
 pub mod json;
+pub mod lockfile;
 pub mod memory;
 pub mod messages;
 pub mod replay;
@@ -73,6 +74,10 @@ pub use inspect::{
     TransactionLockEvidence, ARTIFACT_INSPECTION_SCHEMA,
 };
 pub use journal::{ConsoleSink, Journal};
+pub use lockfile::{
+    describe_lock, lock_file_path, peek_lock_file, LockHolder, LockMode, WorkspaceLock,
+    WORKSPACE_LOCK_FILE,
+};
 pub use memory::{
     MemoryCandidate, MemoryLimits, MemoryStatus, MemoryStore, MemoryTransition, MEMORY_SCHEMA,
 };
