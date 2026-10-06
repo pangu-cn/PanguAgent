@@ -322,6 +322,14 @@ cargo test -p pangu --test backup_drill -- --nocapture
 
 "`--list` 中不存在"是**实测**（`cargo test -p pangu-core --lib -- --list` 过滤后为空），不是从 `#[cfg]` 推断的：条件编译的测试在被跳过的平台上根本不会被收集，因此**过滤到一个空集合也会返回成功**——只看退出码会把"三项都没跑"读成"三项都通过"。
 
+### 9.1.1 本项为什么仍然开着
+
+F8 起，"真拉起执行"由 `crates/pangu-toolkit/tests/runtime_dispatch.rs` 用**记录 argv 的桩**验证（见 [`docs/evidence/README.md`](evidence/README.md)）。那证明的是**启动器**正确：命令真的被交给运行时、带上了隔离标志、输出被取回；它**不**证明 Docker 对这些标志的实现真的隔离了什么——那是运行时自身的属性。
+
+同样，本机（Windows 10.0.19045）**没有可用的容器运行时**：`docker version` 30 秒无响应，Docker Desktop 的 Linux 引擎报 `Access is denied`，无 WSL 发行版、无 Podman。因此**"命令在真实容器内执行"这一条在本机为未执行**，既不是通过也不是跳过。它需要在 `ubuntu-latest`（CI 上已有条件）或操作者指定的目标平台上跑一次。
+
+这与 §9.1 原本的要求是同一件事的两半：**目标部署平台**既决定 symlink/权限两栏能否记为通过，也决定真实容器内执行能否被观测。两者都不能用本机记录代替。
+
 ### 9.2 并发 writer、外部 effect、无人工输入时的停止策略（需部署者书面确认）
 
 这是**唯一的纯人的决定**，无法用测试替代：它约束的是 Pangu 之外的世界。
