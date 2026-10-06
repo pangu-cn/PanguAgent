@@ -11,10 +11,30 @@
 | `f7-drills-windows-10.0.19045.jsonl` | 本机实测 Windows 10.0.19045 / rustc 1.98.1 | `3aa11da` | 7 pass |
 | `f7-drills-windows-105258e.jsonl` | GitHub Actions `windows-latest` | `105258e` | 7 pass |
 | `f7-drills-ubuntu-105258e.jsonl` | GitHub Actions `ubuntu-latest` | `105258e` | 6 pass + 1 not-applicable |
+| `f7-drills-windows-8f60878.jsonl` | 本机实测 Windows 10.0.19045 / x86_64 | `8f60878` | 7 pass |
 
 `105258e` 的两份是修复 Ubuntu 测试失败后的第一次全绿运行（run [37398616832](https://github.com/pangu-cn/PanguAgent/actions/runs/37398616832)）；此前 `plan-a` 上 ubuntu 侧连续 7 次失败，原因见 [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) §11。
 
 `f7-drills-windows-10.0.19045.jsonl` 是**本机**记录，不是 CI 结论，也**不构成** §9.1 要求的"目标部署平台"验收——它只证明该套 drill 在该提交上可复现。条目格式仍严格遵循下面的 schema。
+
+`f7-drills-windows-8f60878.jsonl` 同样是**本机**记录，用于证明该套 drill 在 F8/F9 改动之后仍可复现（7 pass）。它**不构成** §9.1 的目标平台验收，理由同上。
+
+## §9.3 备份可读性 drill
+
+`crates/pangu/tests/backup_drill.rs` 是 §9.3 要求的**可执行程序**，验证"恢复点搬到别处还能用"：
+
+```bash
+cargo test -p pangu --test backup_drill -- --nocapture
+```
+
+它证明四件事，缺任何一件结论都不成立：
+
+1. 原始 store `artifact inspect` 报 `verified`；
+2. store **复制到另一棵树**后，副本单独 `verified`；
+3. **删掉原始目录后**副本仍 `verified`（否则第 2 步可能只是通过链接/共享 inode 读到了原件）；
+4. 篡改副本一个字节后**必须被拒绝**——一个无法让自己失败的备份不是证据。
+
+**该 drill 覆盖不到、仍需 operator 提供的部分**（它在运行输出里也会明说）：跨介质/异地副本、保留期长于响应窗口、不被日志轮转自动删除。这三项无法用单机测试代替。
 
 每行一条 JSON 记录，schema 为 `pangu-f7-drill/1`：
 
