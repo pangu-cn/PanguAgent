@@ -21,6 +21,7 @@ pub mod json;
 pub mod lockfile;
 pub mod mcp;
 pub mod memory;
+pub mod memory_layers;
 pub mod messages;
 pub mod modules;
 pub mod replay;

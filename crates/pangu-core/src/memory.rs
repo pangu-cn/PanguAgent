@@ -139,6 +139,21 @@ fn lock<'a>(
 }
 
 impl MemoryStore {
+    /// Re-read the store from disk, returning an updated handle.
+    ///
+    /// A handle caches its candidates at open time. An operator accepting a
+    /// candidate through the CLI is a *different* process, so a long-running
+    /// handle would otherwise keep serving the pre-decision snapshot until the
+    /// run ended — the operator's decision would appear to do nothing. Callers
+    /// that must observe operator changes re-read rather than assuming their
+    /// in-memory copy is current.
+    ///
+    /// A store that no longer parses is an error, exactly as at open: corrupted
+    /// operator data is never silently treated as empty.
+    pub fn reload(&self) -> Result<Self> {
+        Self::open_with_label(&self.dir, self.limits.clone(), self.run_label.clone())
+    }
+
     /// Open (creating the directory if needed) and load the store.
     pub fn open(dir: &Path, limits: MemoryLimits) -> Result<Self> {
         Self::open_with_label(dir, limits, None)
