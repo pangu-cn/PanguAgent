@@ -229,6 +229,12 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 | Ubuntu（GitHub runner） | `dtolnay/rust-toolchain@stable` | `1b0245d` | 通过 | 0 error / 0 warning | 6 pass + 1 not-applicable | [`evidence/f7-drills-ubuntu.jsonl`](evidence/f7-drills-ubuntu.jsonl) |
 | Windows 10.0.26200 x86_64（本机） | rustc 1.98.0 | `1b0245d` | 通过（142 项，0 失败） | 0 error / 0 warning | 7 pass | 同上（同一 commit） |
 | Windows 10.0.19045 x86_64（本机） | rustc 1.98.1 | `3aa11da` | 通过（373 项，0 失败） | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-10.0.19045.jsonl`](evidence/f7-drills-windows-10.0.19045.jsonl) |
+| Windows（GitHub runner） | `dtolnay/rust-toolchain@stable` | `105258e` | 通过 | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-105258e.jsonl`](evidence/f7-drills-windows-105258e.jsonl) |
+| Ubuntu（GitHub runner） | `dtolnay/rust-toolchain@stable` | `105258e` | 通过 | 0 error / 0 warning | 6 pass + 1 not-applicable | [`evidence/f7-drills-ubuntu-105258e.jsonl`](evidence/f7-drills-ubuntu-105258e.jsonl) |
+
+> 最后两行是 CI 在**修复 Ubuntu 测试失败之后**的第一次全绿运行（run [37398616832](https://github.com/pangu-cn/PanguAgent/actions/runs/37398616832)）。此前 `plan-a` 上每次 CI 都是 ubuntu 失败 / windows 通过（连续 7 次），提交 `1da46a0`、`7627b4d` 均如此；原因见 §11。
+>
+> `105258e` 行的 Ubuntu 与 Windows `failed-operation` 机制名不同（`read-only-directory` 对 `directory-rename-blocked-by-open-file`），这正是 8.1 已记录的平台差异，**属于同一分支的两种实现**，不是不一致的证据。
 
 > 最后一行是 **2026-10-05 本机实测**，不是 CI 结论，也**不满足 §9.1**：它仍属"CI 已覆盖的两个平台"，不是目标部署平台。它的作用是证明该 drill 在当前提交上仍可复现，按 §9.1 的判读规则全部为 `pass`（本平台存在 replacement hand-off 机制，故无 `not-applicable`）。
 
@@ -338,5 +344,30 @@ pangu artifact inspect --root <artifact_root> --json > inspect-after.json
 - rollback 不执行外部补偿、Git、网络、子进程或连接器。
 - Windows replacement hand-off 与 stale lock 仍需 operator 介入，不自动猜测。
 - Git backend 未实现；不会隐式创建 commit/branch/tag/stash 或改 index。
+
+## 11. 验收中发现的平台差异：exclude_roots 的诊断措辞（已修复）
+
+`plan-a` 上 CI 曾连续 7 次出现 **ubuntu 失败 / windows 通过**，失败的测试是 `test_support::tests::an_exclusion_outside_the_workspace_is_rejected`。这不是测试环境问题，是产品在两个平台上对同一份配置给出不同结论。
+
+**根因**：`exclude_roots` 的校验先调用 `absolute_path_from`，而它对 `..` 一律报 `parent traversal is not allowed`，于是配置拼写里带 `..` 的规则会在"是否逃逸工作区"的包含性检查之前就返回。
+
+**为什么只有 Linux 暴露**（最小 rust 程序实测，非推断）：
+
+```text
+canonicalize(".") = \\?\F:\github\dove-home-team\PanguAgent
+
+base=\\?\F:\...\ws   join("../elsewhere") -> \\?\F:\...\elsewhere
+  has ParentDir component = false        ← .. 被静默折叠
+base=/tmp/ws         join("../elsewhere") -> /tmp/ws/../elsewhere
+  has ParentDir component = true         ← 保留，提前被拒
+```
+
+Windows 的 `\\?\` verbatim 前缀让 `..` 在 `join()` 阶段就被折叠掉，因而走到包含性检查、拿到正确消息、测试通过——**而且是靠路径折叠碰巧通过的**；Linux 保留 `ParentDir`，提前被拒。
+
+**修复**：在 join/canonicalize 之前，按配置里的**原始拼写**判断是否逃逸工作区；原始拼写的 components 来自字面量，两个平台一致，判读不再依赖宿主行为。只用 `..` 判定，**不能**用 `is_absolute()`——契约本身会把 `exclude_roots` 归一化成绝对路径再重新校验，拒绝绝对路径会打断所有合法配置（工作区**内部**的绝对路径是合法的）。
+
+**没有放宽任何安全检查**：`absolute_path_from` 仍对 `..` 报错，traversal 相关测试仍全绿；改的只是该字段在"逃逸工作区"时的诊断措辞。
+
+**遗留教训**：这个失败存在了 7 次运行才被处理，说明 CI 结果当时没有人在看。加验收清单不会改变这一点——**红灯必须有人负责**，否则清单只是纸面合规。
 
 相关设计边界见 [`BOUNDARY.md`](BOUNDARY.md)、[`ARCHITECTURE.md`](ARCHITECTURE.md) 和 [`adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md)。

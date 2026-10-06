@@ -9,6 +9,10 @@
 | `f7-drills-windows.jsonl` | GitHub Actions `windows-latest` | `1b0245d` | 7 pass |
 | `f7-drills-ubuntu.jsonl` | GitHub Actions `ubuntu-latest` | `1b0245d` | 6 pass + 1 not-applicable（`replace-backup`，POSIX 无 hand-off） |
 | `f7-drills-windows-10.0.19045.jsonl` | 本机实测 Windows 10.0.19045 / rustc 1.98.1 | `3aa11da` | 7 pass |
+| `f7-drills-windows-105258e.jsonl` | GitHub Actions `windows-latest` | `105258e` | 7 pass |
+| `f7-drills-ubuntu-105258e.jsonl` | GitHub Actions `ubuntu-latest` | `105258e` | 6 pass + 1 not-applicable |
+
+`105258e` 的两份是修复 Ubuntu 测试失败后的第一次全绿运行（run [37398616832](https://github.com/pangu-cn/PanguAgent/actions/runs/37398616832)）；此前 `plan-a` 上 ubuntu 侧连续 7 次失败，原因见 [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) §11。
 
 `f7-drills-windows-10.0.19045.jsonl` 是**本机**记录，不是 CI 结论，也**不构成** §9.1 要求的"目标部署平台"验收——它只证明该套 drill 在该提交上可复现。条目格式仍严格遵循下面的 schema。
 
@@ -28,3 +32,15 @@
 - `skipped` 与 `not-applicable` **不是通过**；平台差异按事实记录（见 CHECKPOINT_RECOVERY §8.1 的已知覆盖边界）。
 - drill 证明 fail closed 与证据存在，**不证明** Pangu 能自动恢复。
 - 生成方式：`PANGU_DRILL_REPORT=<绝对路径> PANGU_DRILL_COMMIT=$(git rev-parse HEAD) cargo test -p pangu --test operator_drills -- --nocapture`，详见 CHECKPOINT_RECOVERY §6。
+
+## CI 注解的严重级别
+
+CI 把每一行报告同时发成可公开读取的注解（`f7-drill-report.jsonl` 作为 artifact 需要认证下载，注解不需要）。**注解级别跟随 `outcome`**：
+
+| `outcome` | 注解级别 | 理由 |
+|-----------|---------|------|
+| `pass` | `notice` | 这是证据，不是问题 |
+| `skipped` / `not-applicable` | `warning` | 不是通过，也不等于失败；必须保持"未覆盖"可见，不能被读成通过 |
+| 其它（含报告缺失） | `error` | `outcome` 是固定词表，出现别值说明报告本身有问题 |
+
+这条区分是必要的：此前所有行一律发 `::error::`，于是**一次全绿的运行也带着约 14 条 error 注解**，"演练全部通过"与"演练失败"在界面上长得一模一样，只能靠解码载荷才能分辨。常亮的警报不携带信息，也会让真正的失败被淹没。
