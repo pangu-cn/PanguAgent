@@ -7,6 +7,7 @@
 pub mod artifact;
 pub mod assemble;
 pub mod audit;
+pub mod canvas;
 pub mod checkpoint;
 pub mod conversation;
 pub mod deliverable;
