@@ -172,5 +172,100 @@ jobs:
           path: f7-drill-report.jsonl
           if-no-files-found: warn
 
+      - name: Install a browser for the real-runtime tests
+        # `browser_cdp.rs` drives a real Chromium over CDP; it cannot be verified
+        # against a stand-in. Ubuntu runners do not ship a browser, so one is
+        # installed explicitly rather than having the suite silently skip.
+        #
+        # `--ignore-missing` keeps this from failing the job if the package name
+        # moves; the test step below is what reports whether a browser was
+        # actually found, so a missing browser surfaces as a skipped test rather
+        # than as an unrelated dependency error here.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends chromium-browser || \
+            sudo apt-get install -y --no-install-recommends chromium || true
+          # google-chrome and chromium take different paths, so both are checked
+          # and the result is visible rather than implied.
+          for candidate in /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser /snap/bin/chromium; do
+            if [ -x "$candidate" ]; then
+              echo "browser found: $candidate"
+              "$candidate" --version || true
+            fi
+          done
+
+      - name: Run tests that need a real runtime
+        # Some claims cannot be checked by a default `cargo test`: they need a
+        # real container runtime or a real browser, so they are `#[ignore]`d and
+        # would otherwise never run anywhere. Leaving them unexecuted in CI is
+        # how "we have a test for it" quietly becomes "nobody has ever run it".
+        #
+        # Linux only, deliberately:
+        #   * the container runtime is available here (Docker is preinstalled on
+        #     ubuntu runners); a Windows runner has no usable Linux engine;
+        #   * the symlink/permission tests are `#[cfg(unix)]`, so on Windows they
+        #     are not collected at all and "0 failures" would mean "0 ran" —
+        #     exactly the misreading this step exists to avoid.
+        #
+        # A failure here is a real failure. An unavailable runtime is not: the
+        # probe reports it and the test asserts the refusal, which is the
+        # behaviour that must hold on such a machine.
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          # Three ignored tests are helper *processes* driven by a parent test
+          # (`path_lock_child`, `module_lock_child`,
+          # `lock_contention_holder_child`). They return early without their env
+          # vars, so running them would add three instant "ok"s that prove
+          # nothing and make the count below a worse signal.
+          #
+          # `--test-threads=1` is required: the browser suite launches nine real
+          # Chromium instances, and concurrent launches were measured to leak a
+          # profile directory that serial runs do not (see the note at the top of
+          # browser_cdp.rs). A leak is quiet — the tests still pass — and only
+          # shows up as an unrelated failure in a later run.
+          cargo test --workspace --all-targets --all-features -- \
+            --ignored \
+            --test-threads=1 \
+            --skip path_lock_child \
+            --skip module_lock_child \
+            --skip lock_contention_holder_child \
+            2>&1 | tee ignored-tests.log
+          status=${PIPESTATUS[0]}
+          set -e
+          # Report how many actually ran. `cargo test -- --ignored` exits 0 when
+          # every ignored test is filtered out, so a passing exit code alone
+          # cannot distinguish "they ran" from "there were none".
+          ran=$(grep -acE '^test .* \.\.\. ok$' ignored-tests.log || true)
+          echo "ignored tests that ran: ${ran:-0}"
+          # 11 = 9 browser + 2 container. Fewer means a suite went missing rather
+          # than passing, which is the failure this step exists to catch.
+          expected=11
+          if [ "${ran:-0}" -lt "$expected" ]; then
+            echo "::error title=real-runtime tests::only ${ran:-0} of $expected ran; a suite is silently absent"
+          else
+            echo "::notice title=real-runtime tests::${ran} test(s) ran (real browser + real container)"
+          fi
+          if [ "$status" -ne 0 ]; then
+            esc() { printf '%s' "$1" | tr -d '\r' | sed -e 's/%/%25/g' -e 's/:/%3A/g'; }
+            sed 's/\x1b\[[0-9;]*m//g' ignored-tests.log > ignored-tests-plain.log
+            grep -aA 3 'panicked at' ignored-tests-plain.log | grep -avE '^--$' | head -30 | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=real-runtime test failure::$(esc "$line")"
+            done
+          fi
+          exit "$status"
+
+      - name: Archive real-runtime test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ignored-tests-log-${{ matrix.os }}
+          path: ignored-tests.log
+          if-no-files-found: warn
+
       - name: Run local demo smoke test
         run: cargo run -q -p pangu -- --demo

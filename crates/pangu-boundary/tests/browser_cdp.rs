@@ -14,13 +14,27 @@
 //! run explicitly:
 //!
 //! ```text
-//! cargo test -p pangu-boundary --test browser_cdp -- --ignored --nocapture
+//! cargo test -p pangu-boundary --test browser_cdp -- --ignored --test-threads=1
 //! ```
 //!
 //! They are ignored rather than skipped silently for the same reason as the
 //! container tests: a test that quietly does nothing reports success it did not
 //! earn. When no browser is installed the tests fail with a message saying so,
 //! rather than passing.
+//!
+//! # `--test-threads=1` is required, not a preference
+//!
+//! Each test launches its own Chromium, and `cargo test` runs tests in parallel
+//! by default. Nine simultaneous browser launches is more than the teardown keeps
+//! up with: a leaked profile directory was reproduced under concurrency and does
+//! **not** occur serially, on the same machine.
+//!
+//! The failure mode is quiet, which is why it is written down. The tests still
+//! *pass* while a browser and its profile survive; the damage appears later as an
+//! unrelated flake, because a stale profile holds a lock and the next run then
+//! fails for a reason that has nothing to do with the code under test. That is
+//! the same class of misleading signal the rest of this suite exists to avoid.
+//! CI passes `--test-threads=1` for this reason.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,26 +43,82 @@ use pangu_boundary::browser::{BrowserConfig, BrowserSession};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn temp_root(label: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "pangu-cdp-{label}-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&root).expect("create root");
-    root
+/// A per-test root under the OS temp directory, removed when the test ends.
+///
+/// Cleanup is not cosmetic. A Chromium profile directory holds a lock, and a
+/// leaked one leaves a browser holding it; 36 such directories accumulated while
+/// this suite was being written, and one run failed for that reason rather than
+/// for anything in the code. Reusing a fixed path would be worse still, since
+/// concurrent runs would then collide by construction.
+///
+/// Removal is best-effort: on Windows a just-killed process can still hold its
+/// files for a moment, and failing a passing test over leftover temp files would
+/// be the wrong trade. The `Drop` runs whether the test passed or panicked, so a
+/// failing assertion does not also leak.
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "pangu-cdp-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        Self(root)
+    }
+}
+impl std::ops::Deref for TempRoot {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempRoot {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        // A few retries: Chromium's teardown is asynchronous, so the first
+        // attempt can lose a race with the process it just exited.
+        for _ in 0..5 {
+            if std::fs::remove_dir_all(&self.0).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+fn temp_root(label: &str) -> TempRoot {
+    TempRoot::new(label)
 }
 
 fn config(root: &std::path::Path) -> BrowserConfig {
     BrowserConfig {
         executable: BrowserConfig::find_executable().unwrap_or_else(|| {
+            // Loud on purpose. These tests are `#[ignore]`d precisely so that
+            // "no browser here" is never silently reported as success; a skip
+            // would read as coverage. On CI the browser is installed by the
+            // workflow's setup step, so reaching this on CI means that step
+            // failed.
             panic!(
-                "no Chromium-based browser found on this machine; these tests require one. \
-                 Install Chrome or Edge and re-run, or leave them ignored"
+                "no Chromium-based browser found; these tests require a real one. \
+                 Install Chrome/Chromium (CI installs it in the workflow's setup step) \
+                 and re-run: cargo test -p pangu-boundary --test browser_cdp -- --ignored"
             )
         }),
         profile_dir: root.join("profile"),
         network: true,
+        // `--no-sandbox` and `--disable-dev-shm-usage` are needed on containerised
+        // CI runners: the first because the sandbox needs capabilities a
+        // container does not grant, the second because `/dev/shm` is often only
+        // 64 MB there and Chromium crashes when it fills up.
         extra_args: vec!["--no-sandbox".into(), "--disable-dev-shm-usage".into()],
     }
 }
@@ -81,7 +151,6 @@ fn a_real_browser_answers_a_cdp_command() {
     println!("session isolates = {}", session.isolates());
 
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Navigation works, and the snapshot reflects the loaded page.
@@ -109,7 +178,6 @@ fn navigation_and_snapshot_reflect_a_data_url() {
     assert!(!snapshot.truncated);
 
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A screenshot returns real PNG bytes.
@@ -136,7 +204,6 @@ fn a_screenshot_is_a_png() {
     assert!(png.len() > 1000, "suspiciously small: {} bytes", png.len());
 
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A click through `Input.dispatchMouseEvent` actually reaches the page.
@@ -163,7 +230,6 @@ fn a_click_reaches_the_page_and_changes_it() {
     assert_eq!(after.title, "clicked", "the page's onclick must have run");
 
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Typing reaches the page's own value, not just an internal buffer.
@@ -185,7 +251,6 @@ fn typing_enters_text_into_a_field() {
     assert_eq!(value, "hi");
 
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Clicking a selector that matches nothing is an error, not a silent no-op.
@@ -207,7 +272,6 @@ fn clicking_a_missing_element_is_refused() {
     assert!(text.contains("nothing was clicked"), "{text}");
 
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A browser error surfaces as an error rather than an empty success.
@@ -225,8 +289,12 @@ fn an_impossible_command_is_reported_as_a_failure() {
     // The method name must appear, so the operator knows which call failed.
     assert!(text.contains("No.SuchDomain.noSuchMethod"), "{text}");
 
+    // `TempRoot`'s `Drop` removes the directory, but `session` still holds the
+    // browser open at that point — and on Windows an open profile cannot be
+    // deleted, so cleanup would silently lose the race. Dropping the session
+    // first means the directory is already unreferenced when `root` goes out of
+    // scope.
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The browser process is gone once the session is dropped.
@@ -269,7 +337,8 @@ fn sessions_do_not_share_state() {
     assert_eq!(first.snapshot().expect("s1").title, "one");
     assert_eq!(second.snapshot().expect("s2").title, "two");
 
+    // Both sessions are dropped before `root` goes out of scope, so the two
+    // profile directories are unreferenced when `TempRoot::drop` removes them.
     drop(first);
     drop(second);
-    let _ = std::fs::remove_dir_all(&root);
 }
