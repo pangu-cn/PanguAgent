@@ -1,6 +1,8 @@
 # Pangu Agent 未来开发路线图（草案）
 
 > **状态：阶段二实验性实现已存在，F7 尚未正式激活** · **基线：v0.1** · **定位：以安全边界为核心吸收优秀 Agent 经验，而不是复制竞品**
+>
+> **2026-10-08 三项短板复核（提交 `1b48eed`）**：F8 与 F9 已实现；F7 仍未正式激活。详见 §3 的 F7、F8、F9 条目。
 
 本文把“Hermes Agent、Pi Agent、ZCode、WorkBuddy、DeepSeek Harness（DSH）、OpenHands、SWE-agent、Aider、Cline”作为第一组参照对象。这里的“所有 Agent”暂按用户点名的九类理解；不把宣传语当作已验证的竞品结论，也不进行没有统一基准的性能排名。
 
@@ -499,6 +501,12 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - `pangu eval list [--json]`；不声明 `[eval]` 时行为与 digest 完全不变。
   - **未包含（有意排除）**：批处理 runner（多 issue 批量归 F6/C4）；内建 benchmark 判定 harness（属外部工具）；非终态 run 的 eval 记录（Journal 兜底）。
 - [ ] **F6 控制平面与 backend/automation profile**：借鉴 OpenHands Agent Canvas，支持本地、Docker、VM、远程 backend 和计划/webhook 任务；每个 backend 和任务都独立认证、限额、幂等和审计。
+- [x] **F8 OS 级运行时适配器（已实现，Firecracker 明确不可用）**：`[execution] runtime` 是强制执行字段，`profile` 仍只是审计声明。`auto` 按 `firecracker > gvisor > oci` 探测；可用运行时真的拉起命令，不可用时拒绝，不退回宿主机。实现见 [`CAPABILITIES.md`](CAPABILITIES.md) §1。
+  - **已验证**：Docker/gVisor 的启动参数、挂载、工作目录、绝对路径启动器和 fail-closed 行为有测试；最新双平台 CI 为 run [`37650567024`](https://github.com/pangu-cn/PanguAgent/actions/runs/37650567024)，提交 `1b48eed`。
+  - **未实现**：Firecracker 即使找到程序和 `/dev/kvm`，也因缺少 vsock/串口通道而始终返回 `Unusable`。探测不证明容器运行时本身无法逃逸。
+- [x] **F9 内置 CDP 浏览器（已实现，默认关闭）**：`pangu-boundary::browser` 自带 CDP 握手和 JSON-RPC，`browser_open`、`browser_read`、`browser_screenshot`、`browser_click`、`browser_type` 进入同一条 L1–L4 链。点击和输入是 `NeedsHuman` / `ExternalMutation` / `Irreversible`，不是只读。实现见 [`CAPABILITIES.md`](CAPABILITIES.md) §2b。
+  - **已验证**：工具评估、资源授权、URL 检查、配置目录、调试端口和离线页面限制有测试；真实浏览器用例为 `#[ignore]`，最近本地运行通过。它们不进入默认 CI。
+  - **未实现**：浏览器默认仍在宿主机进程中运行；只有操作者同时配置 `[execution] runtime` 时才通过该运行时启动。`network = false` 不是 OS 级沙箱。
 - [x] **F7 Pangu Artifact 检查点与受限回退（需求已确认；ADR 已批准；阶段二实现已存在；默认关闭、实验性 opt-in、未正式激活）**：已实现成功 VerifiedAction 后的工作区快照、稳定事件指针、session node、operation ledger、typed rollback、failed-path/effect ledger、Journal v2 receipt 和 CLI 子命令；回退只恢复文件系统/会话状态，不回退外部副作用；默认不自动 commit。详细实现边界见 [`docs/adr/0001-checkpoint-rollback.md`](adr/0001-checkpoint-rollback.md) 和 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)。当前不得把它描述为默认支持。
 
 #### F7 阶段二映射（实现但实验性）
@@ -514,6 +522,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 - **事件契约**：已加入 checkpoint、rollback、failed-path 事件和稳定 v2 event receipt；旧 Journal 不重写，v1 读取兼容保留。
 - **测试门**：已覆盖外部副作用、幂等、快照损坏、失败路径阻断、wall-clock budget、TeeSink receipt、真实 CLI 子进程、stale lock 和配置/事件兼容；operator 事故分支（stale lock、failed operation、CAS drift、外部 mutation、Windows replacement backup、只读性、CLI 退出码）另有 `crates/pangu/tests/operator_drills.rs` 可重复演练，并按平台记录机制差异。
 - **正式激活门**：operator recovery 运行手册已补充，证据收集与四个事故分支已有只读工具（`pangu artifact inspect`）和可重复 drill，**跨平台 CI 已通过**（run 36210280753，提交 `1b0245d`，Ubuntu 与 Windows 的 drill 原始报告已转录到 `docs/evidence/`）；仍缺目标部署平台自身的验证、恢复期间的备份/审计可用性、无人工输入与并发 writer 的停止策略确认，以及 operator/发布负责人签署；在此之前不把 F7 描述为默认支持。详见 [`docs/CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md)。
+  - **2026-10-08 复核**：§8 仍有四项未勾选，分别对应 §9.1 目标部署平台、§9.2 停止策略书面确认、§9.3 异地备份与保留证据、§9.4 operator/发布负责人签署。测试、CI 和文档不能替代这四项，因此 F7 仍是实验性 opt-in。
   - **四个剩余项已各自落成可执行程序（2026-10-05）**：见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) §9——§9.1 目标平台 drill（含 `not-applicable`/`skipped` 的判读规则）、§9.2 停止策略书面确认清单（5 个必答问题）、§9.3 备份与独立审计验证（`artifact inspect` 前后对照）、§9.4 签署与四处文档同步。§8 的每个 `[ ]` 都指向对应小节，留证要求写死在那里。
   - 同日新增本机 drill 记录（Windows 10.0.19045 / rustc 1.98.1 / 提交 `3aa11da`，7 pass，转录见 `docs/evidence/`）。**它不满足 §9.1**——本机仍属 CI 已覆盖的平台，不是目标部署平台；它只证明 drill 在该提交上可复现。
   - **CI 已连续 7 次红，且此前无人处理**：`plan-a` 上每次都是 ubuntu-latest 测试失败、windows-latest 通过。根因是 `exclude_roots` 校验在两个平台上对同一份配置给出不同诊断（Windows 的 `\\?\` 前缀让 `..` 在 `join()` 时被折叠，Linux 保留 `ParentDir` 提前被拒），已修复。提交 `105258e` 是修复后第一次全绿运行（run 37398616832）。原因与教训见 [`CHECKPOINT_RECOVERY.md`](CHECKPOINT_RECOVERY.md) §11。
@@ -523,8 +532,8 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
 如果没有特别偏好，建议先从下面这组开始：
 
 ```text
-已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D1、D3、D4、F1、F2、F3、F4、F5
-        （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活）
+已完成：A1、A2、A3、A4、A5、A6（部分，见 ADR-0005 状态行）、B1、B2、B3、B4、B5、C5、D1、D3、D4、F1、F2、F3、F4、F5、F8、F9
+        （F7 阶段二实现已存在，仍为实验性 opt-in、未正式激活；F8 的 Firecracker 通道未实现）
 按需：B6（仅在需要本地 laya 时开启，默认关闭）、F6（需要远程/自动化控制面时）
 暂缓：C2、C3、C4、D1、D2、E1、E2、E3
 ```
