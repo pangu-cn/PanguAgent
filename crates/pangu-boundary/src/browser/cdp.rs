@@ -820,9 +820,10 @@ mod tests {
         std::fs::create_dir_all(&root).expect("profile");
         std::fs::write(root.join("Cookies"), b"secret").expect("cookie");
         remove_profile_dir(&root).expect("the temporary profile must be removable");
-        let escaped = std::env::temp_dir().join("..").join("pangu-outside");
+        let escaped = std::env::temp_dir().join("pangu-browser-outside");
+        let escaped_via_parent = root.join("..").join("..").join("pangu-browser-outside");
         std::fs::create_dir_all(&escaped).expect("outside");
-        let refused = remove_profile_dir(&escaped);
+        let refused = remove_profile_dir(&escaped_via_parent);
         assert!(
             refused.is_err(),
             "cleanup must not delete an unrelated directory"
