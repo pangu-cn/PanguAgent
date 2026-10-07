@@ -268,6 +268,7 @@ impl BrowserSession {
     pub fn snapshot(&mut self) -> Result<PageSnapshot> {
         self.require_local_page()?;
         let url = self.evaluate("document.location.href")?;
+        self.require_local_page()?;
         self.require_local_subresources()?;
         let title = self.evaluate("document.title")?;
         let text = self.evaluate("document.body ? document.body.innerText : ''")?;
@@ -590,7 +591,7 @@ impl BrowserSession {
         }
         let resources = self.evaluate(
             "JSON.stringify([\
-             ...Array.from(document.querySelectorAll('[src], [href], [srcset], link[rel], meta[http-equiv]')).flatMap(el => [el.src || '', el.href || '', el.srcset || '', el.content || '']),\
+             ...Array.from(document.querySelectorAll('*')).flatMap(el => [el.outerHTML || '', el.getAttribute('style') || '', el.getAttribute('action') || '', el.getAttribute('formaction') || '', el.getAttribute('poster') || '', el.getAttribute('data') || '']),\
              ...Array.from(document.styleSheets).flatMap(sheet => { try { return Array.from(sheet.cssRules).map(rule => rule.cssText || ''); } catch (error) { return [String(error)]; } })\
              ])",
         )?;
@@ -601,12 +602,13 @@ impl BrowserSession {
         })?;
         if let Some(resource) = values.into_iter().find(|resource| {
             let lower = resource.to_ascii_lowercase();
-            lower.contains("http://")
+            lower.contains("http:")
+                || lower.contains("https:")
                 || lower.contains("https://")
-                || lower.contains("ws://")
-                || lower.contains("wss://")
-                || lower.contains("file://")
-                || lower.contains("ftp://")
+                || lower.contains("ws:")
+                || lower.contains("wss:")
+                || lower.contains("file:")
+                || lower.contains("ftp:")
         }) {
             return Err(Error::Other(format!(
                 "the page references a resource outside the disabled-network boundary: {resource}"
