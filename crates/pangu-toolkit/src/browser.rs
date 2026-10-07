@@ -560,13 +560,15 @@ mod tests {
             &[std::path::PathBuf::from("artifacts/screenshot.png")],
         )
         .expect("a current-directory component does not change the file");
-        require_validated_screenshot_path(
-            std::path::Path::new(r"\\?\C:\work\artifacts\screenshot.png"),
-            &[std::path::PathBuf::from(
-                r"C:\work\artifacts\screenshot.png",
-            )],
-        )
-        .expect("a Windows verbatim prefix does not change the file");
+        if cfg!(windows) {
+            require_validated_screenshot_path(
+                std::path::Path::new(r"\\?\C:\work\artifacts\screenshot.png"),
+                &[std::path::PathBuf::from(
+                    r"C:\work\artifacts\screenshot.png",
+                )],
+            )
+            .expect("a Windows verbatim prefix does not change the file");
+        }
     }
 
     #[test]
