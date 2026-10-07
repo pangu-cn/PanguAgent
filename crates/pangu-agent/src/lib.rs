@@ -2626,15 +2626,19 @@ impl Agent {
             }
             let safe_call_id = sanitized_text(&call.id, 256, "call");
             let approval_id = format!("ap_{}_{}", turn, safe_call_id);
-            let target = resources
-                .write_paths
-                .first()
-                .or_else(|| resources.read_paths.first())
-                // The approval target is recorded in the audit trail and shown to
-                // the human asked to approve, so it uses the form they can act on.
-                .map(|path| pangu_core::util::displayable_path(path))
-                .or_else(|| resources.hosts.first().cloned())
-                .map(|value| truncate_middle(&redact_text(&value), 4096));
+            let target = if resources.browser_session {
+                Some("browser session".to_string())
+            } else {
+                resources
+                    .write_paths
+                    .first()
+                    .or_else(|| resources.read_paths.first())
+                    // The approval target is recorded in the audit trail and shown to
+                    // the human asked to approve, so it uses the form they can act on.
+                    .map(|path| pangu_core::util::displayable_path(path))
+                    .or_else(|| resources.hosts.first().cloned())
+                    .map(|value| truncate_middle(&redact_text(&value), 4096))
+            };
             let approval_request = ApprovalRequest {
                 id: approval_id,
                 tool: sanitized_text(&call.name, 128, "tool"),

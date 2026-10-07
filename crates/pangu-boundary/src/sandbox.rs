@@ -40,6 +40,9 @@ pub struct ValidatedResources {
     pub hosts: Vec<String>,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
+    /// Preserved from the request so later gates can tell a browser action
+    /// from an action that merely passed with no filesystem target.
+    pub browser_session: bool,
 }
 
 #[derive(Clone)]
@@ -346,6 +349,11 @@ impl Sandbox {
         if !request.argv.is_empty() {
             self.validate_argv(&request.argv)?;
         }
+        if request.browser_session && !request.argv.is_empty() {
+            return Err(Error::Other(
+                "a browser session is not a launchable command".into(),
+            ));
+        }
 
         let cwd = match &request.cwd {
             Some(path) => require_allowed(self.resolve_read(path), "cwd")?,
@@ -357,6 +365,7 @@ impl Sandbox {
             hosts,
             argv: request.argv.clone(),
             cwd,
+            browser_session: request.browser_session,
         })
     }
 
@@ -1075,6 +1084,34 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_browser_session_survives_validation_but_cannot_launch_a_command() {
+        let root = test_workspace();
+        fs::create_dir_all(&root).unwrap();
+        let config = crate::config::BoundarySection {
+            workspace: root.clone(),
+            readable_roots: vec![root.clone()],
+            writable_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let sandbox = Sandbox::from_config(&config).unwrap();
+        let resources = sandbox
+            .validate_resources(&ResourceRequest {
+                browser_session: true,
+                ..Default::default()
+            })
+            .expect("the session itself is an authorized browser resource");
+        assert!(resources.browser_session);
+
+        let mixed = sandbox.validate_resources(&ResourceRequest {
+            browser_session: true,
+            argv: vec!["cat".into()],
+            ..Default::default()
+        });
+        assert!(mixed.is_err(), "a browser session must not authorize argv");
         fs::remove_dir_all(root).ok();
     }
 
