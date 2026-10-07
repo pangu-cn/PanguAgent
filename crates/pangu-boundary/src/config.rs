@@ -1538,7 +1538,20 @@ impl Config {
                 self.execution.profile.scope_statement(),
             )
         } else {
-            String::new()
+            // Nothing was declared, which means `profile = local` and no runtime:
+            // commands run on the host under L1-L4 alone. Say that, rather than
+            // printing nothing.
+            //
+            // Silence was the previous behaviour, and it is the exact failure this
+            // project refuses elsewhere: a reader cannot tell "no sandbox is
+            // configured" from "this report does not cover sandboxes". Those are
+            // opposite conclusions from the same absent line. An unconfigured
+            // isolation is a fact worth one line; leaving it out let a clean
+            // `doctor` read as though isolation had been checked and found
+            // adequate.
+            "execution       : local (nothing declared — commands run on the host under L1-L4 \
+             only; no OS-level isolation is configured)\n"
+                .to_string()
         };
         let resolved = self.resolve_provider().ok();
         let provider_line = match &resolved {
@@ -1801,6 +1814,24 @@ mod tests {
         assert_eq!(config.budget.max_turns, 12);
         assert!(config.goal.require_evidence);
         assert!(!config.rules.is_empty());
+    }
+
+    /// F8: the default report must say that no OS-level isolation is configured.
+    ///
+    /// Printing nothing is not the same as saying "none". A reader cannot tell
+    /// "no sandbox is configured" from "this report does not cover sandboxes",
+    /// and those are opposite conclusions from the same absent line.
+    #[test]
+    fn the_default_report_says_no_os_isolation_is_configured() {
+        let report = Config::embedded().unwrap().explain();
+        assert!(
+            report.contains("no OS-level isolation is configured"),
+            "the default report must state the absence of isolation: {report}"
+        );
+        assert!(
+            !report.contains("ENFORCED"),
+            "the default configuration enforces no runtime: {report}"
+        );
     }
 
     /// F8: `doctor` must not let a bare `profile` read as isolation.

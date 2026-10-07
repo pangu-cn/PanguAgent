@@ -319,6 +319,29 @@ impl Toolkit {
     /// `browser_click` and `browser_type` are **not** read-only: the page
     /// decides what a click does, so classifying them as observations would let
     /// a state-changing action skip the human gate.
+    ///
+    /// # Why these are `NeedsHuman` + `Irreversible`
+    ///
+    /// This pairing is load-bearing, and getting it wrong made both tools
+    /// unrunnable. `pangu-agent` validates every assessment through
+    /// `EffectDescriptor::validate_for_risk` before Policy or Approval see it,
+    /// and that rule is: an `ExternalMutation` must be `Irreversible` and must
+    /// carry at least `Destructive` risk.
+    ///
+    /// These tools were originally declared `Reversible` on both axes. Both
+    /// halves of that were rejected, so `browser_click` and `browser_type`
+    /// failed on **every** call with `external_mutation must be paired with
+    /// irreversible`. The tools were still advertised to the model, so it looked
+    /// like a tool that errors rather than a capability that cannot run.
+    ///
+    /// The classification is also the honest one. A click is not reversible by
+    /// this program: it cannot undo a submitted form, a placed order, or a
+    /// deleted record, because the resulting state lives on a server the
+    /// boundary does not control and may never observe. "Reversible" would claim
+    /// an ability to restore that no code here has, and would additionally
+    /// suggest the action needs less scrutiny than `browser_open`, which only
+    /// fetches. `NeedsHuman` is what makes the human gate unconditional, exactly
+    /// as it is for `run_command`.
     fn assess_browser(&self, call: &ToolCall, sandbox: &Sandbox) -> Result<ToolAssessment> {
         // The effect kind decides the branch; whether a host is declared is
         // expressed by declaring one below, not by a flag checked separately.
@@ -344,9 +367,11 @@ impl Toolkit {
                 )
             }
             "external_mutation" => {
-                let mut assessment = ToolAssessment::new(Risk::Reversible).with_effect(
-                    EffectDescriptor::new(EffectScope::ExternalMutation, Reversibility::Reversible),
-                );
+                let mut assessment =
+                    ToolAssessment::new(Risk::NeedsHuman).with_effect(EffectDescriptor::new(
+                        EffectScope::ExternalMutation,
+                        Reversibility::Irreversible,
+                    ));
                 match call.name.as_str() {
                     "browser_click" => {
                         ensure_allowed_keys(&call.args, &["selector"])?;

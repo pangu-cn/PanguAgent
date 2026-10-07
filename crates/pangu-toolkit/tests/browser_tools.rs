@@ -141,6 +141,65 @@ async fn a_browser_call_without_a_browser_is_refused_before_execution() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `browser_click` and `browser_type` must produce an effect the L1 chain will
+/// actually accept.
+///
+/// This is the test whose absence let a dead tool ship. `assess` builds the
+/// `EffectDescriptor`; `pangu-agent` then runs `validate_effect()` on it for
+/// **every** action before Policy or Approval see anything. Those two halves
+/// were written against different models, so the descriptor these tools emitted
+/// (`ExternalMutation` + `Reversible`) was rejected on every single call:
+/// `external_mutation must be paired with irreversible`.
+///
+/// The tools were still advertised to the model, so the failure looked like a
+/// tool that always errors rather than a capability that cannot run. Nothing
+/// asserted the two halves agree, and the end-to-end click evidence drives
+/// `BrowserSession::click` directly, bypassing this gate entirely — so the CDP
+/// layer looked proven while the L1-L4 path was unreachable.
+///
+/// The assertion is deliberately made through `validate_for_risk`, the same
+/// function the agent calls, so this test cannot drift from the real rule.
+#[tokio::test]
+async fn a_click_and_a_type_produce_an_effect_the_agent_will_accept() {
+    let root = temp_root("effect");
+    let sandbox = sandbox_for(&root);
+    let toolkit = Toolkit::new().with_browser(config_at(&root), root.join("artifacts"));
+
+    for (name, args) in [
+        ("browser_click", serde_json::json!({"selector": "#submit"})),
+        ("browser_type", serde_json::json!({"text": "hello"})),
+    ] {
+        let call = pangu_core::ToolCall::new(name, args);
+        let assessment = toolkit
+            .assess(&call, &sandbox)
+            .await
+            .unwrap_or_else(|error| panic!("`{name}` must be assessable: {error}"));
+
+        // The real rule, applied exactly as the agent applies it.
+        assessment
+            .effect
+            .expect("a click or a type must declare an effect")
+            .validate_for_risk(assessment.risk)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "`{name}` emits an effect the agent rejects for every call, so the tool \
+                     could never run: {error}"
+                )
+            });
+
+        // NeedsHuman is the load-bearing class, not merely "above read-only".
+        // Reversible is above read-only too, and that was the classification
+        // validate_for_risk rejected on every call.
+        assert_eq!(
+            assessment.risk,
+            pangu_boundary::Risk::NeedsHuman,
+            "`{name}` changes state the program cannot undo, so it must always reach the human gate"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Navigation is an outbound request, so an unlisted host is refused.
 ///
 /// Without this, the network boundary would never see where the browser went and

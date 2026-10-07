@@ -35,8 +35,8 @@ L1–L4 链。
 | `browser_open` | `NeedsHuman` | `ExternalRead` | 会访问**主机**，与 `http_fetch` 同类，必须声明 host |
 | `browser_read` | `ReadOnly` | `NoEffect` | 读取当前页面，不改变任何东西 |
 | `browser_screenshot` | `ReadOnly` | `NoEffect` | 同上，是观察而非改变 |
-| `browser_click` | `Reversible` | `ExternalMutation` | 点下去会发生什么**由页面决定** |
-| `browser_type` | `Reversible` | `ExternalMutation` | 输入可能触发会行动的处理器 |
+| `browser_click` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 点下去会发生什么**由页面决定**，且本程序无法撤销 —— 状态改动落在它不控制的服务器上 |
+| `browser_type` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 输入可能触发会行动的处理器，同样无法撤销 |
 
 **最关键的一条：点击不是只读。** 把它当成观察，会让一个改变状态的动作绕过人工闸门 ——
 和"信任对方声明的 `readOnlyHint`"是同一类错误。

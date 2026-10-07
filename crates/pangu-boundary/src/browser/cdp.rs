@@ -165,12 +165,7 @@ impl BrowserSession {
                     if reply.get("id").and_then(Value::as_u64) == Some(id) {
                         return unwrap_reply(method, reply);
                     }
-                    // A reply to a different command, or an event: keep it for
-                    // the caller that asked, rather than discarding or
-                    // misattributing it.
-                    if let Some(other) = reply.get("id").and_then(Value::as_u64) {
-                        self.pending.insert(other, reply);
-                    }
+                    self.retain_if_requested(reply);
                 }
                 None => {
                     return Err(Error::Other(format!(
@@ -233,9 +228,7 @@ impl BrowserSession {
                     {
                         return Ok(());
                     }
-                    if let Some(other) = message.get("id").and_then(Value::as_u64) {
-                        self.pending.insert(other, message);
-                    }
+                    self.retain_if_requested(message);
                 }
                 None => {
                     return Err(Error::Other(format!(
@@ -407,6 +400,30 @@ impl Drop for BrowserSession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+impl BrowserSession {
+    /// Keep a reply only when it answers a command this session actually sent.
+    fn retain_if_requested(&mut self, message: Value) {
+        if retainable_reply_id(message.get("id").and_then(Value::as_u64), self.next_id).is_some() {
+            if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                self.pending.insert(id, message);
+            }
+        }
+    }
+}
+
+/// Whether a reply id may be stored while waiting for something else.
+///
+/// Both `call` and `wait_for_load` read the socket, so both must apply this
+/// rule. A peer chooses the ids it sends. Retaining every one would let a
+/// hostile or merely broken page grow `pending` without limit — each reply up
+/// to `MAX_FRAME_BYTES` (32 MiB) — until the process runs out of memory.
+/// `next_id` counts upward from the start of the session, so an id at or above
+/// it was never requested and can never be awaited. An ordinary `browser_open`
+/// reaches this path; compromising the socket first is not required.
+fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
+    id.filter(|id| *id < next_id)
 }
 
 /// Turn a CDP reply into a result or an error.
@@ -659,6 +676,17 @@ pub fn endpoint_marker(profile_dir: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unsolicited_reply_id_is_not_retained() {
+        // The session has issued ids 1 and 2, so the next id is 3. A peer that
+        // invents ids must not be able to make the client store them.
+        assert_eq!(retainable_reply_id(Some(1), 3), Some(1));
+        assert_eq!(retainable_reply_id(Some(2), 3), Some(2));
+        assert_eq!(retainable_reply_id(Some(3), 3), None);
+        assert_eq!(retainable_reply_id(Some(u64::MAX), 3), None);
+        assert_eq!(retainable_reply_id(None, 3), None);
+    }
 
     #[test]
     fn an_error_reply_becomes_an_error_not_an_empty_result() {
