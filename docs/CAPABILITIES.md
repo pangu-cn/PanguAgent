@@ -34,9 +34,9 @@ L1–L4 链。
 |------|------|------|--------|
 | `browser_open` | `NeedsHuman` | `ExternalRead` | 会访问**主机**，与 `http_fetch` 同类，必须声明 host |
 | `browser_read` | `ReadOnly` | `NoEffect` | 读取当前页面，不改变任何东西 |
-| `browser_screenshot` | `Reversible` | `Workspace` / `Reversible` | 页面本身不变，但 PNG 会写入运行产物目录；`NoEffect` 不能诚实声明这次写入 |
-| `browser_click` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 点下去会发生什么**由页面决定**，且本程序无法撤销 —— 状态改动落在它不控制的服务器上 |
-| `browser_type` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 输入可能触发会行动的处理器，同样无法撤销 |
+| `browser_screenshot` | `Reversible` | `Workspace` / `Reversible` | 页面本身不变，但 PNG 会写入运行产物目录；评估必须声明该目录，沙箱才能检查可写根 |
+| `browser_click` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 点下去会发生什么**由页面决定**，且本程序无法撤销；评估声明的资源是已打开的浏览器会话 |
+| `browser_type` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 输入可能触发会行动的处理器，同样无法撤销；资源声明与 `browser_click` 相同 |
 
 **最关键的一条：点击不是只读。** 把它当成观察，会让一个改变状态的动作绕过人工闸门 ——
 和"信任对方声明的 `readOnlyHint`"是同一类错误。

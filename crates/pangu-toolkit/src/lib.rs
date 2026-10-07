@@ -442,12 +442,20 @@ impl Toolkit {
                 // `NoEffect` would let a write skip the reversible-write gate
                 // while the manifest, which records the write, says otherwise.
                 if call.name == "browser_screenshot" {
-                    Ok(
-                        ToolAssessment::new(Risk::Reversible).with_effect(EffectDescriptor::new(
+                    let artifact_dir = self
+                        .browser_artifact_dir
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("browser_screenshot has no artifact directory"))?;
+                    // The directory itself is the declared write: the PNG name is
+                    // generated later, but the sandbox must check the directory
+                    // now. Omitting it made every screenshot fail L1 because a
+                    // reversible workspace effect with no write path is invalid.
+                    Ok(ToolAssessment::new(Risk::Reversible)
+                        .with_effect(EffectDescriptor::new(
                             EffectScope::Workspace,
                             Reversibility::Reversible,
-                        )),
-                    )
+                        ))
+                        .write(artifact_dir.as_ref().clone()))
                 } else {
                     Ok(
                         ToolAssessment::new(Risk::ReadOnly).with_effect(EffectDescriptor::new(
@@ -463,6 +471,7 @@ impl Toolkit {
                         EffectScope::ExternalMutation,
                         Reversibility::Irreversible,
                     ));
+                assessment.browser_session = true;
                 match call.name.as_str() {
                     "browser_click" => {
                         ensure_allowed_keys(&call.args, &["selector"])?;

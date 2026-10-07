@@ -21,6 +21,10 @@ pub struct ResourceRequest {
     pub hosts: Vec<String>,
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// The action uses the already-open browser session. This is neither a
+    /// filesystem path nor a launchable command: the session was authorized
+    /// when the operator enabled the browser.
+    pub browser_session: bool,
     /// B3: Pangu-internal I/O (checkpoint/rollback artifact access) is not a
     /// tool path. Forbidden globs exist to stop *model-controlled* paths from
     /// reaching secrets and Pangu-owned storage; Pangu itself must still read

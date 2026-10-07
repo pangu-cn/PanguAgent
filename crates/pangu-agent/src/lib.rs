@@ -163,6 +163,9 @@ pub struct ToolAssessment {
     pub hosts: Vec<String>,
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// The action uses the browser session the operator enabled. It is not a
+    /// path, host, or launchable command, but it is still a named resource.
+    pub browser_session: bool,
     pub preview: String,
     pub escapes_workspace: bool,
 }
@@ -177,6 +180,7 @@ impl ToolAssessment {
             hosts: Vec::new(),
             argv: Vec::new(),
             cwd: None,
+            browser_session: false,
             preview: String::new(),
             escapes_workspace: false,
         }
@@ -258,9 +262,13 @@ impl ToolAssessment {
                 }
             }
             EffectScope::ExternalMutation => {
-                if self.hosts.is_empty() && self.argv.is_empty() && self.write_paths.is_empty() {
+                if self.hosts.is_empty()
+                    && self.argv.is_empty()
+                    && self.write_paths.is_empty()
+                    && !self.browser_session
+                {
                     return Err(anyhow!(
-                        "external-mutation assessment must declare a host, argv, or write path"
+                        "external-mutation assessment must declare a host, argv, write path, or browser session"
                     ));
                 }
             }
@@ -938,6 +946,7 @@ impl Agent {
             hosts: Vec::new(),
             argv: Vec::new(),
             cwd: None,
+            browser_session: false,
             internal: true,
         };
         if self.sandbox.validate_resources(&resources).is_err()
@@ -1268,6 +1277,7 @@ impl Agent {
             hosts: Vec::new(),
             argv: Vec::new(),
             cwd: None,
+            browser_session: false,
             // Pangu-internal I/O: see the rollback site note.
             internal: true,
         };
@@ -2566,6 +2576,7 @@ impl Agent {
             hosts: assessment.hosts.clone(),
             argv: assessment.argv.clone(),
             cwd: assessment.cwd.clone(),
+            browser_session: assessment.browser_session,
             // B3/B2: `propose_memory` writes and `read_skill` reads exactly
             // one Pangu-owned location (declared in their manifest entries)
             // whose path comes from the operator's config, never from model

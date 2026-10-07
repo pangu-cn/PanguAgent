@@ -176,16 +176,12 @@ async fn a_click_and_a_type_produce_an_effect_the_agent_will_accept() {
             .unwrap_or_else(|error| panic!("`{name}` must be assessable: {error}"));
 
         // The real rule, applied exactly as the agent applies it.
-        assessment
-            .effect
-            .expect("a click or a type must declare an effect")
-            .validate_for_risk(assessment.risk)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "`{name}` emits an effect the agent rejects for every call, so the tool \
+        assessment.validate_effect().unwrap_or_else(|error| {
+            panic!(
+                "`{name}` emits an effect the agent rejects for every call, so the tool \
                      could never run: {error}"
-                )
-            });
+            )
+        });
 
         // NeedsHuman is the load-bearing class, not merely "above read-only".
         // Reversible is above read-only too, and that was the classification
@@ -203,12 +199,17 @@ async fn a_click_and_a_type_produce_an_effect_the_agent_will_accept() {
         .await
         .expect("browser_screenshot must be assessable");
     assert_eq!(assessment.risk, pangu_boundary::Risk::Reversible);
+    assessment
+        .validate_effect()
+        .expect("the screenshot effect must pass the same rule as every other action");
+    assert_eq!(
+        assessment.write_paths,
+        vec![root.join("artifacts")],
+        "the screenshot must name the directory it writes, or the sandbox cannot check it"
+    );
     let effect = assessment
         .effect
         .expect("a screenshot must declare the file it writes");
-    effect
-        .validate_for_risk(assessment.risk)
-        .expect("the screenshot effect must pass the same rule as every other action");
     assert_eq!(
         effect.reversibility,
         pangu_agent::Reversibility::Reversible,
