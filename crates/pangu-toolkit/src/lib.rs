@@ -592,6 +592,11 @@ impl Toolkit {
                 "browser_screenshot" => {
                     let session = handle.session()?;
                     require_current_page(action, &session.snapshot()?.url)?;
+                    let path = artifact_dir.as_ref().join("screenshot.png");
+                    browser::require_validated_screenshot_path(
+                        &path,
+                        &action.resources().write_paths,
+                    )?;
                     let png = session.screenshot()?;
                     let bytes = png.len();
                     let name = handle.save_screenshot(&png)?;

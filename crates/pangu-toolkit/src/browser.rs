@@ -52,7 +52,6 @@ pub struct BrowserHandle {
     session: BrowserSession,
     /// Where screenshots are written, inside the writable boundary.
     artifact_dir: std::path::PathBuf,
-    counter: u64,
 }
 
 impl BrowserHandle {
@@ -83,7 +82,6 @@ impl BrowserHandle {
         Ok(Self {
             session,
             artifact_dir,
-            counter: 0,
         })
     }
 
@@ -107,8 +105,9 @@ impl BrowserHandle {
                 self.artifact_dir.display()
             )
         })?;
-        self.counter += 1;
-        let name = format!("screenshot-{:03}.png", self.counter);
+        // L3 validated this exact filename. A counter would write a different
+        // path from the one the assessment declared.
+        let name = "screenshot.png".to_string();
         let path = self.artifact_dir.join(&name);
         std::fs::write(&path, data)
             .map_err(|error| anyhow!("cannot write the screenshot {}: {error}", path.display()))?;
@@ -296,6 +295,19 @@ pub fn require_validated_navigation_host(url: &str, validated_hosts: &[String]) 
     Ok(())
 }
 
+pub fn require_validated_screenshot_path(
+    path: &std::path::Path,
+    validated_paths: &[std::path::PathBuf],
+) -> Result<()> {
+    if !validated_paths.iter().any(|validated| validated == path) {
+        bail!(
+            "screenshot path `{}` was not validated by L3",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn require_validated_browser_action(name: &str, browser_session: bool) -> Result<()> {
     // Open is authorized by its checked host, and screenshot by its writable
     // artifact path. Read, click, and type use the browser session itself.
@@ -468,6 +480,15 @@ mod tests {
         )
         .expect_err("credentials must be rejected before navigation");
         assert!(error.to_string().contains("credential"), "{error}");
+        let approved = std::path::PathBuf::from("artifacts/screenshot.png");
+        require_validated_screenshot_path(&approved, std::slice::from_ref(&approved))
+            .expect("the validated screenshot path may be written");
+        let error = require_validated_screenshot_path(
+            std::path::Path::new("artifacts/screenshot-002.png"),
+            &[approved],
+        )
+        .expect_err("a different filename must not reuse the approval");
+        assert!(error.to_string().contains("screenshot-002"), "{error}");
     }
 
     #[test]
