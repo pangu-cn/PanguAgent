@@ -122,8 +122,12 @@ fn write_stub(bin_dir: &Path, record: &Path, token: &str) -> PathBuf {
     {
         use std::os::unix::fs::PermissionsExt;
         let path = bin_dir.join("docker");
+        // The `RAN` sentinel matches the Windows branch, so a record proves the
+        // program ran even when it received no arguments. Without it an
+        // argument-less invocation leaves the record empty, which reads as "the
+        // program never ran" — the opposite of the truth.
         let body = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{record}'\necho '{token}'\n",
+            "#!/bin/sh\nprintf 'RAN docker %s\\n' \"$*\" >> '{record}'\necho '{token}'\n",
             record = record.display(),
             token = token
         );

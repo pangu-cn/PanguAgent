@@ -164,10 +164,17 @@ fn write_stub_named(bin_dir: &Path, record: &Path, token: &str, name: &str) {
     {
         use std::os::unix::fs::PermissionsExt;
         let path = bin_dir.join(name);
+        // The `RAN <name>` sentinel matches the Windows branch. Without it the
+        // record is only written when the program receives arguments, and a
+        // program invoked with none leaves the file empty — indistinguishable
+        // from "the program never ran", which is the opposite conclusion. The
+        // Windows branch grew this sentinel first (because `echo %*` prints
+        // "ECHO is off." with no arguments); the Unix branch was missed, and CI
+        // caught it.
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{record}'\necho '{token}'\n",
+                "#!/bin/sh\nprintf 'RAN {name} %s\\n' \"$*\" >> '{record}'\necho '{token}'\n",
                 record = record.display()
             ),
         )
