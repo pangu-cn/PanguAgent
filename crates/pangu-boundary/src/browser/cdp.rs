@@ -69,6 +69,8 @@ pub struct BrowserSession {
     /// Whether this session's execution is isolated, recorded so the reported
     /// scope matches reality.
     isolates: bool,
+    /// Whether page navigation may leave `data:` and `about:` URLs.
+    network: bool,
 }
 
 impl BrowserSession {
@@ -122,21 +124,15 @@ impl BrowserSession {
         let tab = open_tab(&endpoint)?;
         let socket = connect_websocket(&tab)?;
 
-        let mut session = Self {
+        let session = Self {
             child,
             profile_dir: config.profile_dir.clone(),
             socket,
             next_id: 1,
             pending: HashMap::new(),
             isolates: runtime_launcher.is_some(),
+            network: config.network,
         };
-        if !config.network {
-            session.call(
-                "Network.setBlockedURLs",
-                json!({"urls": ["http://*", "https://*", "ws://*", "wss://*", "file://*", "ftp://*"]}),
-            )?;
-            session.call("Network.enable", json!({}))?;
-        }
         Ok(session)
     }
 
@@ -214,6 +210,11 @@ impl BrowserSession {
 
     /// Navigate the page, waiting for the load event.
     pub fn navigate(&mut self, url: &str) -> Result<()> {
+        if !self.network && !local_page_url(url) {
+            return Err(Error::Other(format!(
+                "navigation refused while network is disabled: {url}"
+            )));
+        }
         self.call("Page.enable", json!({}))?;
         let result = self.call("Page.navigate", json!({"url": url}))?;
         // Chromium reports a failed navigation inside a successful CDP result,
@@ -560,6 +561,11 @@ fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
 
 /// The navigation failure carried inside an otherwise successful CDP result.
 ///
+fn local_page_url(url: &str) -> bool {
+    let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+    matches!(scheme, Some("data" | "about"))
+}
+
 /// `Page.navigate` returns `{"result":{"frameId":"...","errorText":"net::ERR_..."}}`
 /// when the URL cannot be loaded. An empty or whitespace-only value is not a
 /// failure: a successful result has no `errorText`.
