@@ -316,9 +316,15 @@ fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     let right: Vec<_> = right.components().collect();
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
-            left.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+            let left = left.as_os_str().to_string_lossy();
+            let right = right.as_os_str().to_string_lossy();
+            // Windows paths are case-insensitive. Linux paths are not, so a
+            // case-only difference must remain a different file there.
+            if cfg!(windows) {
+                left.eq_ignore_ascii_case(&right)
+            } else {
+                left == right
+            }
         })
 }
 
@@ -503,11 +509,15 @@ mod tests {
         )
         .expect_err("a different filename must not reuse the approval");
         assert!(error.to_string().contains("screenshot-002"), "{error}");
-        require_validated_screenshot_path(
+        let case_difference = require_validated_screenshot_path(
             std::path::Path::new("Artifacts/Screenshot.PNG"),
             &[approved],
-        )
-        .expect("path comparison is component-wise and case-insensitive");
+        );
+        if cfg!(windows) {
+            case_difference.expect("Windows path comparison ignores ASCII case");
+        } else {
+            case_difference.expect_err("Linux path comparison remains case-sensitive");
+        }
     }
 
     #[test]
