@@ -462,12 +462,23 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
 }
 
 pub(crate) fn create_private_profile_dir(path: &std::path::Path) -> Result<()> {
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(Error::Other(format!(
-                "refusing to use a symlinked browser profile: {}",
-                path.display()
-            )));
+    let root = std::env::temp_dir().join("pangu-browser");
+    if !profile_is_child_of(path, &root) {
+        return Err(Error::Other(format!(
+            "refusing to create a browser profile outside pangu-browser: {}",
+            path.display()
+        )));
+    }
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+            if metadata.file_type().is_symlink() {
+                return Err(Error::Other(format!(
+                    "refusing to use a symlinked browser profile: {}",
+                    current.display()
+                )));
+            }
         }
     }
     let mut builder = std::fs::DirBuilder::new();
@@ -929,6 +940,24 @@ mod tests {
             assert!(refused.is_err(), "a profile symlink must not be followed");
             let _ = std::fs::remove_file(linked);
             let _ = std::fs::remove_dir_all(target);
+            let parent_link = std::env::temp_dir()
+                .join("pangu-browser")
+                .join(format!("parent-link-{}", std::process::id()));
+            let parent_target =
+                std::env::temp_dir().join(format!("pangu-parent-target-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&parent_target);
+            std::fs::create_dir_all(&parent_target).expect("parent target");
+            let _ = std::fs::remove_file(&parent_link);
+            std::os::unix::fs::symlink(&parent_target, &parent_link).expect("parent symlink");
+            let child = parent_link.join("session");
+            let refused_parent = create_private_profile_dir(&child);
+            assert!(
+                refused_parent.is_err(),
+                "a symlinked parent must not receive the profile"
+            );
+            assert!(!parent_target.join("session").exists());
+            let _ = std::fs::remove_file(parent_link);
+            let _ = std::fs::remove_dir_all(parent_target);
         }
     }
 
