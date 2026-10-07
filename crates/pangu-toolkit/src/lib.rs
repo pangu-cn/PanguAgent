@@ -495,6 +495,9 @@ impl Toolkit {
             "external_read" => {
                 ensure_allowed_keys(&call.args, &["url"])?;
                 let url = required_string(&call.args, "url")?;
+                sandbox
+                    .check_url(&url)
+                    .map_err(|error| anyhow!("browser URL rejected: {error}"))?;
                 let host = browser::navigation_host(&url)?;
                 // Validate the host through the same boundary `http_fetch`
                 // uses: navigation is an outbound request.
@@ -541,7 +544,17 @@ impl Toolkit {
             |handle| match name {
                 "browser_open" => {
                     let url = required_string(&args, "url")?;
-                    browser::require_validated_navigation_host(&url, &action.resources().hosts)?;
+                    browser::require_navigation_url(
+                        &url,
+                        |url| {
+                            action
+                                .sandbox()
+                                .check_url(url)
+                                .map(|_| ())
+                                .map_err(|error| anyhow!(error))
+                        },
+                        &action.resources().hosts,
+                    )?;
                     let session = handle.session()?;
                     session.navigate(&url)?;
                     // Returning the page immediately saves a round trip: an

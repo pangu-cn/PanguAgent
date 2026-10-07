@@ -292,7 +292,10 @@ async fn a_file_url_is_refused() {
         .expect_err("a file: URL must be refused");
     let text = error.to_string();
     println!("refused as expected: {text}");
-    assert!(text.contains("http"), "{text}");
+    assert!(
+        text.contains("file") || text.contains("URL without host"),
+        "{text}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

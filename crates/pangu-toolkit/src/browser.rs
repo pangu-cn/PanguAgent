@@ -279,6 +279,15 @@ pub fn navigation_host(url: &str) -> Result<String> {
     })
 }
 
+pub fn require_navigation_url(
+    url: &str,
+    mut check_url: impl FnMut(&str) -> Result<()>,
+    validated_hosts: &[String],
+) -> Result<()> {
+    check_url(url)?;
+    require_validated_navigation_host(url, validated_hosts)
+}
+
 pub fn require_validated_navigation_host(url: &str, validated_hosts: &[String]) -> Result<()> {
     let host = navigation_host(url)?;
     if !validated_hosts.iter().any(|validated| validated == &host) {
@@ -452,6 +461,13 @@ mod tests {
         )
         .expect_err("a different host must not reuse the approval");
         assert!(error.to_string().contains("other.example"), "{error}");
+        let error = require_navigation_url(
+            "https://user:secret@allowed.example/",
+            |_| Err(anyhow!("credentials are forbidden")),
+            &["allowed.example:443".into()],
+        )
+        .expect_err("credentials must be rejected before navigation");
+        assert!(error.to_string().contains("credential"), "{error}");
     }
 
     #[test]

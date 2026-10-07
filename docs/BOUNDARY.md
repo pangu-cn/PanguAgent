@@ -58,7 +58,7 @@ Contract 与 Sandbox 的有效字段及 readable/writable roots 的有效顺序�
 - **进程**：不经过 shell；argv 总长度、可执行程序、flag 和路径参数受限；child stdin 关闭、环境按 allow-list 清洗、超时 kill、stdout/stderr 有界读取。工具不提供通用 shell：`run_command`/`git_diff` 只允许只读命令 allow-list；`verify` 只运行 `[verify] command` 在启动时冻结进 contract 的**整条命令**——其程序名必须在同一只读白名单（内置或 `extra_readonly_commands`）上，模型不能增改参数，每次调用都需 L4 人工批准。`extra_readonly_commands` 是操作者对被声明程序副作用的断言，不放宽路径/flag/host 检查，也不构成 Pangu 对其外部副作用的追踪。
 - **网络**：仅 HTTP/HTTPS；主机必须在显式 allow-list；默认拒绝 localhost、私网、链路本地、组播和 `169.254.169.254` metadata；禁止 URL credentials、fragment、零端口、敏感 query 参数和重定向。审批 preview 移除 query/fragment，并以 path 的 SHA-256 摘要代替直接展示路径。
 - **凭据**：含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD`、`PASSWD`、`AUTH` 或 `CREDENTIAL` 的环境键不能进入 child env；事件字段、payload、错误和 provider 错误在边界处脱敏。
-- **浏览器**：`browser_session` 通过 L3 后仍保留在已验证资源中。它不是路径，也不是可启动命令；与 argv 同时出现会被拒绝。`browser_read`、`browser_click` 和 `browser_type` 在执行前再次要求该标记；没有它就拒绝，不会接触浏览器。`browser_open` 由已检查主机授权，执行时请求 URL 的主机必须等于 L3 保留的主机；`browser_screenshot` 由可写产物路径授权。需要审批时，审批目标显示为 `browser session`，而不是工作区路径。
+- **浏览器**：`browser_session` 通过 L3 后仍保留在已验证资源中。它不是路径，也不是可启动命令；与 argv 同时出现会被拒绝。`browser_read`、`browser_click` 和 `browser_type` 在执行前再次要求该标记；没有它就拒绝，不会接触浏览器。`browser_open` 由已检查主机授权。评估和执行都调用 `check_url`，因此凭据、片段、零端口和敏感查询参数在导航前被拒绝；执行时请求 URL 的主机还必须等于 L3 保留的主机。`browser_screenshot` 由可写产物路径授权。需要审批时，审批目标显示为 `browser session`，而不是工作区路径。
 - **资源**：每 action 的 path 数、写入字节、工具输出、搜索结果、argv、子进程输出和墙钟都有上限；provider 的 cache-read token 计入输入预算，cache-read 费用按输入价计算。Agent 在 provider/tool phase 边界以及每个 tool call 前检查预算和墙钟；内置 provider、approval handler 和 toolkit 适配器各自实施超时。任意外部注入的 trusted adapter 以及同步 OS DNS 解析不会被 Agent 强制抢占，宿主必须为它们提供可中断的超时适配器。
 
 这些是应用层限制，不是 OS 强隔离；规范不承诺抵御蓄意恶意代码或具有内核权限的对手。网络检查会重新解析 DNS，但尚未把解析结果固定到实际连接 IP，不能声称消除了 DNS rebinding / TOCTOU 风险。
