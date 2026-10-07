@@ -61,6 +61,7 @@ pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// A live browser session.
 pub struct BrowserSession {
     child: Child,
+    profile_dir: std::path::PathBuf,
     socket: WebSocket,
     next_id: u64,
     /// Replies that arrived while waiting for a different command.
@@ -128,6 +129,7 @@ impl BrowserSession {
 
         Ok(Self {
             child,
+            profile_dir: config.profile_dir.clone(),
             socket,
             next_id: 1,
             pending: HashMap::new(),
@@ -412,6 +414,10 @@ impl Drop for BrowserSession {
         // run would fail for reasons unrelated to itself.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The profile holds cookies and cache outside the workspace. Leaving it
+        // in the system temporary directory would preserve that state after the
+        // session ends.
+        remove_profile_dir(&self.profile_dir);
     }
 }
 
@@ -435,6 +441,10 @@ impl BrowserSession {
 /// `next_id` counts upward from the start of the session, so an id at or above
 /// it was never requested and can never be awaited. An ordinary `browser_open`
 /// reaches this path; compromising the socket first is not required.
+pub(crate) fn remove_profile_dir(path: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(path);
+}
+
 fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
     id.filter(|id| *id < next_id)
 }
@@ -778,6 +788,19 @@ mod tests {
         // fail on a valid screenshot.
         let decoded = decode_base64("aGVs\r\nbG8=").expect("decode");
         assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn ending_a_session_removes_its_temporary_profile() {
+        let root = std::env::temp_dir().join(format!("pangu-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("profile");
+        std::fs::write(root.join("Cookies"), b"secret").expect("cookie");
+        remove_profile_dir(&root);
+        assert!(
+            !root.exists(),
+            "the temporary profile must not survive the session"
+        );
     }
 
     #[test]
