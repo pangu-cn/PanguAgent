@@ -252,6 +252,12 @@ mod tests {
             profile_dir_under(root, "abc"),
             profile_dir_under(root, "def")
         );
+        assert!(
+            !profile_dir_under(Path::new("/tmp/pangu-browser"), "abc")
+                .components()
+                .any(|component| component.as_os_str() == ".pangu"),
+            "browser state must stay outside the checkpoint-excluded tree"
+        );
     }
 
     #[test]

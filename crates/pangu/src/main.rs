@@ -2204,8 +2204,10 @@ fn attach_browser(
     if !config.browser.enabled {
         return Ok(toolkit);
     }
+    // Cookies and cache must not enter the workspace snapshot. `.pangu` is
+    // excluded from checkpoints, so a profile there would disappear on rollback.
     let profile = pangu_boundary::browser::profile_dir_under(
-        &workspace.join(".pangu").join("runs"),
+        &std::env::temp_dir().join("pangu-browser"),
         &format!("browser-{}", unix_nanos()),
     );
     let browser_config = pangu_toolkit::browser::resolve_config(
@@ -2216,7 +2218,15 @@ fn attach_browser(
     )?;
     // Screenshots go inside the run's own storage so they are covered by the
     // same rules as every other artifact, and are cleaned up with the run.
-    let artifacts = workspace.join(".pangu").join("artifacts").join("browser");
+    let artifacts = workspace.join("artifacts").join("browser");
+    if artifacts
+        .components()
+        .any(|component| component.as_os_str() == ".pangu")
+    {
+        anyhow::bail!(
+            "browser screenshots must not be stored under .pangu; checkpoints exclude that tree"
+        );
+    }
     std::fs::create_dir_all(&artifacts).map_err(|error| {
         anyhow::anyhow!(
             "cannot create the browser artifact directory {}: {error}",
