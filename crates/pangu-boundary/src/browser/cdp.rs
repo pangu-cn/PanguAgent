@@ -122,14 +122,22 @@ impl BrowserSession {
         let tab = open_tab(&endpoint)?;
         let socket = connect_websocket(&tab)?;
 
-        Ok(Self {
+        let mut session = Self {
             child,
             profile_dir: config.profile_dir.clone(),
             socket,
             next_id: 1,
             pending: HashMap::new(),
             isolates: runtime_launcher.is_some(),
-        })
+        };
+        if !config.network {
+            session.call(
+                "Network.setBlockedURLs",
+                json!({"urls": ["http://*", "https://*", "ws://*", "wss://*", "file://*", "ftp://*"]}),
+            )?;
+            session.call("Network.enable", json!({}))?;
+        }
+        Ok(session)
     }
 
     /// Whether the browser runs inside a declared sandbox runtime.
