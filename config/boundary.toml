@@ -273,7 +273,8 @@ enabled = false
 network = false
 
 # 追加到内置参数之后的额外命令行参数（逐字传入）。
-# 不能覆盖调试地址、端口、套接字，也不能使用 --remote-allow-origins
-# 或 --disable-web-security。等号和空格两种写法都会被拒绝。
+# 不能覆盖调试地址、端口、套接字、用户数据目录、代理或扩展加载，
+# 也不能使用 --remote-allow-origins 或 --disable-web-security。
+# 等号、空格和拆成两个参数的写法都会被拒绝。
 # args = ["--lang=en-US"]
 

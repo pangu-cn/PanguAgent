@@ -224,6 +224,11 @@ pub fn resolve_config(
             "--remote-debugging-socket",
             "--remote-allow-origins",
             "--disable-web-security",
+            "--user-data-dir",
+            "--proxy-server",
+            "--proxy-bypass-list",
+            "--load-extension",
+            "--disable-extensions-except",
         ];
         let normalized = argument.trim();
         if forbidden.iter().any(|prefix| {
@@ -673,7 +678,7 @@ mod tests {
             None,
             std::path::PathBuf::from("/tmp/p"),
             false,
-            vec!["--remote-debugging-address".into(), "0.0.0.0".into()],
+            vec!["--user-data-dir".into(), "/tmp/other".into()],
         )
         .expect_err("must refuse");
         assert!(
