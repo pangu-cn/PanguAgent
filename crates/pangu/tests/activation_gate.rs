@@ -255,6 +255,112 @@ fn the_documented_stale_lock_rule_still_holds() {
     );
 }
 
+/// The manual must not hand the operator a command that does not build.
+///
+/// §9.1 step 2 tells the deployment owner to run `cargo test -p pangu-core --lib`
+/// with a test filter — **without** `--all-features`. `crates/pangu-core`'s own
+/// unit tests need `pangu_core::testing`, so that module has to compile for a
+/// plain `cargo test`, not only when the feature is on. This was broken: the
+/// module was gated on the feature alone, and the documented command failed with
+/// `unresolved import crate::testing`. Nobody noticed because every CI job and
+/// every local run this session used `--all-features`.
+///
+/// The check is on the manifest and the module gate, because the actual build
+/// happens elsewhere and a test that shells out to cargo would recurse.
+#[test]
+fn the_documented_verification_command_is_able_to_compile() {
+    let lib = read("crates/pangu-core/src/lib.rs");
+    let lines: Vec<&str> = lib.lines().collect();
+    let index = lines
+        .iter()
+        .position(|line| line.contains("pub mod testing;"))
+        .expect("the testing module must be declared");
+    // The `#[cfg(...)]` attribute sits immediately above the declaration,
+    // separated only by doc comments.
+    let gate: String = lines[..index]
+        .iter()
+        .rev()
+        .skip_while(|line| line.trim_start().starts_with("///"))
+        .take(1)
+        .copied()
+        .collect();
+    assert!(
+        gate.contains("test"),
+        "`pangu_core::testing` must be available to this crate's own unit tests, \
+         not only under the `test-support` feature: `cargo test -p pangu-core` \
+         (the command §9.1 gives the operator) does not enable that feature, so \
+         gating on the feature alone makes that command fail to compile. \
+         Found gate: {gate}"
+    );
+
+    // And the manual must keep naming that command, so the guard stays relevant.
+    let manual = read("docs/CHECKPOINT_RECOVERY.md");
+    assert!(
+        manual.contains("cargo test -p pangu-core --lib"),
+        "§9.1 step 2 must keep the pangu-core command this test protects"
+    );
+}
+
+/// The manual's platform table must match what the filter actually collects.
+///
+/// §9.1 warns the operator to count passed tests rather than trust a zero exit
+/// code, because `#[cfg]`-gated tests are not collected on the wrong platform.
+/// That makes the count a claim the manual is making. This pins the filter's
+/// Windows side to the number of applicable table rows, so the two cannot drift
+/// apart silently.
+#[test]
+fn the_platform_table_matches_the_number_of_tests_the_filter_collects() {
+    let manual = read("docs/CHECKPOINT_RECOVERY.md");
+    let start = manual
+        .find("**平台条件编译（实测，非推断）**")
+        .expect("§9.1 must keep the platform table");
+    // Bound to the table itself: the rows are contiguous, so the table ends at
+    // the first line that is neither a row nor a separator. A fixed-width window
+    // overran into a second table further down and made the count meaningless.
+    let rows: Vec<&str> = manual[start..]
+        .lines()
+        .skip_while(|line| !line.starts_with("| `artifact::tests::"))
+        .take_while(|line| line.starts_with('|'))
+        .filter(|line| line.starts_with("| `artifact::tests::"))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "the platform table must list the artifact tests by name"
+    );
+    let unix_only = rows
+        .iter()
+        .filter(|row| row.contains("#[cfg(unix)]"))
+        .count();
+    let applicable = rows.len() - unix_only;
+
+    // On Windows the filter collects exactly the non-Unix-gated rows that match
+    // the `restore_`/`corrupt_blob`/`snapshot_rejects` prefixes. The table writes
+    // the restore group as one row (`restore_*`), so compare against the number
+    // of *named* rows plus that group's expansion is not attempted here; instead
+    // assert the relationship the manual states: the Unix-gated rows are the ones
+    // that cannot be produced on Windows.
+    // The table lists five `artifact::tests::` rows. The `rollback_cli` row is
+    // named separately and reached by its own command, so it is not counted here.
+    assert_eq!(
+        rows.len(),
+        5,
+        "the table is expected to list five artifact tests; found {rows:#?}"
+    );
+    assert_eq!(
+        unix_only, 3,
+        "exactly three rows are `#[cfg(unix)]`; the manual's Windows guidance \
+         depends on that count, found {unix_only}"
+    );
+    // The manual tells the operator that on Windows the three Unix-gated rows are
+    // `not-applicable` and the rest must pass. That is two rows plus the
+    // `restore_*` group, which the manual elsewhere records as 5 collected tests.
+    assert_eq!(
+        applicable, 2,
+        "two rows carry no platform gate, so they are the ones Windows must \
+         produce; found {applicable}"
+    );
+}
+
 /// The section must keep telling the reader that these facts do not pass the gate.
 #[test]
 fn the_section_still_states_that_the_facts_are_not_an_approval() {

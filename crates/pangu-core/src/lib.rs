@@ -38,11 +38,17 @@ pub mod util;
 
 /// Test fixtures that must satisfy this project's path policy.
 ///
-/// Behind a feature because it is only needed by tests, and reachable from
-/// integration tests because those are separate crates and cannot see a
-/// `#[cfg(test)]` item inside a library. See the module for why one shared
-/// implementation replaced the copies that had drifted.
-#[cfg(feature = "test-support")]
+/// Compiled when the `test-support` feature is on, **and** for this crate's own
+/// unit tests. The second half matters: `cargo test -p pangu-core` does not turn
+/// the feature on, and a `#[cfg(test)]` module inside this crate has to reach
+/// this module to build its fixtures. Gating on the feature alone made that
+/// command fail to compile — which is the exact command
+/// `docs/CHECKPOINT_RECOVERY.md` §9.1 hands to an operator, so the manual was
+/// telling people to run something that did not build.
+///
+/// Integration tests in *other* crates still need the feature, because they are
+/// separate crates and can only see a public item.
+#[cfg(any(feature = "test-support", test))]
 pub mod testing;
 
 pub use artifact::{
