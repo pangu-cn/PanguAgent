@@ -436,7 +436,9 @@ pub fn explain_action(
         authoritative: false,
         tool: request.tool.clone(),
         risk: request.risk,
-        workspace: workspace.display().to_string(),
+        // The explain report is read by whoever is asking "why was this
+        // allowed?", so the workspace is named in a form they can act on.
+        workspace: pangu_core::util::displayable_path(workspace),
         boundary_digest: context.boundary_digest.to_string(),
         projection,
         layers,

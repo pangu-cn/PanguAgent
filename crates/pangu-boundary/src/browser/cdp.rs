@@ -84,7 +84,9 @@ impl BrowserSession {
     ) -> Result<Self> {
         if !config.executable.is_file() {
             return Err(BrowserUnavailable::NotInstalled {
-                looked_for: vec![config.executable.display().to_string()],
+                // Displayable: this list is what the operator uses to go find the
+                // browser, so it must be a path they can paste into a shell.
+                looked_for: vec![pangu_core::util::displayable_path(&config.executable)],
             }
             .refusal());
         }

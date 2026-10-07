@@ -120,7 +120,8 @@ fn the_gate_section_cites_where_each_of_its_code_facts_lives() {
     let section = section_9_2_1();
     let citations = citations(&section);
     // Three facts carry a full `path:line`; the fourth (the approval-mode
-    // refusal) reuses the file named in the same cell and is cited as `:2007`.
+    // refusal) reuses the file named in the same cell and is cited as a bare
+    // `:NNNN` continuation.
     // Counting them together keeps the check honest: a table that lost its
     // citations would drop below this.
     assert!(
@@ -149,19 +150,40 @@ fn the_gate_section_cites_where_each_of_its_code_facts_lives() {
 #[test]
 fn the_documented_rollback_refusal_is_still_where_the_section_says_it_is() {
     let section = section_9_2_1();
-    assert!(
-        section.contains("main.rs:1971"),
-        "§9.2.1 must keep citing the unattended refusal by line; found:\n{section}"
-    );
+    // Find the citation rather than hard-coding it: the line number legitimately
+    // moves whenever code above it changes, and what has to hold is that the doc
+    // and the code agree — not that the number is any particular value.
+    let cited = citations(&section)
+        .into_iter()
+        .find(|(path, _)| path.ends_with("pangu/src/main.rs"))
+        .expect("§9.2.1 must cite the unattended refusal by line in main.rs");
 
-    let line = line_of("crates/pangu/src/main.rs", 1971);
+    let line = line_of(&cited.0, cited.1);
+    // The citation names where the refusal happens. `bail!` is the refusal; the
+    // `if` that guards it sits immediately above. Accept either, but require the
+    // refusal itself to be there — a citation pointing at unrelated code is the
+    // failure this test exists to catch.
+    let nearby = {
+        let text = read(&cited.0);
+        let start = cited.1.saturating_sub(2).max(1);
+        text.lines()
+            .skip(start - 1)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert!(
-        line.contains("unattended"),
-        "crates/pangu/src/main.rs:1971 must remain the unattended check, but reads: {line}"
+        line.contains("unattended") || nearby.contains("unattended"),
+        "{}:{} must remain the unattended refusal; the area reads:\n{nearby}",
+        cited.0,
+        cited.1
     );
     assert!(
-        line.contains("if "),
-        "crates/pangu/src/main.rs:1971 must remain a conditional guard, but reads: {line}"
+        line.contains("bail!") || nearby.contains("bail!"),
+        "{}:{} must remain an outright refusal (`bail!`), not a warning; the \
+         area reads:\n{nearby}",
+        cited.0,
+        cited.1
     );
 
     // The behaviour itself: a run configured as unattended must not reach a

@@ -790,7 +790,14 @@ async fn canvas_serve(
     // Attach an audit export so the page can show the integrity statement and
     // the run's own claims alongside the timeline. The chain head recorded here
     // is the verified one, not whatever a record claimed about itself.
-    let claims = vec![("workspace".to_string(), workspace.display().to_string())];
+    //
+    // The claim is displayable rather than canonical: an audit export is read
+    // away from the machine that produced it (§9.3 stores it off-box), and
+    // Windows canonicalization prefixes `\\?\`, which resolves nowhere else.
+    let claims = vec![(
+        "workspace".to_string(),
+        pangu_core::util::displayable_path(&workspace),
+    )];
     let head = non_empty(integrity.1.head_sha.clone());
     let log = pangu_core::audit::export(&events, head, claims)?;
     canvas = canvas.with_audit(log);
@@ -2001,7 +2008,7 @@ async fn rollback_command(
     let mut contract = GoalContract::from_config("rollback maintenance", &config)?;
     contract.config_files = files
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| pangu_core::util::displayable_path(path))
         .collect();
     if contract.is_unattended() {
         bail!("rollback cannot run with an unattended approval mode");
@@ -2312,7 +2319,7 @@ async fn execute_goal(
     let mut contract = GoalContract::from_config(goal, &config)?;
     contract.config_files = files
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| pangu_core::util::displayable_path(path))
         .collect();
     // F5: pin the frozen contract into the evaluation context before the
     // agent is built (the contract is moved into it). The digest does not

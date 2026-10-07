@@ -1635,7 +1635,11 @@ impl Config {
         format!(
             "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{browser_line}{memory_line}{skills_line}{eval_line}{delegation_line}\nrules:\n{}\n",
             self.boundary_digest(),
-            self.workspace_abs().display(),
+            // Displayable, not canonical: this line is what an operator reads
+            // and pastes into a ticket or a config file, and the canonicalized
+            // workspace carries Windows' `\\?\` prefix, which is not a path
+            // anyone can use from a shell or on another host.
+            pangu_core::util::displayable_path(&self.workspace_abs()),
             self.boundary.writable_roots,
             self.boundary.forbidden_globs.join(", "),
             self.budget.max_turns,

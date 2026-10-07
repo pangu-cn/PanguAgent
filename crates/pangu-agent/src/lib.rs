@@ -1289,14 +1289,19 @@ impl Agent {
                 risk: pangu_boundary::Risk::Reversible,
                 rule_id: decision.rule_id.clone(),
                 reason: truncate_middle(&redact_text(&decision.reason), 4096),
-                target: Some(redact_text(
-                    &self.contract.workspace().display().to_string(),
-                )),
+                // Recorded in an approval event, which is part of the audit
+                // trail; see the journal header for why the displayable form is
+                // used rather than the canonicalized one.
+                target: Some(redact_text(&pangu_core::util::displayable_path(
+                    self.contract.workspace(),
+                ))),
                 invariant: Some("I-Checkpoint-After-Verified-Action".into()),
                 preview: "create an internal workspace checkpoint".into(),
                 args: approval_args(&args),
                 impact: pangu_boundary::ApprovalImpact {
-                    writes: vec![self.contract.workspace().display().to_string()],
+                    writes: vec![pangu_core::util::displayable_path(
+                        self.contract.workspace(),
+                    )],
                     ..Default::default()
                 },
             };
@@ -1628,7 +1633,12 @@ impl Agent {
             },
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             model: self.provider.model().to_string(),
-            workspace: self.contract.workspace().display().to_string(),
+            // The journal header is archived evidence and is read on machines
+            // other than the one that wrote it, so the workspace is recorded in
+            // the form an operator can use. The contract's workspace is
+            // canonicalized, which on Windows yields `\\?\F:\ws` — correct for
+            // the filesystem, meaningless pasted into a shell elsewhere.
+            workspace: pangu_core::util::displayable_path(self.contract.workspace()),
             goal: redact_text(&self.contract.goal),
             boundary_digest: self.contract.digest(),
             unattended: self.contract.is_unattended(),
@@ -2607,7 +2617,9 @@ impl Agent {
                 .write_paths
                 .first()
                 .or_else(|| resources.read_paths.first())
-                .map(|path| path.display().to_string())
+                // The approval target is recorded in the audit trail and shown to
+                // the human asked to approve, so it uses the form they can act on.
+                .map(|path| pangu_core::util::displayable_path(path))
                 .or_else(|| resources.hosts.first().cloned())
                 .map(|value| truncate_middle(&redact_text(&value), 4096));
             let approval_request = ApprovalRequest {
@@ -2628,17 +2640,17 @@ impl Agent {
                     reads: resources
                         .read_paths
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|path| pangu_core::util::displayable_path(path))
                         .collect(),
                     writes: resources
                         .write_paths
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|path| pangu_core::util::displayable_path(path))
                         .collect(),
                     cwd: assessment
                         .cwd
                         .as_ref()
-                        .map(|path| path.display().to_string()),
+                        .map(|path| pangu_core::util::displayable_path(path)),
                     // F4: show what would change, bounded and redacted; honest
                     // summary when no inline diff is possible.
                     diffs: write_file_diffs(&call, &resources),

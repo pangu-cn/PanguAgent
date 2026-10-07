@@ -360,7 +360,7 @@ F8 起，"真拉起执行"由 `crates/pangu-toolkit/tests/runtime_dispatch.rs` �
 | 1. 谁在写同一个 workspace | — | **全部**。这只有部署者知道（编辑器、构建、同步盘、CI、其它 agent）。 |
 | 2. 如何保证恢复期间没有 writer | 并发的 **Pangu** 写入者已被 workspace 写锁串行化（受限子 Agent 持锁；见 `BOUNDARY.md`） | 除 Pangu 之外的写入者靠什么流程保证不在写。**锁是协作机制，不是 OS 强制**；对这些写入者 Pangu 只能 digest/CAS 检测，**检测不是预防**。 |
 | 3. 外部不可逆副作用 | Pangu 阻断整次 rollback 且**不做外部补偿**（§4.5；drill `external-effect` 已验）。落地位置：`crates/pangu-core/src/artifact.rs:1469` 的拒绝分支 | 谁负责手工补偿、谁批准。 |
-| 4. 无人工输入时 | `--dangerously-unattended` 与 rollback 不兼容；无人值守下 rollback 一律 fail closed。落地位置：`crates/pangu/src/main.rs:1971`（`args.unattended` 即 bail）与 `:2007`（unattended 审批模式即 bail） | 确认部署中**不会**出现期望"无人值守自动回滚"的流程。 |
+| 4. 无人工输入时 | `--dangerously-unattended` 与 rollback 不兼容；无人值守下 rollback 一律 fail closed。落地位置：`crates/pangu/src/main.rs:1979`（`args.unattended` 即 bail）与 `:2014`（unattended 审批模式即 bail） | 确认部署中**不会**出现期望"无人值守自动回滚"的流程。 |
 | 5. 升级路径 | 锁超时后 Pangu **不会**删除锁文件，只报出持锁者身份。落地位置：`crates/pangu-core/src/lockfile.rs:50` 注释说明为何不删（单看锁文件无法区分"持锁者在工作"与"持锁者已消失"） | 第一个联系谁、多久内响应，以及**谁在超时后核实并手工清理锁**。 |
 
 上表的代码位置由 `crates/pangu/tests/activation_gate.rs` 看守：该测试会读取本文件的

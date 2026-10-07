@@ -186,7 +186,9 @@ pub fn resolve_config(
             let path = std::path::PathBuf::from(path);
             if !path.is_file() {
                 return Err(BrowserUnavailable::NotInstalled {
-                    looked_for: vec![path.display().to_string()],
+                    // Displayable: the operator uses this to go find the browser,
+                    // so it has to be a path they can act on.
+                    looked_for: vec![pangu_core::util::displayable_path(&path)],
                 }
                 .refusal()
                 .into());
