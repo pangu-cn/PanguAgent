@@ -297,7 +297,7 @@ impl Sandbox {
     }
 
     pub fn root_contains(&self, target: &Path, roots: &[PathBuf]) -> bool {
-        roots.iter().any(|root| target.starts_with(root))
+        roots.iter().any(|root| path_has_prefix(target, root))
     }
 
     pub fn validate_resources(&self, request: &ResourceRequest) -> Result<ValidatedResources> {
@@ -728,6 +728,20 @@ impl ResolveOutcome {
     }
 }
 
+/// Whether `target` is `root` or a descendant of it.
+///
+/// `Path::starts_with` compares the encoded path. On Unix, `/work` is therefore
+/// a prefix of `/workspace`. Component comparison keeps those distinct.
+fn path_has_prefix(target: &Path, root: &Path) -> bool {
+    let mut target = target.components();
+    for component in root.components() {
+        if target.next() != Some(component) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Canonicalize the nearest existing ancestor and append the missing tail.
 ///
 /// A first screenshot declares a file inside a directory that does not exist
@@ -1116,6 +1130,11 @@ mod tests {
         assert!(
             outcome.is_allowed(),
             "a first write must not require its parent to exist already: {outcome:?}"
+        );
+        let outside = PathBuf::from(format!("{}-outside/file.txt", root.display()));
+        assert!(
+            !sandbox.resolve_write(&outside).is_allowed(),
+            "a path that merely shares the workspace text prefix must stay outside"
         );
         fs::remove_dir_all(root).ok();
     }
