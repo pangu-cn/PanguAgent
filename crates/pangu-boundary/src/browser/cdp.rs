@@ -590,15 +590,14 @@ impl BrowserSession {
             return Ok(());
         }
         let resources = self.evaluate(
-            "JSON.stringify(Array.from(document.querySelectorAll('*')).flatMap(el => {\
+            "JSON.stringify([...Array.from(document.querySelectorAll('*')).flatMap(el => {\
              const names = ['src','href','action','formaction','poster','data','srcset'];\
-             return names.flatMap(name => {\
-               const raw = el.getAttribute(name) || '';\
-               const candidate = raw.trim().split(/\\s+/)[0] || '';\
+             return names.flatMap(name => (el.getAttribute(name) || '').split(',').flatMap(part => {\
+               const candidate = part.trim().split(/\\s+/)[0] || '';\
                const resolved = candidate.startsWith('/') || candidate.includes(':') ? (() => { try { return new URL(candidate, 'https://invalid.local').href; } catch (error) { return candidate; } })() : '';\
-               return [raw, resolved];\
-             });\
-             }))",
+               return [candidate, resolved];\
+             }));\
+             }), ...Array.from(document.querySelectorAll('style')).flatMap(style => Array.from((style.textContent || '').matchAll(/url\\(([^)]+)\\)/gi)).map(match => match[1].replace(/[\\\"']/g, '').trim()))])",
         )?;
         let values: Vec<String> = serde_json::from_str(&resources).map_err(|error| {
             Error::Other(format!(
