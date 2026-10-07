@@ -299,13 +299,27 @@ pub fn require_validated_screenshot_path(
     path: &std::path::Path,
     validated_paths: &[std::path::PathBuf],
 ) -> Result<()> {
-    if !validated_paths.iter().any(|validated| validated == path) {
+    if !validated_paths
+        .iter()
+        .any(|validated| same_path(validated, path))
+    {
         bail!(
             "screenshot path `{}` was not validated by L3",
             path.display()
         );
     }
     Ok(())
+}
+
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let left: Vec<_> = left.components().collect();
+    let right: Vec<_> = right.components().collect();
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+        })
 }
 
 pub fn require_validated_browser_action(name: &str, browser_session: bool) -> Result<()> {
@@ -485,10 +499,15 @@ mod tests {
             .expect("the validated screenshot path may be written");
         let error = require_validated_screenshot_path(
             std::path::Path::new("artifacts/screenshot-002.png"),
-            &[approved],
+            &[std::path::PathBuf::from("artifacts/screenshot.png")],
         )
         .expect_err("a different filename must not reuse the approval");
         assert!(error.to_string().contains("screenshot-002"), "{error}");
+        require_validated_screenshot_path(
+            std::path::Path::new("Artifacts/Screenshot.PNG"),
+            &[approved],
+        )
+        .expect("path comparison is component-wise and case-insensitive");
     }
 
     #[test]
