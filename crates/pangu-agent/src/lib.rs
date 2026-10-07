@@ -163,6 +163,9 @@ pub struct ToolAssessment {
     pub hosts: Vec<String>,
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// The action uses the browser session the operator enabled. It is not a
+    /// path, host, or launchable command, but it is still a named resource.
+    pub browser_session: bool,
     pub preview: String,
     pub escapes_workspace: bool,
 }
@@ -177,6 +180,7 @@ impl ToolAssessment {
             hosts: Vec::new(),
             argv: Vec::new(),
             cwd: None,
+            browser_session: false,
             preview: String::new(),
             escapes_workspace: false,
         }
@@ -228,8 +232,10 @@ impl ToolAssessment {
                 }
             }
             EffectScope::ProcessRead => {
-                if self.argv.is_empty() {
-                    return Err(anyhow!("process-read assessment must declare an argv"));
+                if self.argv.is_empty() && !self.browser_session {
+                    return Err(anyhow!(
+                        "process-read assessment must declare an argv or browser session"
+                    ));
                 }
                 if !self.hosts.is_empty() || !self.write_paths.is_empty() {
                     return Err(anyhow!(
@@ -258,9 +264,13 @@ impl ToolAssessment {
                 }
             }
             EffectScope::ExternalMutation => {
-                if self.hosts.is_empty() && self.argv.is_empty() && self.write_paths.is_empty() {
+                if self.hosts.is_empty()
+                    && self.argv.is_empty()
+                    && self.write_paths.is_empty()
+                    && !self.browser_session
+                {
                     return Err(anyhow!(
-                        "external-mutation assessment must declare a host, argv, or write path"
+                        "external-mutation assessment must declare a host, argv, write path, or browser session"
                     ));
                 }
             }
@@ -938,6 +948,7 @@ impl Agent {
             hosts: Vec::new(),
             argv: Vec::new(),
             cwd: None,
+            browser_session: false,
             internal: true,
         };
         if self.sandbox.validate_resources(&resources).is_err()
@@ -1268,6 +1279,7 @@ impl Agent {
             hosts: Vec::new(),
             argv: Vec::new(),
             cwd: None,
+            browser_session: false,
             // Pangu-internal I/O: see the rollback site note.
             internal: true,
         };
@@ -1289,14 +1301,19 @@ impl Agent {
                 risk: pangu_boundary::Risk::Reversible,
                 rule_id: decision.rule_id.clone(),
                 reason: truncate_middle(&redact_text(&decision.reason), 4096),
-                target: Some(redact_text(
-                    &self.contract.workspace().display().to_string(),
-                )),
+                // Recorded in an approval event, which is part of the audit
+                // trail; see the journal header for why the displayable form is
+                // used rather than the canonicalized one.
+                target: Some(redact_text(&pangu_core::util::displayable_path(
+                    self.contract.workspace(),
+                ))),
                 invariant: Some("I-Checkpoint-After-Verified-Action".into()),
                 preview: "create an internal workspace checkpoint".into(),
                 args: approval_args(&args),
                 impact: pangu_boundary::ApprovalImpact {
-                    writes: vec![self.contract.workspace().display().to_string()],
+                    writes: vec![pangu_core::util::displayable_path(
+                        self.contract.workspace(),
+                    )],
                     ..Default::default()
                 },
             };
@@ -1466,7 +1483,7 @@ impl Agent {
         match self.run_inner().await {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
-                let message = redact_text(&error.to_string());
+                let message = redact_text(&describe_error(&error));
                 if let Err(event_error) = self
                     .emit(
                         self.event(EventKind::RunFinished, 0, format!("run failed: {message}"))
@@ -1628,7 +1645,12 @@ impl Agent {
             },
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             model: self.provider.model().to_string(),
-            workspace: self.contract.workspace().display().to_string(),
+            // The journal header is archived evidence and is read on machines
+            // other than the one that wrote it, so the workspace is recorded in
+            // the form an operator can use. The contract's workspace is
+            // canonicalized, which on Windows yields `\\?\F:\ws` — correct for
+            // the filesystem, meaningless pasted into a shell elsewhere.
+            workspace: pangu_core::util::displayable_path(self.contract.workspace()),
             goal: redact_text(&self.contract.goal),
             boundary_digest: self.contract.digest(),
             unattended: self.contract.is_unattended(),
@@ -2556,6 +2578,7 @@ impl Agent {
             hosts: assessment.hosts.clone(),
             argv: assessment.argv.clone(),
             cwd: assessment.cwd.clone(),
+            browser_session: assessment.browser_session,
             // B3/B2: `propose_memory` writes and `read_skill` reads exactly
             // one Pangu-owned location (declared in their manifest entries)
             // whose path comes from the operator's config, never from model
@@ -2603,13 +2626,19 @@ impl Agent {
             }
             let safe_call_id = sanitized_text(&call.id, 256, "call");
             let approval_id = format!("ap_{}_{}", turn, safe_call_id);
-            let target = resources
-                .write_paths
-                .first()
-                .or_else(|| resources.read_paths.first())
-                .map(|path| path.display().to_string())
-                .or_else(|| resources.hosts.first().cloned())
-                .map(|value| truncate_middle(&redact_text(&value), 4096));
+            let target = if resources.browser_session {
+                Some("browser session".to_string())
+            } else {
+                resources
+                    .write_paths
+                    .first()
+                    .or_else(|| resources.read_paths.first())
+                    // The approval target is recorded in the audit trail and shown to
+                    // the human asked to approve, so it uses the form they can act on.
+                    .map(|path| pangu_core::util::displayable_path(path))
+                    .or_else(|| resources.hosts.first().cloned())
+                    .map(|value| truncate_middle(&redact_text(&value), 4096))
+            };
             let approval_request = ApprovalRequest {
                 id: approval_id,
                 tool: sanitized_text(&call.name, 128, "tool"),
@@ -2628,17 +2657,17 @@ impl Agent {
                     reads: resources
                         .read_paths
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|path| pangu_core::util::displayable_path(path))
                         .collect(),
                     writes: resources
                         .write_paths
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|path| pangu_core::util::displayable_path(path))
                         .collect(),
                     cwd: assessment
                         .cwd
                         .as_ref()
-                        .map(|path| path.display().to_string()),
+                        .map(|path| pangu_core::util::displayable_path(path)),
                     // F4: show what would change, bounded and redacted; honest
                     // summary when no inline diff is possible.
                     diffs: write_file_diffs(&call, &resources),
@@ -3338,6 +3367,33 @@ impl Agent {
             pangu_core::ConversationSnapshot::new("node-digest-projection", "", projected)?;
         Ok(Some(snapshot.history_digest))
     }
+}
+
+/// Describe an error including its cause chain.
+///
+/// `anyhow::Error`'s `Display` prints only the outermost message, so a failure
+/// reported through a context wrapper loses the actual cause: an operator sees
+/// `io: os error 2` with no indication of which path or program produced it. The
+/// chain is what makes a failure diagnosable.
+///
+/// Only the chain is added — no backtrace, no internal types — so the result
+/// stays safe for the journal and for a model-visible message.
+fn describe_error(error: &anyhow::Error) -> String {
+    let mut text = error.to_string();
+    for (index, cause) in error.chain().skip(1).enumerate() {
+        // Bounded: a deep or repetitive chain must not produce an unbounded
+        // message.
+        if index >= 4 {
+            text.push_str(" | (further causes omitted)");
+            break;
+        }
+        let next = cause.to_string();
+        if !next.is_empty() && !text.contains(&next) {
+            text.push_str(" | caused by: ");
+            text.push_str(&next);
+        }
+    }
+    text
 }
 
 fn sanitized_text(value: &str, max_bytes: usize, fallback: &str) -> String {

@@ -333,17 +333,12 @@ impl EventSink for ConsoleSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
 
     #[test]
     fn journal_round_trip_and_tamper_detection() {
-        let path = std::env::temp_dir().join(format!(
-            "pangu-journal-test-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("journal-round-trip");
+        let path = dir.join("journal.jsonl");
         let journal = Journal::create(&path).unwrap();
         journal
             .record(&Event::new(EventKind::RunStarted, 0, "start"))
@@ -359,19 +354,13 @@ mod tests {
         source = source.replacen("start", "tampered", 1);
         std::fs::write(&path, source).unwrap();
         assert!(crate::replay::read(&path).is_err());
-        std::fs::remove_file(path).ok();
+        dir.remove();
     }
 
     #[test]
     fn journal_v2_records_schema_and_stable_event_ids() {
-        let path = std::env::temp_dir().join(format!(
-            "pangu-journal-v2-test-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir_1 = TempDir::new("journal-v2-schema");
+        let path = dir_1.join("journal.jsonl");
         let journal = Journal::create_v2(&path).unwrap();
         let sealed = journal
             .record(&Event::new_v2(
@@ -396,19 +385,13 @@ mod tests {
         tampered_id.event_id = Some(format!("evt_{}", "0".repeat(64)));
         tampered_id.sha = Event::compute_sha(&tampered_id.prev_sha, &tampered_id.canonical());
         assert!(crate::replay::verify(&[tampered_id]).is_err());
-        std::fs::remove_file(path).ok();
+        dir_1.remove();
     }
 
     #[test]
     fn journal_v1_rejects_v2_only_events_and_format_mismatch() {
-        let path = std::env::temp_dir().join(format!(
-            "pangu-journal-v1-schema-test-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir_2 = TempDir::new("journal-v1-mismatch");
+        let path = dir_2.join("journal.jsonl");
         let journal = Journal::create(&path).unwrap();
         journal
             .record(&Event::new(EventKind::RunStarted, 0, "start"))
@@ -418,43 +401,30 @@ mod tests {
             .is_err());
         drop(journal);
         assert!(Journal::append_to_v2(&path).is_err());
-        std::fs::remove_file(path).ok();
+        dir_2.remove();
     }
 
     #[test]
     fn journal_append_requires_an_existing_chain() {
-        let path = std::env::temp_dir().join(format!(
-            "pangu-journal-missing-test-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir_3 = TempDir::new("journal-append-chain");
+        let path = dir_3.join("journal.jsonl");
         assert!(Journal::append_to(&path).is_err());
-        std::fs::remove_file(path).ok();
+        dir_3.remove();
 
-        let empty_path = std::env::temp_dir().join(format!(
-            "pangu-journal-empty-test-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir_4 = TempDir::new("journal-empty-chain");
+        let empty_path = dir_4.join("journal.jsonl");
         std::fs::write(&empty_path, "").unwrap();
         assert!(Journal::append_to(&empty_path).is_err());
-        std::fs::remove_file(empty_path).ok();
+        dir_4.remove();
     }
 
     #[test]
     fn journal_create_reports_unwritable_destination() {
-        let directory = std::env::temp_dir().join(format!(
-            "pangu-journal-directory-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
+        // The destination is a *directory*: `Journal::create` must refuse it
+        // rather than creating something inside it.
+        let dir = TempDir::new("journal-unwritable");
+        let directory = dir.child("not-a-file");
         assert!(Journal::create(&directory).is_err());
-        std::fs::remove_dir_all(directory).ok();
+        dir.remove();
     }
 }

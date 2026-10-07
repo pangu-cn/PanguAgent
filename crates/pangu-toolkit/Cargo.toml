@@ -21,3 +21,20 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+# The MCP client tests drive a real server subprocess, so they need the
+# multi-threaded runtime and the test macro rather than just the sync subset the
+# library uses.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+# A test fixture, not a product binary: the MCP client tests need a server whose
+# stdout is exclusively the JSON-RPC stream. The cargo test harness writes to
+# stdout, so the fixture must be a real [[bin]] target.
+[[bin]]
+name = "mcp_fixture_server"
+path = "src/bin/mcp_fixture_server.rs"
+# It is only ever built for tests; `cargo install` must not ship it.
+required-features = []
+test = false
+doctest = false

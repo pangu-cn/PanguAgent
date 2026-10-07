@@ -1,0 +1,6 @@
+schema = "pangu-skill-manifest/1"
+name = "protocol-design"
+version = "1.0.0"
+description = "Design a wire format or interface that a stranger can implement against, including how it fails. Covers versioning, unknown fields, and what an error actually tells the caller."
+files = ["SKILL.md"]
+scripts = []

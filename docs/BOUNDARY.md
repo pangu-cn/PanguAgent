@@ -58,6 +58,7 @@ Contract 与 Sandbox 的有效字段及 readable/writable roots 的有效顺序�
 - **进程**：不经过 shell；argv 总长度、可执行程序、flag 和路径参数受限；child stdin 关闭、环境按 allow-list 清洗、超时 kill、stdout/stderr 有界读取。工具不提供通用 shell：`run_command`/`git_diff` 只允许只读命令 allow-list；`verify` 只运行 `[verify] command` 在启动时冻结进 contract 的**整条命令**——其程序名必须在同一只读白名单（内置或 `extra_readonly_commands`）上，模型不能增改参数，每次调用都需 L4 人工批准。`extra_readonly_commands` 是操作者对被声明程序副作用的断言，不放宽路径/flag/host 检查，也不构成 Pangu 对其外部副作用的追踪。
 - **网络**：仅 HTTP/HTTPS；主机必须在显式 allow-list；默认拒绝 localhost、私网、链路本地、组播和 `169.254.169.254` metadata；禁止 URL credentials、fragment、零端口、敏感 query 参数和重定向。审批 preview 移除 query/fragment，并以 path 的 SHA-256 摘要代替直接展示路径。
 - **凭据**：含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD`、`PASSWD`、`AUTH` 或 `CREDENTIAL` 的环境键不能进入 child env；事件字段、payload、错误和 provider 错误在边界处脱敏。
+- **浏览器**：`browser_session` 通过 L3 后仍保留在已验证资源中。它不是路径，也不是可启动命令；与 argv 同时出现会被拒绝。`browser_read`、`browser_click` 和 `browser_type` 在执行前再次要求该标记；没有它就拒绝，不会接触浏览器。`browser_open` 由已检查主机授权。评估和执行都调用 `check_url`，因此凭据、片段、零端口和敏感查询参数在导航前被拒绝；执行时请求 URL 的主机还必须等于 L3 保留的主机。`browser_screenshot` 由可写产物路径授权，实际写入使用 L3 已验证资源中的 `screenshot.png` 路径，而不是启动时另行拼接的目录。路径先去掉 `.`、`..` 和 Windows `\\?\` 前缀，再按组件比较。Windows 忽略 ASCII 大小写，避免规范化差异误拒；Linux 保持大小写敏感，因此 `Screenshot.PNG` 不能复用 `screenshot.png` 的批准。浏览器配置目录位于系统临时目录下的 `pangu-browser`，不进入工作区快照。Unix 上创建时使用 `0700`，避免同机其他用户读取 cookies。会话结束时先规范化路径，只删除系统临时目录下 `pangu-browser` 中的单个会话子目录。比较按路径组件进行，因此 `pangu-browser-evil` 不会被当成子目录，共享根目录本身也不会被删除；`..` 越界会被拒绝，删除失败会报告而不是忽略。截图不得写入 `.pangu`，因为 checkpoint 排除该目录。需要审批时，审批目标显示为 `browser session`，而不是工作区路径。
 - **资源**：每 action 的 path 数、写入字节、工具输出、搜索结果、argv、子进程输出和墙钟都有上限；provider 的 cache-read token 计入输入预算，cache-read 费用按输入价计算。Agent 在 provider/tool phase 边界以及每个 tool call 前检查预算和墙钟；内置 provider、approval handler 和 toolkit 适配器各自实施超时。任意外部注入的 trusted adapter 以及同步 OS DNS 解析不会被 Agent 强制抢占，宿主必须为它们提供可中断的超时适配器。
 
 这些是应用层限制，不是 OS 强隔离；规范不承诺抵御蓄意恶意代码或具有内核权限的对手。网络检查会重新解析 DNS，但尚未把解析结果固定到实际连接 IP，不能声称消除了 DNS rebinding / TOCTOU 风险。
@@ -134,6 +135,38 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 - **签收只能由人做**：`pangu deliverable accept|reject` 是 run 外的独立动作，单向审计（同记忆生命周期）。`complete`（自动检查全过）≠ `accepted`（人认可事实正确）；格式正确也不等于事实正确（W-18）。
 - 产物文件的写入本身仍走 write_file 与 L1–L4；验收器不产生新权限面。
 
+### 外部 MCP 工具（配置即授权）
+
+`[mcp.servers.<name>]` 声明外部 MCP 服务器后，其工具经适配层进入同一条 L1–L4 链。规则：
+
+- **未声明即不存在**：只有配置里声明的服务器与映射过的工具会被广告给模型；未映射的工具**不广告且被报告**。一个外部进程不能靠自称提供工具来获得调用机会。
+- **`readOnlyHint` 永不参与风险判定**：注解是**受约束方自己**的声明。风险由我们的映射决定——把带 `readOnlyHint: true` 的工具映射为 destructive，`assess()` 就必须返回 `Risk::Destructive`（有测试守护）。否则受限方可以用一行注解决定自己被如何审查。
+- **描述文本是数据**：外部工具的 description 前必须加前缀，标明它由服务器提供、是数据而非指令。模型读到的描述不能变成给它自己的命令。
+- **`isError` 转成 `Err`**：一次被拒绝或失败的操作不能变成证据。
+- **非文本内容命名而不内联**：图片、资源块只报类型与大小，不把二进制塞进事件或上下文。
+- **声明了却起不来是错误，不是警告**：配置声称有这个服务器，而它无法启动，运行必须失败关闭。
+- **`initialize` 只声明 `tools`**：从不声明 `sampling` 或 `roots`——声明一个不打算实现的能力，等于邀请对方向我们要它。
+- **如实记录的限制**：`assess()` 无法知道外部工具实际触碰什么。映射只约束了 Policy 能看到什么，不约束那个进程做了什么。这条限制写在模块文档中。
+
+### 分层记忆（作用域与授权）
+
+记忆分三层，按"这个事实在哪里成立"划分，这也决定它可以在哪里写入。详见 [`CAPABILITIES.md`](CAPABILITIES.md)。规则：
+
+- **全局层对 run 只读，且由构造保证**：`Global`（`~/.pangu/memory/`）对此用户的所有项目成立。项目目录是用户从陌生人那里 clone 来的，若 run 能写全局层，打开一个不可信仓库就会让它植入对所有其它项目生效的记忆——这是跨项目的权限提升。因此 `is_writable_by_run()` 恒为 false，**没有任何配置组合能打开它**；全局记忆只能由操作者 CLI 写入。
+- **项目层与全局层隔离**：`Project`（`<workspace>/.pangu/memory/`）只对此仓库成立。默认的分层形态使项目专属事实不再泄漏到其它项目。
+- **注入不改变授权**：分层只改变文本存在哪里、注入到哪里。注入块明确声明这些是**数据不是指令、不携带任何授权、不能改变允许做的事**；全局层来的记忆与项目层来的记忆携带完全相同的（零）权限。
+- **来源必须可见**：每条注入行带作用域与来源。全局记忆注明**由哪个项目贡献**——这是"事情本来就这样"与"另一个项目当初这么做"的区别。
+- **Session 层永不落盘**：被取消的 run 留不下状态。
+
+### 本地只读画布
+
+`pangu canvas` 提供 trace 与审计导出的可视化。规则：
+
+- **不存在能改变状态的代码路径**：只读不是配置项，是代码里没有那条路径。任何"页面能批准动作"的设计都会被否决——页面渲染模型产出的文本，那正是敌意字符串唯一可能变成动作的地方。
+- **只绑定回环**，且默认要求 token（审计视图可能含私有仓库的路径与消息）。token 校验作用于**每一条路由**，包括 404 的：未认证方连探测存在哪些路由都做不到。
+- **所有插值转义**，且响应带 `nosniff`、`no-store` 与 `default-src 'none'` 的 CSP，使转义万一失效时注入的脚本仍不执行。
+- **画布不是权威**：页面与 API 都带 `derived: true` / `authoritative: false` 并指向 Journal。
+
 ### Issue-to-patch 评测 profile（F5）
 
 `[eval]` 声明把一次 run 固定成一个可复现实验。详见 [ADR-0009](adr/0009-issue-to-patch-eval.md)。规则：
@@ -169,14 +202,32 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
   - **发现范围有限且明示**：只读命名模块的声明（`[workspace] members`、`include`、`<modules>`、`workspaces`），**不**运行任何构建工具、不解析依赖、不执行插件逻辑。需要执行 Gradle 脚本才能得到的模块列表就得不到——猜一个比报告"没有"更糟。嵌套模块以最内层声明为准（更具体）。无模块声明的仓库是**单一单元**（`single_unit`，正常形态），不是"发现失败"——两者由 `single_unit` 与 `is_confident` 分别表达，不可混同。
   - **模块锁键与路径锁键不会碰撞**：模块键在 `module:` 命名空间下（真实相对路径不可能以该拼写开头，名为 `module` 的目录会产生 `module/...`，哈希不同），两者共用同一套排序取锁，因此"同时改构建文件与普通文件"和"按相反顺序改"不会死锁。
 
-### 执行后端声明（C5）
+### 执行后端声明（C5）与 OS 级沙箱（F8）
 
-`[execution]` 允许操作者声明运行所在的后端（`local` 默认 / `container` / `remote`），并可附一段审计描述。规则：
+`[execution]` 有两个**承诺不同**的字段，必须分开读：
 
-- **声明不是验证**。Pangu 不启动、不管理、不验证容器、VM 或远程后端；从进程内部看它们与 local 无法区分。声明只进入 contract（digest 仅在声明时携带）、`RunStarted` 审计载荷和 `doctor`/`explain` 输出。
-- **声明不改变任何闸门**。L1–L4 在所有 profile 下逐位相同；容器/VM 边界由部署者的运行时提供，网络与凭据隔离由部署者负责——这不是 Pangu 提供的保证（见第 5 节非目标）。
+| 字段 | 含义 | 是否强制 |
+|------|------|----------|
+| `profile` | 操作者声明进程在哪里运行（`local` 默认 / `container` / `remote`） | 否——仅审计 |
+| `runtime` | 命令真正在哪个 OS 级沙箱里执行（F8） | **是** |
+
+关于 `profile`：
+
+- **声明不是验证**。Pangu 不启动、不管理、不验证 `profile` 所声称的后端；从进程内部看它们与 local 无法区分。声明进入 contract、`RunStarted` 审计载荷和 `doctor`/`explain` 输出；digest 仅在声明时携带。
+- **声明不改变任何闸门**。L1–L4 在所有 profile 下逐位相同。
 - 各 profile 的真实保护范围由 `doctor`/`explain` 引用固定话术陈述（见 `ExecutionProfile::scope_statement`）；修改话术与修改代码同等对待。
 - 提醒部署者：checkpoint 的 Artifact store 存在于声明的后端内；container/remote profile 下应确保 artifact_root 位于持久化存储，否则后端被替换时恢复点随之丢失。
+
+关于 `runtime`（F8，与上面的声明分开）：
+
+- **这是强制字段**。声明非 `local` 后，Pangu 会真正启动该运行时并在其中执行命令，而不是只写一行日志。`runtime`、`image`、`network`、`memory_mib`、`cpus` 都进入 boundary digest 与 contract digest；只记录 `profile` 会让 Docker、gVisor 和未启用运行时得到同一个摘要。
+- **探测后才可用**：只看二进制是否存在不够，必须在沙箱里真正跑通一条命令。探测报告的是**观察到的行为**，不是无法支撑的安全断言。
+- **fail-closed，无宿主机退回**：探测失败即**拒绝执行命令**。理由见下条。
+- **为什么没有退回**：运行记录里写着操作者声明的运行时，实际却在宿主机上跑，会让这条记录变成假的——操作者会以为自己拥有并不存在的隔离。`local` 仍然可用且诚实，但必须是主动选择的，不能是失败后的兜底。
+- **`auto` 的优先级按内核边界强度**：firecracker > gvisor > oci。这个顺序是规范的一部分，不是实现细节。
+- **明确选择不会被降级**：要求 firecracker 而机器上只有 docker，是错误而不是静默降级——降级会给比操作者接受的更弱的隔离。
+- **Firecracker 尚不能驱动到完成**（缺 vsock/串口通道），因此当前始终报告不可用。声称一个从不启动的微 VM，正是本节要消除的那类失败。
+- **探测不验证隔离是否无法逃逸**：那是运行时自身的属性，启动器无法证明。
 
 阶段二实现和测试已经存在，但在正式激活/支持声明前，本节和第 4.1 节是条件性实验规范；部署者仍须遵守第 4.1 节的 operator recovery 限制。
 
@@ -233,12 +284,18 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 24. **I-Deliverable-Evidence-Before-Complete**：仅当 goal 声明了交付物时生效。`complete` 必须通过每个交付物的运行时检查，检查失败回灌而非静默；交付快照（digest/时间/run）必须登记成功才算完成；人工签收只存在于 run 外，模型没有任何签收路径；`complete` 与 `accepted` 是两个不同的状态，不得混用。
 25. **I-Eval-Record-Not-Acceptance**：仅当 `[eval]` 已声明时生效。评测记录只含机器事实（终态、token、成本、证据计数、产物 digest），**没有 score 字段**，每条记录携带固定免责声明；记录中的状态不断言 issue 已修复；验收仍然只由 verify evidence 与人工签收构成；不声明 `[eval]` 时行为与 digest 完全不变。
 26. **I-Sub-Agent-Never-Wider**：仅当 `[boundary] allow_delegation` 已开启时生效。子 Agent 的 contract 由父 contract 派生，任何一维预算超过父级即拒绝；子的 sandbox/policy/审批面与父级相同，run 作用域特性全部剥离；子的事件进同一中央 Journal，花费聚合进父级账本；子不能再委派（深度 1，结构性）；委派事件只携带 task digest，不携带原文；关闭开关时行为与 digest 完全不变。
+27. **I-Sandbox-Declared-Means-Enforced**：仅当 `[execution] runtime` 非 `local` 时生效。声明的运行时必须**先探测通过**（在沙箱内真正跑通一条命令）才允许任何命令执行；探测失败即拒绝，**不存在**任何退回宿主机执行的路径——否则审计里记录的运行时与实际执行不符，记录即为假。探测报告的是观察到的行为，不是"隔离攻不破"的断言。`auto` 按 firecracker > gvisor > oci 的内核边界强度择优；显式选择不得静默降级为更弱的运行时。`runtime = "local"`（默认）不进入本不变量，行为与 digest 完全不变。
+28. **I-Browser-Absent-Until-Enabled**：仅当 `[browser] enabled` 时生效。未启用时浏览器工具**不出现在任何工具表中**，模型无法调用一个操作者未开启的能力；`assess` 亦拒绝调用，使拒绝是结构性的而非只靠执行器。启用后每个浏览器动作进入与其它工具逐位相同的 L1–L4 链：`browser_open` 会访问主机，必须声明其 host 并受 egress 允许表约束；**`browser_click`/`browser_type` 是 `NeedsHuman` + `ExternalMutation`/`Irreversible`，并声明已打开的浏览器会话；`browser_screenshot` 必须声明其 artifact 目录作为写入路径。它们都不是只读**——点下去会发生什么由页面决定，将其归类为观察会让改变状态的动作绕过人工闸门。这里的 `Irreversible` 不是保守取值：状态改动落在本程序不控制的服务器上，它无法撤销自己观察不到的变更。该组合还必须满足 `validate_for_risk` 的约束（ExternalMutation 必须 Irreversible 且 risk ≥ Destructive），否则工具会在每次调用时被 L1 拒绝——曾经如此，见 `docs/CAPABILITIES.md` 的说明。只支持 `http`/`https`，`file:` 被拒绝。导航前检查请求主机。所有浏览器动作在返回前都用同一个出口规则检查当前 URL。无论拒绝来自打开、读取、截图、点击还是输入，只要页面落到未允许主机或 `file:`，浏览器会话都会关闭，避免后续动作继续观察该页面。`enabled = false`（默认）时不进入本不变量，行为与 digest 完全不变。
 
 ## 5. 非目标
 
 - 不做通用聊天、角色扮演或“什么都问一句”的助手壳。
 - 不做多 agent DAG、工作流 SaaS 或模型训练/微调平台。
-- 不做 OS 级 seccomp、Landlock、容器或 VM 隔离。
+- **不再把 OS 级隔离列为非目标**（F8 起）：`[execution] runtime` 会真正启动
+  Firecracker/gVisor/OCI 并在其中执行命令。仍然不做的是：
+  - **不内置 seccomp/Landlock 过滤器**；要更强边界就声明 runtime，让运行时去提供。
+  - **不保证隔离无法逃逸**。我们保证的是"命令确实在声明的边界内执行"，不是
+    "该边界攻不破"——后者是运行时自身的属性，启动器无法证明。
 - 不承诺“永远不被绕过”，也不把 Pangu 当作运行不受信任代码的完整安全边界。
 - 不做遥测；除用户配置的 provider endpoint 和显式允许的 HTTP 工具外，不主动出站。
 - 不实现 Anthropic 专用 provider；需要其他模型时使用 OpenAI-compatible endpoint。

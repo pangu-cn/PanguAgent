@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod canvas_server;
+
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
@@ -122,6 +124,27 @@ enum Commands {
     Events {
         #[command(subcommand)]
         action: EventsCommands,
+    },
+    /// The local read-only canvas: serve a run's trace and audit export over
+    /// loopback. It has no route that runs, approves or writes anything, so a
+    /// page rendered from model output can never sit next to a control that
+    /// authorizes it.
+    Canvas {
+        /// Journal to view. Defaults to the workspace journal.
+        #[arg(long)]
+        journal: Option<PathBuf>,
+        /// Port to bind on 127.0.0.1. 0 asks the OS to choose a free one.
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// Print the URL and the token, then exit without serving. Useful for
+        /// checking what would be opened.
+        #[arg(long)]
+        print_url: bool,
+        /// Serve without a token. Only meaningful on a machine where every
+        /// process is equally trusted; the audit view can contain private
+        /// paths and messages.
+        #[arg(long)]
+        no_token: bool,
     },
     /// Read-only operator tooling. Nothing here repairs or cleans evidence.
     Artifact {
@@ -497,6 +520,12 @@ async fn main() -> Result<()> {
                 session_replay(&args, &node, full, json)
             }
         },
+        Some(Commands::Canvas {
+            journal,
+            port,
+            print_url,
+            no_token,
+        }) => canvas_serve(&args, journal, port, print_url, no_token).await,
         Some(Commands::Events { action }) => match action {
             EventsCommands::Read {
                 path,
@@ -712,6 +741,148 @@ fn doctor(args: &Cli, journal: Option<&std::path::Path>) -> Result<()> {
 /// otherwise echoes the `sha` it read back — "this sha was in the file" and
 /// "this sha was recomputed and the chain is intact" render identically and
 /// mean very different things to a CI auditor.
+/// Serve the local read-only canvas.
+///
+/// Nothing here executes, approves or writes anything in the workspace: the
+/// canvas has no route that can. It binds loopback only and mints a token by
+/// default, because a trace can contain private paths and messages.
+async fn canvas_serve(
+    args: &Cli,
+    journal: Option<PathBuf>,
+    port: u16,
+    print_url: bool,
+    no_token: bool,
+) -> Result<()> {
+    let (config, _files) = Config::load(args.config.as_deref())?;
+    let workspace = config.boundary.workspace.clone();
+
+    let journal_path = match journal {
+        Some(path) => path,
+        None => latest_journal(&workspace)?,
+    };
+
+    // Read and verify through the same path `pangu events read --verify` uses,
+    // so the canvas cannot show a different picture from the CLI.
+    let events = pangu_core::replay::read(&journal_path)?;
+    if events.is_empty() {
+        bail!(
+            "journal {} has no events; nothing to display",
+            journal_path.display()
+        );
+    }
+    let integrity = pangu_core::replay::verify_journal(&journal_path)?;
+
+    let token = if no_token {
+        None
+    } else {
+        Some(pangu_core::canvas::Canvas::mint_token()?)
+    };
+
+    let mut canvas = pangu_core::canvas::Canvas::new(
+        journal_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| "journal".to_string()),
+        &events,
+        token.clone(),
+    )?;
+
+    // Attach an audit export so the page can show the integrity statement and
+    // the run's own claims alongside the timeline. The chain head recorded here
+    // is the verified one, not whatever a record claimed about itself.
+    //
+    // The claim is displayable rather than canonical: an audit export is read
+    // away from the machine that produced it (§9.3 stores it off-box), and
+    // Windows canonicalization prefixes `\\?\`, which resolves nowhere else.
+    let claims = vec![(
+        "workspace".to_string(),
+        pangu_core::util::displayable_path(&workspace),
+    )];
+    let head = non_empty(integrity.1.head_sha.clone());
+    let log = pangu_core::audit::export(&events, head, claims)?;
+    canvas = canvas.with_audit(log);
+
+    if print_url {
+        println!("{}", canvas_url(port, token.as_deref()));
+        return Ok(());
+    }
+
+    let bound = canvas_server::serve(canvas, port).await?;
+    println!(
+        "canvas (read-only): {}",
+        canvas_url(bound.port(), token.as_deref())
+    );
+    if token.is_some() {
+        println!("the token is required on every route; the canvas is bound to 127.0.0.1 only");
+    } else {
+        println!("WARNING: serving without a token (--no-token)");
+    }
+    println!("press Ctrl-C to stop");
+
+    // Park forever: the server only returns on a fatal bind error.
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// The URL to open, with the token when there is one.
+fn canvas_url(port: u16, token: Option<&str>) -> String {
+    match token {
+        Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
+        None => format!("http://127.0.0.1:{port}/"),
+    }
+}
+
+/// Treat an empty digest as absent.
+///
+/// An empty journal has no chain head, and recording `""` would look like a head
+/// that was checked and found to be the empty string.
+fn non_empty(value: String) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// The most recently written journal in the workspace.
+///
+/// Chosen by modification time rather than by name: the name carries a run
+/// label whose ordering is not guaranteed. An absent journal is an error rather
+/// than an empty canvas, so a typo in the workspace path does not look like a
+/// run that recorded nothing.
+fn latest_journal(workspace: &std::path::Path) -> Result<PathBuf> {
+    let dir = workspace.join(".pangu");
+    let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("cannot read {}", dir.display()))?
+        .flatten()
+    {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if !name.starts_with("journal") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                candidates.push((modified, path));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+        .ok_or_else(|| {
+            anyhow!(
+                "no journal found in {}; pass --journal <path>",
+                dir.display()
+            )
+        })
+}
+
 fn events_read(
     path: &std::path::Path,
     kind: Option<String>,
@@ -1837,7 +2008,7 @@ async fn rollback_command(
     let mut contract = GoalContract::from_config("rollback maintenance", &config)?;
     contract.config_files = files
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| pangu_core::util::displayable_path(path))
         .collect();
     if contract.is_unattended() {
         bail!("rollback cannot run with an unattended approval mode");
@@ -1879,6 +2050,8 @@ async fn rollback_command(
             Some(registry) => base.with_skills(registry.clone()),
             None => base,
         };
+        let base = attach_runtime(base, &config, contract.workspace());
+        let base = attach_browser(base, &config, contract.workspace())?;
         Arc::new(base)
     };
     let mut agent = Agent::new(
@@ -1992,6 +2165,77 @@ fn build_memory_store(
 }
 
 /// B2: build the run-side skill registry when the contract enables it. The
+/// F8: resolve and attach the declared OS-level sandbox.
+///
+/// Resolution **probes** the runtime, so an operator learns at startup whether
+/// the sandbox they asked for actually works — rather than from every command
+/// being refused mid-run, or worse, from believing they had isolation they did
+/// not have.
+///
+/// An unresolvable runtime is attached anyway rather than silently dropped: the
+/// toolkit then refuses commands, which is the intended fail-closed behaviour.
+/// Dropping it here would quietly restore host execution, which is exactly the
+/// failure this feature removes.
+fn attach_runtime(toolkit: Toolkit, config: &Config, workspace: &std::path::Path) -> Toolkit {
+    if !config.execution.isolates() {
+        return toolkit;
+    }
+    let runtime = config
+        .execution
+        .runtime_config(workspace.to_path_buf())
+        .resolve();
+    toolkit.with_runtime(Arc::new(runtime))
+}
+
+/// F9: attach the browser when the operator enabled it.
+///
+/// Returns the toolkit unchanged when `[browser] enabled = false` (the default),
+/// in which case the browser tools are **not advertised at all** — the model
+/// cannot call a capability the operator did not turn on.
+///
+/// A configuration error is reported rather than degraded: an operator who
+/// enabled the browser and pointed it at a missing executable should hear about
+/// it at startup, not discover it when a model first clicks.
+fn attach_browser(
+    toolkit: Toolkit,
+    config: &Config,
+    workspace: &std::path::Path,
+) -> Result<Toolkit> {
+    if !config.browser.enabled {
+        return Ok(toolkit);
+    }
+    // Cookies and cache must not enter the workspace snapshot. `.pangu` is
+    // excluded from checkpoints, so a profile there would disappear on rollback.
+    let profile = pangu_boundary::browser::profile_dir_under(
+        &std::env::temp_dir().join("pangu-browser"),
+        &format!("browser-{}", unix_nanos()),
+    );
+    let browser_config = pangu_toolkit::browser::resolve_config(
+        config.browser.executable.as_deref(),
+        profile,
+        config.browser.network,
+        config.browser.args.clone(),
+    )?;
+    // Screenshots go inside the run's own storage so they are covered by the
+    // same rules as every other artifact, and are cleaned up with the run.
+    let artifacts = workspace.join("artifacts").join("browser");
+    if artifacts
+        .components()
+        .any(|component| component.as_os_str() == ".pangu")
+    {
+        anyhow::bail!(
+            "browser screenshots must not be stored under .pangu; checkpoints exclude that tree"
+        );
+    }
+    std::fs::create_dir_all(&artifacts).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot create the browser artifact directory {}: {error}",
+            artifacts.display()
+        )
+    })?;
+    Ok(toolkit.with_browser(browser_config, artifacts))
+}
+
 /// registry lives under `<workspace>/.pangu/skills/` (tool-forbidden); the
 /// contract already froze the loaded skill set, and the run compares against
 /// it at startup.
@@ -2091,7 +2335,7 @@ async fn execute_goal(
     let mut contract = GoalContract::from_config(goal, &config)?;
     contract.config_files = files
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| pangu_core::util::displayable_path(path))
         .collect();
     // F5: pin the frozen contract into the evaluation context before the
     // agent is built (the contract is moved into it). The digest does not
@@ -2151,6 +2395,8 @@ async fn execute_goal(
             Some(registry) => base.with_skills(registry.clone()),
             None => base,
         };
+        let base = attach_runtime(base, &config, contract.workspace());
+        let base = attach_browser(base, &config, contract.workspace())?;
         Arc::new(base)
     };
     let mut agent = Agent::with_chain(

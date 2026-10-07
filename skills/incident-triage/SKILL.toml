@@ -1,0 +1,6 @@
+schema = "pangu-skill-manifest/1"
+name = "incident-triage"
+version = "1.0.0"
+description = "Work a failure from symptom to cause to a bounded fix, recording each step as evidence so the conclusion can be re-derived. Refuses to guess a root cause it cannot support."
+files = ["SKILL.md"]
+scripts = []

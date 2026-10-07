@@ -2,15 +2,23 @@
 //! approval. The crate owns decisions but never performs tool side effects.
 
 pub mod approval;
+pub mod browser;
 pub mod budget;
 pub mod config;
 pub mod execution;
 pub mod explain;
 pub mod goal;
+pub mod mcp;
 pub mod policy;
 pub mod registry;
 pub mod risk;
+pub mod runtime;
 pub mod sandbox;
+
+pub use mcp::{
+    namespaced_tool_name, report_for, split_tool_name, validate_server_name, McpSection,
+    McpServerSection, ServerReport, TOOL_NAMESPACE,
+};
 
 pub use approval::{
     ApprovalHandler, ApprovalImpact, ApprovalMode, ApprovalRequest, ApprovalResponse,

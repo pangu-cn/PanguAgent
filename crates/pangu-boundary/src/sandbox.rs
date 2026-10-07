@@ -21,6 +21,10 @@ pub struct ResourceRequest {
     pub hosts: Vec<String>,
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// The action uses the already-open browser session. This is neither a
+    /// filesystem path nor a launchable command: the session was authorized
+    /// when the operator enabled the browser.
+    pub browser_session: bool,
     /// B3: Pangu-internal I/O (checkpoint/rollback artifact access) is not a
     /// tool path. Forbidden globs exist to stop *model-controlled* paths from
     /// reaching secrets and Pangu-owned storage; Pangu itself must still read
@@ -36,6 +40,9 @@ pub struct ValidatedResources {
     pub hosts: Vec<String>,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
+    /// Preserved from the request so later gates can tell a browser action
+    /// from an action that merely passed with no filesystem target.
+    pub browser_session: bool,
 }
 
 #[derive(Clone)]
@@ -175,7 +182,7 @@ impl Sandbox {
         }
         let canonical = match std::fs::canonicalize(&target) {
             Ok(path) => path,
-            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+            Err(error) => return ResolveOutcome::Error(cannot_resolve(&target, &error)),
         };
         if let Some(forbidden) = self.forbidden_path(&canonical) {
             return ResolveOutcome::ForbiddenGlob(forbidden);
@@ -205,7 +212,7 @@ impl Sandbox {
         }
         let canonical = match std::fs::canonicalize(&target) {
             Ok(path) => path,
-            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+            Err(error) => return ResolveOutcome::Error(cannot_resolve(&target, &error)),
         };
         if self.root_contains(&canonical, &self.readable_roots) {
             ResolveOutcome::Allowed(canonical)
@@ -231,15 +238,9 @@ impl Sandbox {
                 return ResolveOutcome::Error(Error::Config("write target has no parent".into()))
             }
         };
-        if has_symlink_component(parent) {
-            return ResolveOutcome::Error(Error::Config(format!(
-                "symlink path not allowed: {}",
-                target.display()
-            )));
-        }
-        let canonical_parent = match std::fs::canonicalize(parent) {
+        let canonical_parent = match canonical_existing_ancestor(parent) {
             Ok(path) => path,
-            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+            Err(error) => return ResolveOutcome::Error(error),
         };
         let candidate = canonical_parent.join(file_name);
         if has_symlink_component(&candidate) {
@@ -277,15 +278,9 @@ impl Sandbox {
                 return ResolveOutcome::Error(Error::Config("write target has no parent".into()))
             }
         };
-        if has_symlink_component(parent) {
-            return ResolveOutcome::Error(Error::Config(format!(
-                "symlink path not allowed: {}",
-                parent.display()
-            )));
-        }
-        let canonical_parent = match std::fs::canonicalize(parent) {
+        let canonical_parent = match canonical_existing_ancestor(parent) {
             Ok(path) => path,
-            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+            Err(error) => return ResolveOutcome::Error(error),
         };
         let candidate = canonical_parent.join(file_name);
         if has_symlink_component(&candidate) {
@@ -305,7 +300,7 @@ impl Sandbox {
     }
 
     pub fn root_contains(&self, target: &Path, roots: &[PathBuf]) -> bool {
-        roots.iter().any(|root| target.starts_with(root))
+        roots.iter().any(|root| path_has_prefix(target, root))
     }
 
     pub fn validate_resources(&self, request: &ResourceRequest) -> Result<ValidatedResources> {
@@ -354,6 +349,11 @@ impl Sandbox {
         if !request.argv.is_empty() {
             self.validate_argv(&request.argv)?;
         }
+        if request.browser_session && !request.argv.is_empty() {
+            return Err(Error::Other(
+                "a browser session is not a launchable command".into(),
+            ));
+        }
 
         let cwd = match &request.cwd {
             Some(path) => require_allowed(self.resolve_read(path), "cwd")?,
@@ -365,6 +365,7 @@ impl Sandbox {
             hosts,
             argv: request.argv.clone(),
             cwd,
+            browser_session: request.browser_session,
         })
     }
 
@@ -643,10 +644,33 @@ impl Sandbox {
     }
 
     pub fn sanitize_env(&self, input: &HashMap<String, String>) -> HashMap<String, String> {
+        // Windows environment variable names are case-insensitive, and a process
+        // started from Explorer or the DSH harness typically carries `Path` and
+        // `SystemRoot` rather than `PATH` and `SYSTEMROOT`.
+        //
+        // An exact-case lookup therefore silently dropped both, because
+        // `env_allow` lists the upper-case spellings. The effect was that every
+        // sandboxed subprocess ran without `PATH` or `SystemRoot`: on Windows the
+        // loader needs `SystemRoot` to find system DLLs, so commands failed with
+        // `os error 2` instead of running. On Unix the names already match, which
+        // is why this only ever showed up on Windows.
+        //
+        // Matching case-insensitively for the lookup is correct here rather than
+        // merely convenient: on Windows the two spellings *are* the same
+        // variable, so dropping a value because the operator's config spelled it
+        // differently would be the sandbox lying about what it passes.
+        let mut resolved: HashMap<String, String> = HashMap::new();
+        for (name, value) in input {
+            resolved.insert(name.to_ascii_uppercase(), value.clone());
+        }
         self.env_allow
             .iter()
             .filter(|key| !sensitive_env_key(key))
-            .filter_map(|key| input.get(key).map(|value| (key.clone(), value.clone())))
+            .filter_map(|key| {
+                resolved
+                    .get(&key.to_ascii_uppercase())
+                    .map(|value| (key.clone(), value.clone()))
+            })
             .collect()
     }
 
@@ -665,6 +689,16 @@ impl Sandbox {
             }
         })
     }
+}
+
+/// Why a path could not be canonicalised, naming the path.
+///
+/// A bare `os error 2` does not say *which* path failed, which makes a denied
+/// action very hard to diagnose — it took a long investigation to trace one back
+/// to its source. Naming the path costs nothing and turns an opaque failure into
+/// an actionable one.
+fn cannot_resolve(path: &Path, error: &std::io::Error) -> Error {
+    Error::Config(format!("cannot resolve path {}: {error}", path.display()))
 }
 
 fn require_allowed(outcome: ResolveOutcome, operation: &str) -> Result<PathBuf> {
@@ -699,6 +733,64 @@ impl ResolveOutcome {
         match self {
             Self::Allowed(path) => Some(path),
             _ => None,
+        }
+    }
+}
+
+/// Whether `target` is `root` or a descendant of it.
+///
+/// `Path::starts_with` compares the encoded path. On Unix, `/work` is therefore
+/// a prefix of `/workspace`. Component comparison keeps those distinct.
+fn path_has_prefix(target: &Path, root: &Path) -> bool {
+    let mut target = target.components();
+    for component in root.components() {
+        if target.next() != Some(component) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Canonicalize the nearest existing ancestor and append the missing tail.
+///
+/// A first screenshot declares a file inside a directory that does not exist
+/// yet. Requiring that exact parent rejects the action before execution can
+/// create it. Existing components are still canonicalized, so a symlink in the
+/// path cannot redirect the write.
+fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::Config(format!(
+                    "symlink path not allowed: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {
+                let mut canonical = std::fs::canonicalize(&current)?;
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(Error::Config(format!(
+                        "cannot resolve path: {}",
+                        path.display()
+                    )));
+                };
+                missing.push(name.to_os_string());
+                if !current.pop() {
+                    return Err(Error::Config(format!(
+                        "cannot resolve path: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -996,6 +1088,34 @@ mod tests {
     }
 
     #[test]
+    fn a_browser_session_survives_validation_but_cannot_launch_a_command() {
+        let root = test_workspace();
+        fs::create_dir_all(&root).unwrap();
+        let config = crate::config::BoundarySection {
+            workspace: root.clone(),
+            readable_roots: vec![root.clone()],
+            writable_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let sandbox = Sandbox::from_config(&config).unwrap();
+        let resources = sandbox
+            .validate_resources(&ResourceRequest {
+                browser_session: true,
+                ..Default::default()
+            })
+            .expect("the session itself is an authorized browser resource");
+        assert!(resources.browser_session);
+
+        let mixed = sandbox.validate_resources(&ResourceRequest {
+            browser_session: true,
+            argv: vec!["cat".into()],
+            ..Default::default()
+        });
+        assert!(mixed.is_err(), "a browser session must not authorize argv");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn command_argv_is_bounded_and_allow_listed() {
         let root = test_workspace();
         fs::create_dir_all(&root).unwrap();
@@ -1032,6 +1152,30 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn a_missing_write_parent_is_checked_through_its_existing_ancestor() {
+        let root = test_workspace();
+        fs::create_dir_all(&root).unwrap();
+        let config = crate::config::BoundarySection {
+            workspace: root.clone(),
+            readable_roots: vec![root.clone()],
+            writable_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let sandbox = Sandbox::from_config(&config).unwrap();
+        let outcome = sandbox.resolve_write(Path::new("artifacts/screenshot.png"));
+        assert!(
+            outcome.is_allowed(),
+            "a first write must not require its parent to exist already: {outcome:?}"
+        );
+        let outside = PathBuf::from(format!("{}-outside/file.txt", root.display()));
+        assert!(
+            !sandbox.resolve_write(&outside).is_allowed(),
+            "a path that merely shares the workspace text prefix must stay outside"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_components_are_rejected() {
@@ -1051,5 +1195,89 @@ mod tests {
         assert!(!sandbox.resolve_read(Path::new("link.txt")).is_allowed());
         fs::remove_dir_all(root).ok();
         fs::remove_dir_all(outside).ok();
+    }
+
+    /// Windows spells these `Path` and `SystemRoot`, but `env_allow` lists the
+    /// upper-case forms. An exact-case lookup silently dropped both, so every
+    /// sandboxed subprocess ran without `PATH` or `SystemRoot` — and on Windows
+    /// the loader needs `SystemRoot` to find system DLLs, which made commands
+    /// fail with `os error 2` instead of running.
+    #[test]
+    fn env_allow_matches_names_case_insensitively() {
+        let root = test_workspace();
+        fs::create_dir_all(&root).unwrap();
+        let config = crate::config::BoundarySection {
+            workspace: root.clone(),
+            readable_roots: vec![root.clone()],
+            writable_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let sandbox = Sandbox::from_config(&config).unwrap();
+
+        // Exactly the casing Windows actually reports.
+        let mut input: HashMap<String, String> = HashMap::new();
+        input.insert("Path".into(), r"C:\Windows\System32".into());
+        input.insert("SystemRoot".into(), r"C:\Windows".into());
+        input.insert("PATHEXT".into(), ".EXE;.CMD".into());
+        input.insert("TEMP".into(), r"C:\Temp".into());
+
+        let sanitised = sandbox.sanitize_env(&input);
+        assert_eq!(
+            sanitised.get("PATH").map(String::as_str),
+            Some(r"C:\Windows\System32"),
+            "PATH must survive a `Path` spelling; got {sanitised:?}"
+        );
+        assert_eq!(
+            sanitised.get("SYSTEMROOT").map(String::as_str),
+            Some(r"C:\Windows"),
+            "SYSTEMROOT must survive a `SystemRoot` spelling; got {sanitised:?}"
+        );
+        assert_eq!(
+            sanitised.get("PATHEXT").map(String::as_str),
+            Some(".EXE;.CMD")
+        );
+        assert_eq!(sanitised.get("TEMP").map(String::as_str), Some(r"C:\Temp"));
+
+        // The secret filter must still apply regardless of casing: a
+        // case-insensitive lookup must not become a way to smuggle a secret in.
+        let mut with_secret: HashMap<String, String> = HashMap::new();
+        with_secret.insert("Path".into(), "ok".into());
+        with_secret.insert("GITHUB_TOKEN".into(), "secret".into());
+        with_secret.insert("github_token".into(), "secret".into());
+        with_secret.insert("my_api_key".into(), "secret".into());
+        let sanitised = sandbox.sanitize_env(&with_secret);
+        assert!(
+            !sanitised.values().any(|value| value == "secret"),
+            "secrets must be filtered whatever the casing: {sanitised:?}"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A key not in the allow-list must stay out, whatever its casing.
+    #[test]
+    fn env_outside_the_allow_list_is_not_passed_through() {
+        let root = test_workspace();
+        fs::create_dir_all(&root).unwrap();
+        let config = crate::config::BoundarySection {
+            workspace: root.clone(),
+            readable_roots: vec![root.clone()],
+            writable_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let sandbox = Sandbox::from_config(&config).unwrap();
+
+        let mut input: HashMap<String, String> = HashMap::new();
+        input.insert("PATH".into(), "keep".into());
+        input.insert("SOME_UNLISTED_VAR".into(), "drop".into());
+        input.insert("some_unlisted_var".into(), "drop".into());
+        let sanitised = sandbox.sanitize_env(&input);
+        assert!(sanitised.contains_key("PATH"));
+        assert!(
+            !sanitised.contains_key("SOME_UNLISTED_VAR"),
+            "an unlisted key must not be passed through: {sanitised:?}"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 }

@@ -1,6 +1,10 @@
 //! Built-in tools. Every executor is an adapter around the Agent capability
 //! protocol; no public method accepts an unverified model call for execution.
 
+pub mod browser;
+pub mod mcp_executor;
+pub mod mcp_stdio;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -36,6 +40,24 @@ pub struct Toolkit {
     /// B2: the skill registry. `None` = the `read_skill` tool does not
     /// exist, exactly as if B2 were not compiled in.
     skills: Option<std::sync::Arc<SkillRegistry>>,
+    /// F8: the resolved OS-level sandbox runtime. `None` means no runtime was
+    /// declared, which is the `local` profile: commands run on the host exactly
+    /// as before.
+    ///
+    /// When present this is **enforced**: an unusable runtime refuses the
+    /// command instead of falling back to the host. Preventing that fallback is
+    /// the reason this field exists.
+    runtime: Option<std::sync::Arc<pangu_boundary::runtime::Runtime>>,
+    /// F9: the browser session, when a browser is configured.
+    ///
+    /// `None` means the browser tools do not exist, exactly as if F9 were not
+    /// compiled in — the same discipline as `memory` and `skills`. A tool that
+    /// is advertised but cannot run is worse than an absent one.
+    browser: Option<std::sync::Arc<browser::BrowserSlot>>,
+    /// F9: the resolved browser configuration.
+    browser_config: Option<std::sync::Arc<pangu_boundary::browser::BrowserConfig>>,
+    /// F9: where screenshots are written, inside the writable boundary.
+    browser_artifact_dir: Option<std::sync::Arc<PathBuf>>,
 }
 
 impl Toolkit {
@@ -51,6 +73,10 @@ impl Toolkit {
             verify_command: command,
             memory: None,
             skills: None,
+            runtime: None,
+            browser: None,
+            browser_config: None,
+            browser_artifact_dir: None,
         }
     }
 
@@ -67,6 +93,67 @@ impl Toolkit {
     pub fn with_skills(mut self, registry: std::sync::Arc<SkillRegistry>) -> Self {
         self.skills = Some(registry);
         self
+    }
+
+    /// F8: attach a resolved sandbox runtime.
+    ///
+    /// Callers pass the result of `RuntimeConfig::resolve`, which has already
+    /// probed. An attached runtime that turns out to be unusable makes every
+    /// command **fail** rather than run on the host.
+    pub fn with_runtime(
+        mut self,
+        runtime: std::sync::Arc<pangu_boundary::runtime::Runtime>,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// F8: the attached runtime, if any.
+    pub fn runtime(&self) -> Option<&std::sync::Arc<pangu_boundary::runtime::Runtime>> {
+        self.runtime.as_ref()
+    }
+
+    /// F9: attach a browser.
+    ///
+    /// Until this is called the browser tools are **not advertised at all**:
+    /// a model cannot call a capability the operator did not enable, and an
+    /// operator who did not configure a browser should not see browser tools in
+    /// the list.
+    ///
+    /// `artifact_dir` receives screenshots. It must be inside a writable root,
+    /// so screenshots are covered by the same rules as every other run artifact.
+    pub fn with_browser(
+        mut self,
+        config: pangu_boundary::browser::BrowserConfig,
+        artifact_dir: PathBuf,
+    ) -> Self {
+        self.browser = Some(std::sync::Arc::new(browser::BrowserSlot::new()));
+        self.browser_config = Some(std::sync::Arc::new(config));
+        self.browser_artifact_dir = Some(std::sync::Arc::new(artifact_dir));
+        self
+    }
+
+    /// F9: whether a browser is configured.
+    pub fn has_browser(&self) -> bool {
+        self.browser.is_some()
+    }
+
+    /// F9: whether a browser session is currently open.
+    pub fn browser_is_open(&self) -> bool {
+        self.browser
+            .as_ref()
+            .map(|slot| slot.is_open())
+            .unwrap_or(false)
+    }
+
+    /// F9: close the browser session, releasing the process and its profile.
+    ///
+    /// Called at the end of a run so a headless browser is not left holding a
+    /// profile directory and a port into the next run.
+    pub fn close_browser(&self) {
+        if let Some(slot) = &self.browser {
+            slot.close();
+        }
     }
 
     /// B3: the memory store handle, if attached.
@@ -219,7 +306,343 @@ impl Toolkit {
                 timeout_ms: None,
             });
         }
+        // F9: the browser tools exist only when a browser is configured, and
+        // the manifest is the declared capability surface. Omitting them here
+        // while `specs()` advertises them makes the declaration deny five
+        // tools the model can actually call.
+        if self.browser.is_some() {
+            capabilities.extend([
+                Capability {
+                    name: "browser_open".into(),
+                    version: "1".into(),
+                    risk: Risk::NeedsHuman,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ExternalRead,
+                        Reversibility::NoEffect,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: vec!["allowlisted".into()],
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_read".into(),
+                    version: "1".into(),
+                    risk: Risk::ReadOnly,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ProcessRead,
+                        Reversibility::NoEffect,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: empty(),
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_screenshot".into(),
+                    version: "1".into(),
+                    risk: Risk::Reversible,
+                    effect: EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::Reversible,
+                    ),
+                    reads: empty(),
+                    writes: vec!["artifact".into()],
+                    hosts: empty(),
+                    processes: empty(),
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_click".into(),
+                    version: "1".into(),
+                    risk: Risk::NeedsHuman,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ExternalMutation,
+                        Reversibility::Irreversible,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: empty(),
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_type".into(),
+                    version: "1".into(),
+                    risk: Risk::NeedsHuman,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ExternalMutation,
+                        Reversibility::Irreversible,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: empty(),
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+            ]);
+        }
         CapabilityManifest::new(capabilities)
+    }
+
+    /// F9: the risk and effect of a browser action.
+    ///
+    /// `browser_open` is the interesting case: it is an **outbound network
+    /// action**, so it declares its host exactly as `http_fetch` does. Without
+    /// that, the network boundary would never see where the browser went, and a
+    /// page could be loaded from a host the operator never allowed.
+    ///
+    /// `browser_click` and `browser_type` are **not** read-only: the page
+    /// decides what a click does, so classifying them as observations would let
+    /// a state-changing action skip the human gate.
+    ///
+    /// # Why these are `NeedsHuman` + `Irreversible`
+    ///
+    /// This pairing is load-bearing, and getting it wrong made both tools
+    /// unrunnable. `pangu-agent` validates every assessment through
+    /// `EffectDescriptor::validate_for_risk` before Policy or Approval see it,
+    /// and that rule is: an `ExternalMutation` must be `Irreversible` and must
+    /// carry at least `Destructive` risk.
+    ///
+    /// These tools were originally declared `Reversible` on both axes. Both
+    /// halves of that were rejected, so `browser_click` and `browser_type`
+    /// failed on **every** call with `external_mutation must be paired with
+    /// irreversible`. The tools were still advertised to the model, so it looked
+    /// like a tool that errors rather than a capability that cannot run.
+    ///
+    /// The classification is also the honest one. A click is not reversible by
+    /// this program: it cannot undo a submitted form, a placed order, or a
+    /// deleted record, because the resulting state lives on a server the
+    /// boundary does not control and may never observe. "Reversible" would claim
+    /// an ability to restore that no code here has, and would additionally
+    /// suggest the action needs less scrutiny than `browser_open`, which only
+    /// fetches. `NeedsHuman` is what makes the human gate unconditional, exactly
+    /// as it is for `run_command`.
+    fn assess_browser(&self, call: &ToolCall, sandbox: &Sandbox) -> Result<ToolAssessment> {
+        // The effect kind decides the branch; whether a host is declared is
+        // expressed by declaring one below, not by a flag checked separately.
+        let (kind, _) = browser::describe(&call.name)
+            .ok_or_else(|| anyhow!("`{}` is not a browser tool", call.name))?;
+        if self.browser.is_none() {
+            // The spec is not advertised in this case, so reaching here means a
+            // caller invented the tool name.
+            bail!(
+                "`{}` is not available: no browser is configured ([browser] enabled)",
+                call.name
+            );
+        }
+
+        match kind {
+            "read" => {
+                ensure_allowed_keys(&call.args, &[])?;
+                // A screenshot is not an observation in the effect ledger: it
+                // writes a PNG into the run's artifact directory. Calling that
+                // `NoEffect` would let a write skip the reversible-write gate
+                // while the manifest, which records the write, says otherwise.
+                if call.name == "browser_screenshot" {
+                    let artifact_dir = self
+                        .browser_artifact_dir
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("browser_screenshot has no artifact directory"))?;
+                    // The PNG name is chosen at execution time. Declaring the
+                    // directory makes the write checker look for its parent,
+                    // which does not exist on the first screenshot. A placeholder
+                    // file inside the configured directory checks that directory
+                    // against the writable roots instead.
+                    Ok(ToolAssessment::new(Risk::Reversible)
+                        .with_effect(EffectDescriptor::new(
+                            EffectScope::Workspace,
+                            Reversibility::Reversible,
+                        ))
+                        .write(artifact_dir.as_ref().join("screenshot.png")))
+                } else {
+                    let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                        EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                    );
+                    // Reading the page uses the browser session the operator
+                    // enabled. ProcessRead requires a named resource; without
+                    // one, validate_effect rejects every browser_read.
+                    assessment.browser_session = true;
+                    Ok(assessment)
+                }
+            }
+            "external_mutation" => {
+                let mut assessment =
+                    ToolAssessment::new(Risk::NeedsHuman).with_effect(EffectDescriptor::new(
+                        EffectScope::ExternalMutation,
+                        Reversibility::Irreversible,
+                    ));
+                assessment.browser_session = true;
+                match call.name.as_str() {
+                    "browser_click" => {
+                        ensure_allowed_keys(&call.args, &["selector"])?;
+                        let selector = browser::required_selector(&call.args)?;
+                        assessment.preview = format!("click {selector}");
+                    }
+                    _ => {
+                        ensure_allowed_keys(&call.args, &["text"])?;
+                        let text = required_string(&call.args, "text")?;
+                        // The text is previewed in a bounded, redacted form: it
+                        // can contain anything, including a secret the operator
+                        // would not expect to see echoed into a journal.
+                        assessment.preview = format!("type {:?}", truncate_preview(&text, 200));
+                    }
+                }
+                Ok(assessment)
+            }
+            "external_read" => {
+                ensure_allowed_keys(&call.args, &["url"])?;
+                let url = required_string(&call.args, "url")?;
+                sandbox
+                    .check_url(&url)
+                    .map_err(|error| anyhow!("browser URL rejected: {error}"))?;
+                let host = browser::navigation_host(&url)?;
+                // Validate the host through the same boundary `http_fetch`
+                // uses: navigation is an outbound request.
+                sandbox.check_host(&host)?;
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::ExternalRead,
+                        Reversibility::NoEffect,
+                    ))
+                    .host(host);
+                assessment.preview = format!("GET {} (browser)", url_preview(&url));
+                Ok(assessment)
+            }
+            other => bail!("unhandled browser effect kind `{other}`"),
+        }
+    }
+
+    /// F9: run a browser action against the session.
+    ///
+    /// The session is opened lazily on first use and kept for the rest of the
+    /// run: a session per call would lose the page between a click and the read
+    /// that follows it, and that sequence is what computer use consists of.
+    fn execute_browser(&self, action: &VerifiedAction) -> Result<ToolOutput> {
+        let slot = self
+            .browser
+            .as_ref()
+            .ok_or_else(|| anyhow!("no browser is configured"))?;
+        let config = self
+            .browser_config
+            .as_ref()
+            .ok_or_else(|| anyhow!("no browser is configured"))?;
+        let artifact_dir = self
+            .browser_artifact_dir
+            .as_ref()
+            .ok_or_else(|| anyhow!("no browser artifact directory is configured"))?;
+
+        let name = action.call().name.as_str();
+        let args = action.call().args.clone();
+
+        let outcome = slot.with(config, self.runtime.as_deref(), |handle| match name {
+            "browser_open" => {
+                let url = required_string(&args, "url")?;
+                browser::require_navigation_url(
+                    &url,
+                    |url| {
+                        action
+                            .sandbox()
+                            .check_url(url)
+                            .map(|_| ())
+                            .map_err(|error| anyhow!(error))
+                    },
+                    &action.resources().hosts,
+                )?;
+                let session = handle.session()?;
+                session.navigate(&url)?;
+                // Returning the page immediately saves a round trip: an
+                // `open` that yielded only "ok" would oblige the model to
+                // read next, doubling the calls for the common case.
+                let snapshot = session.snapshot()?;
+                // The requested host was checked before navigation. A redirect
+                // can land somewhere else, so the page actually reached must
+                // pass the same egress check before its content is returned.
+                require_current_page(action, &snapshot.url)?;
+                Ok(browser::output(
+                    browser::render_snapshot(
+                        &snapshot.url,
+                        &snapshot.title,
+                        &snapshot.text,
+                        snapshot.truncated,
+                    ),
+                    Some(format!("navigated to {}", snapshot.url)),
+                ))
+            }
+            "browser_read" => {
+                let session = handle.session()?;
+                let snapshot = session.snapshot()?;
+                require_current_page(action, &snapshot.url)?;
+                Ok(browser::output(
+                    browser::render_snapshot(
+                        &snapshot.url,
+                        &snapshot.title,
+                        &snapshot.text,
+                        snapshot.truncated,
+                    ),
+                    None,
+                ))
+            }
+            "browser_screenshot" => {
+                let session = handle.session()?;
+                require_current_page(action, &session.snapshot()?.url)?;
+                let path = browser::validated_screenshot_path(
+                    artifact_dir.as_ref(),
+                    &action.resources().write_paths,
+                )?;
+                let png = session.screenshot()?;
+                let bytes = png.len();
+                let name = handle.save_screenshot_at(&path, &png)?;
+                Ok(browser::output(
+                    format!("screenshot saved as {name} ({bytes} bytes, PNG)"),
+                    // The evidence is the file that now exists, not a claim
+                    // that a capture happened.
+                    Some(format!("screenshot:{name}:{bytes}")),
+                ))
+            }
+            "browser_click" => {
+                let selector = browser::required_selector(&args)?;
+                let session = handle.session()?;
+                session.click(&selector)?;
+                Ok(browser::output(
+                    format!("clicked {selector}"),
+                    Some(format!("clicked:{selector}")),
+                ))
+            }
+            "browser_type" => {
+                let text = required_string(&args, "text")?;
+                let session = handle.session()?;
+                session.type_text(&text)?;
+                Ok(browser::output(
+                    format!("typed {} characters", text.chars().count()),
+                    Some(format!("typed:{}", text.chars().count())),
+                ))
+            }
+            other => bail!("`{other}` has no browser handler"),
+        });
+        if let Err(error) = &outcome {
+            if browser::page_must_not_remain_open(error) {
+                // A refused page must not stay available to the next browser
+                // action. This covers redirects from open/read/screenshot as
+                // well as navigation caused by click or typing.
+                slot.close();
+            }
+        } else if matches!(name, "browser_click" | "browser_type") {
+            match slot.with_open(|handle| {
+                let url = handle.session()?.snapshot()?.url;
+                require_current_page(action, &url)
+            }) {
+                Ok(()) => {}
+                Err(error) if browser::page_must_not_remain_open(&error) => {
+                    slot.close();
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        outcome
     }
 }
 
@@ -358,6 +781,19 @@ impl ToolExecutor for Toolkit {
                     }
                 }),
             ));
+        }
+        // F9: advertise the browser tools only when the operator configured a
+        // browser. Until then they do not exist, so the model cannot call a
+        // capability that was never enabled.
+        if self.browser.is_some() {
+            for name in browser::BROWSER_TOOLS {
+                let (description, schema) = browser::description(name)
+                    .zip(browser::schema(name))
+                    .unwrap_or_else(|| {
+                        unreachable!("every browser tool has a description and a schema")
+                    });
+                specs.push(ToolSpec::new(name, description, schema));
+            }
         }
         specs
     }
@@ -594,6 +1030,7 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            name if browser::is_browser_tool(name) => self.assess_browser(call, sandbox),
             other => bail!("unknown tool `{other}`"),
         }
     }
@@ -605,9 +1042,16 @@ impl ToolExecutor for Toolkit {
             "search" => execute_search(action).await,
             "write_file" => execute_write(action).await,
             "http_fetch" => execute_http(action).await,
-            "git_diff" => execute_command(action).await,
-            "run_command" => execute_command(action).await,
-            "verify" => execute_verify(action).await,
+            "git_diff" => execute_command(action, self.runtime.as_deref()).await,
+            "run_command" => execute_command(action, self.runtime.as_deref()).await,
+            "verify" => execute_verify(action, self.runtime.as_deref()).await,
+            name if browser::is_browser_tool(name) => {
+                browser::require_validated_browser_action(
+                    name,
+                    action.resources().browser_session,
+                )?;
+                self.execute_browser(action)
+            }
             "propose_memory" => {
                 let store = self
                     .memory
@@ -640,6 +1084,24 @@ fn url_preview(raw: &str) -> String {
     url.to_string()
 }
 
+/// Bound a string for display, marking clearly when it was cut.
+///
+/// A preview is a claim about what an action will do, so a silently shortened
+/// one would misrepresent the action. The marker makes the omission visible.
+///
+/// Slicing respects character boundaries: cutting mid-codepoint would panic on
+/// the next `chars()` call, and the input here is model- and page-controlled.
+fn truncate_preview(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(max_chars).collect();
+    format!(
+        "{kept}…({} more characters)",
+        value.chars().count() - max_chars
+    )
+}
+
 fn ensure_allowed_keys(args: &Value, allowed: &[&str]) -> Result<()> {
     let object = args
         .as_object()
@@ -667,15 +1129,34 @@ fn required_path(args: &Value, key: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
+/// Paths a read-only command is expected to read.
+///
+/// # Why `git` needs its own rule
+///
+/// For most commands the first non-flag argument is a path (`cat notes.txt`).
+/// For `git` it is a **subcommand**: in `git diff`, `diff` is not a file, and
+/// treating it as one made the sandbox try to resolve
+/// `<workspace>/diff`, fail with `os error 2` (the path does not exist), and
+/// deny the action. No `git` command could run through `run_command`.
+///
+/// Paths after a subcommand are still collected (`git diff -- src/main.rs`), and
+/// a bare `git diff` reads no named path — it reads the repository, which the
+/// sandbox cannot enumerate, so the read set is empty and correct: the action is
+/// still gated by `validate_argv`, which limits `git` to its read-only
+/// subcommands.
 fn command_read_paths(command: &str, args: &[String]) -> Result<Vec<PathBuf>> {
     let command = command.to_ascii_lowercase();
     if matches!(command.as_str(), "pwd" | "") {
         return Ok(Vec::new());
     }
+    // For `git`, skip the subcommand before collecting paths. Every other
+    // command's first bare argument is a path.
+    let subcommand_seen = command != "git";
     let mut paths = Vec::new();
     let mut pattern_seen = command != "grep";
     let mut skip_next = false;
     let mut after_separator = false;
+    let mut skipped_subcommand = subcommand_seen;
     for argument in args {
         if after_separator {
             paths.push(PathBuf::from(argument));
@@ -701,6 +1182,10 @@ fn command_read_paths(command: &str, args: &[String]) -> Result<Vec<PathBuf>> {
             if matches!(argument.as_str(), "-e" | "--regexp") {
                 skip_next = true;
             }
+            continue;
+        }
+        if !skipped_subcommand {
+            skipped_subcommand = true;
             continue;
         }
         if skip_next {
@@ -1040,14 +1525,30 @@ fn resolve_executable(program: &str, sandbox: &Sandbox) -> Result<PathBuf> {
     bail!("executable `{program}` was not found outside the workspace")
 }
 
-async fn execute_command(action: &VerifiedAction) -> Result<ToolOutput> {
-    execute_command_tagged(action, "command").await
+fn require_current_page(action: &VerifiedAction, url: &str) -> Result<()> {
+    browser::require_allowed_page_url(url, |host| {
+        action
+            .sandbox()
+            .check_host(host)
+            .map(|_| ())
+            .map_err(|error| anyhow!(error))
+    })
+}
+
+async fn execute_command(
+    action: &VerifiedAction,
+    runtime: Option<&pangu_boundary::runtime::Runtime>,
+) -> Result<ToolOutput> {
+    execute_command_tagged(action, "command", runtime).await
 }
 
 /// F3: verify shares the run_command subprocess discipline (no shell, cleaned
 /// env, closed stdin, timeout, bounded output); only the evidence tag differs.
-async fn execute_verify(action: &VerifiedAction) -> Result<ToolOutput> {
-    execute_command_tagged(action, "verify").await
+async fn execute_verify(
+    action: &VerifiedAction,
+    runtime: Option<&pangu_boundary::runtime::Runtime>,
+) -> Result<ToolOutput> {
+    execute_command_tagged(action, "verify", runtime).await
 }
 
 /// B3: append a pending memory candidate. The output carries the id and the
@@ -1094,16 +1595,98 @@ fn execute_propose_memory(action: &VerifiedAction, store: &MemoryStore) -> Resul
     })
 }
 
-async fn execute_command_tagged(action: &VerifiedAction, tag: &str) -> Result<ToolOutput> {
+/// F8: the enforcement decision, as a pure function.
+///
+/// Split out of the executor so it can be tested directly. The property that
+/// matters — *a declared sandbox that does not work refuses the command* — is
+/// the one this feature exists for, and a test that only read
+/// `Runtime::refusal()` would still pass if the executor stopped calling it.
+///
+/// `Ok(())` means "proceed". There is deliberately no branch returning `Ok` for
+/// an unusable runtime, so no edit here can reintroduce a silent host fallback
+/// without breaking a test.
+pub fn sandbox_admits(runtime: Option<&pangu_boundary::runtime::Runtime>) -> Result<()> {
+    match runtime {
+        // No runtime declared: the `local` profile, unchanged behaviour.
+        None => Ok(()),
+        Some(runtime) => {
+            if runtime.allows_execution() {
+                Ok(())
+            } else {
+                // Its own message, so operator and audit trail can tell "the
+                // sandbox refused" from "the command failed".
+                Err(anyhow!("{}", runtime.refusal()))
+            }
+        }
+    }
+}
+
+/// Describe what a spawn was about to run, for the failure message.
+fn launcher_program_for_error(launcher: Option<(&str, &[String])>, argv0: &str) -> String {
+    match launcher {
+        Some((program, args)) => format!("{program} {args:?}"),
+        None => format!("resolved `<{argv0}>` on PATH"),
+    }
+}
+
+async fn execute_command_tagged(
+    action: &VerifiedAction,
+    tag: &str,
+    runtime: Option<&pangu_boundary::runtime::Runtime>,
+) -> Result<ToolOutput> {
     let argv = &action.resources().argv;
     if argv.is_empty() {
         bail!("empty command");
     }
-    let executable = resolve_executable(&argv[0], action.sandbox())?;
-    let mut command = tokio::process::Command::new(executable);
+    // F8: enforce the declared sandbox before anything is spawned.
+    //
+    // This is where "declared" becomes "enforced". An unusable runtime refuses
+    // here; it does not fall through to the host, because the run's audit trail
+    // records the declaration and executing outside it would make that record
+    // false — the operator would believe they had isolation they did not have.
+    sandbox_admits(runtime)?;
+    // Inside a usable runtime the command is launched **through** the sandbox,
+    // not on the host. The argv comes from the same `RuntimeConfig::command_for`
+    // the probe used, so a runtime that passed the probe is invoked identically
+    // here.
+    let launcher = runtime.and_then(|runtime| runtime.launcher());
+    let mount = runtime.and_then(|runtime| runtime.workspace_mount());
+    // The workspace as the *host* sees it. Needed because the launcher process —
+    // `docker`, `runsc` — is itself spawned on the host, so `current_dir` must be
+    // a path that exists here. The in-container path (`/workspace`) is not one:
+    // passing it made every sandboxed command fail with an invalid-directory
+    // error before the runtime ever ran.
+    let host_workspace = runtime.map(|runtime| runtime.workspace());
+    let mut command = match launcher {
+        Some((program, leading)) => {
+            let mut command = tokio::process::Command::new(program);
+            // `leading` carries the bind mount, so the workspace the command sees
+            // is the one the operator declared, mounted at the in-container path.
+            command.args(leading);
+            // The command runs inside the sandbox, where `cwd` must be the in-container
+            // mount point rather than the host path.
+            command.args(argv).current_dir(mount.unwrap_or("."));
+            command
+        }
+        None => {
+            let executable = resolve_executable(&argv[0], action.sandbox())?;
+            let mut command = tokio::process::Command::new(executable);
+            command
+                .args(&argv[1..])
+                .current_dir(&action.resources().cwd);
+            command
+        }
+    };
+    // The launcher process runs on the host, so its own cwd must be a host path;
+    // the in-container path above is what the *command* is told to use. Without
+    // this the spawn fails with an invalid-directory error on a host where
+    // `/workspace` does not exist, and the sandbox never starts.
+    if let Some(host) = host_workspace {
+        if host.is_dir() {
+            command.current_dir(host);
+        }
+    }
     command
-        .args(&argv[1..])
-        .current_dir(&action.resources().cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1115,9 +1698,22 @@ async fn execute_command_tagged(action: &VerifiedAction, tag: &str) -> Result<To
     let timeout = Duration::from_secs(action.sandbox().subprocess_timeout_secs);
     let deadline = tokio::time::Instant::now() + timeout;
     let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn {}", argv[0]))?;
+    let mut child = command.spawn().map_err(|error| {
+        // Report the whole decision, not just the failing call: which program,
+        // from where, in which directory, and with which environment. `anyhow`
+        // context would be dropped by `Display` at the event boundary, so the
+        // facts go into the message itself.
+        anyhow!(
+            "spawn failed: {error} | launching: {} | host cwd={} (exists={})",
+            launcher_program_for_error(launcher, &argv[0]),
+            host_workspace
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| action.resources().cwd.display().to_string()),
+            host_workspace
+                .map(Path::is_dir)
+                .unwrap_or_else(|| action.resources().cwd.is_dir()),
+        )
+    })?;
     let stdout = child
         .stdout
         .take()
@@ -1216,6 +1812,42 @@ mod tests {
             configured.verify_command(),
             vec!["cargo".to_string(), "test".to_string()]
         );
+    }
+
+    #[test]
+    fn manifest_matches_specs_one_to_one_with_a_browser() {
+        let toolkit = Toolkit::new().with_browser(
+            pangu_boundary::browser::BrowserConfig {
+                executable: PathBuf::from("browser"),
+                profile_dir: PathBuf::from("profile"),
+                network: false,
+                extra_args: Vec::new(),
+            },
+            PathBuf::from("artifacts"),
+        );
+        let specs = toolkit.specs();
+        let manifest = toolkit.manifest();
+        manifest
+            .validate()
+            .expect("a browser-enabled manifest validates");
+        let mut spec_names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        let mut manifest_names: Vec<&str> = manifest.names();
+        spec_names.sort();
+        manifest_names.sort();
+        assert_eq!(
+            spec_names, manifest_names,
+            "enabling a browser must not make specs() and manifest() diverge"
+        );
+        for name in ["browser_click", "browser_type"] {
+            let capability = manifest
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} must be declared"));
+            assert_eq!(capability.risk, Risk::NeedsHuman);
+            capability
+                .effect
+                .validate_for_risk(capability.risk)
+                .unwrap_or_else(|error| panic!("{name} has an effect L1 rejects: {error}"));
+        }
     }
 
     #[test]

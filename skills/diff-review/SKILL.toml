@@ -1,0 +1,6 @@
+schema = "pangu-skill-manifest/1"
+name = "diff-review"
+version = "1.0.0"
+description = "Review a change set against what it claims to do, separating verified facts from assumptions. Ends in findings with evidence, or an explicit statement of what could not be checked."
+files = ["SKILL.md"]
+scripts = []

@@ -222,3 +222,56 @@ command = []
 # description 可选，用于审计（脱敏、限长 512 字节）。
 profile = "local"
 # description = "docker:ubuntu-24.04 image sha256:..."
+
+# F8: OS 级沙箱。与上面的 profile 不同，这个字段是**强制**的，不是审计声明。
+#
+#   runtime = "local"       在宿主机上直接执行（默认，行为与以前一致）
+#   runtime = "auto"        按强度择优：firecracker > gvisor > oci
+#   runtime = "firecracker" 微 VM（独立内核，最强边界）
+#   runtime = "gvisor"      runsc 用户态内核
+#   runtime = "oci"         Docker/Podman 容器（命名空间 + cgroup）
+#
+# 声明非 local 后，Pangu 会**探测**该运行时（真正在里面跑一条命令），
+# 探测通过才执行；探测失败则**拒绝执行命令**，绝不静默退回宿主机。
+#
+# 为什么不做退回：审计日志里记着操作者声明的运行时，实际却在宿主机上跑，
+# 会让这条记录变成假的 —— 操作者会以为自己拥有并不存在的隔离。
+# local 仍然可用且诚实，但必须是**主动选择**的，不能是失败后的兜底。
+#
+# 换 runtime 必须同时把 profile 改成 container/remote，否则配置校验会报错：
+# 审计声明与实际强制不一致是矛盾，不该被静默接受。
+# runtime = "oci"
+# image = "alpine:3.20"     沙箱里执行命令所用的镜像/rootfs
+# network = false           沙箱是否需要网络（默认 false；给了网络就少了一层边界）
+# memory_mib = 512          内存上限（运行时支持时生效）
+# cpus = 1                  CPU 数（运行时支持时生效）
+
+[browser]
+# F9: 内置浏览器（CDP 原生驱动无头 Chromium）。
+#
+# 默认关闭：关闭时浏览器工具**根本不会被广告**，模型无法调用一个操作者没有
+# 开启的能力。开启后工具进入同一套 L1-L4 链，与其它工具逐位相同：
+#
+#   browser_open       NeedsHuman, ExternalRead   —— 会访问**主机**，声明其 host
+#   browser_read       ReadOnly,  NoEffect
+#   browser_screenshot ReadOnly,  NoEffect
+#   browser_click      Reversible, ExternalMutation
+#   browser_type       Reversible, ExternalMutation
+#
+# 注意 click/type **不是**只读：点下去会发生什么由页面决定，把它当成观察会
+# 让一个改变状态的动作绕过人工闸门 —— 与"信任对方的 readOnlyHint"同类错误。
+enabled = false
+
+# 浏览器可执行文件的**绝对路径**。不填则搜索常见安装位置
+# （Chrome 优先，其次 Edge）。相对路径会被拒绝：沙箱自己解析程序，"让加载器
+# 去找"不是一个应该被委托的决定。
+# 填了但指向不存在的文件会在**启动时**报错，而不是等到模型第一次点击。
+# executable = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+# 页面是否可以访问网络。默认 false，限制页面自作主张的请求。
+# 这不是沙箱 —— 真隔离是上面 [execution] runtime 的职责。
+network = false
+
+# 追加到内置参数之后的额外命令行参数（逐字传入）。
+# args = ["--lang=en-US"]
+

@@ -1,0 +1,6 @@
+schema = "pangu-skill-manifest/1"
+name = "commit-craft"
+version = "1.0.0"
+description = "Write a commit that a stranger can use six months from now: what changed, why, and what was verified. Separates the mechanically checkable from the claimed."
+files = ["SKILL.md"]
+scripts = []

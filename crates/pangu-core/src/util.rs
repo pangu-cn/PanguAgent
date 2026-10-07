@@ -99,6 +99,34 @@ pub fn approx_tokens_of_chars(chars: u64) -> u64 {
     chars.div_ceil(4)
 }
 
+/// A path rendered for a human or for a record, not for the Win32 API.
+///
+/// Paths that have been through `std::fs::canonicalize` come back in Windows'
+/// *verbatim* form (`\\?\F:\ws`, or `\\?\UNC\server\share`), because that is what
+/// addresses long paths without further normalization. It is the right form to
+/// hand to the filesystem and the wrong form to show anyone: it does not work
+/// pasted into a shell, and it means nothing on another machine.
+///
+/// This matters where output is archived as evidence. §9.3 of the recovery
+/// manual has the operator save `artifact inspect --json` as the off-machine
+/// record of what a store looked like; a `root` field in verbatim form is not
+/// something a reader elsewhere can resolve or check.
+///
+/// Only the marker is removed — the UNC form keeps its double backslash, because
+/// that *is* the share path other Windows programs expect.
+pub fn displayable_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
 pub fn human_bytes(n: usize) -> String {
     if n < 1024 {
         format!("{n} B")

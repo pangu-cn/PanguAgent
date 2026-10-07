@@ -6,6 +6,8 @@
 
 pub mod artifact;
 pub mod assemble;
+pub mod audit;
+pub mod canvas;
 pub mod checkpoint;
 pub mod conversation;
 pub mod deliverable;
@@ -19,7 +21,9 @@ pub mod inspect;
 pub mod journal;
 pub mod json;
 pub mod lockfile;
+pub mod mcp;
 pub mod memory;
+pub mod memory_layers;
 pub mod messages;
 pub mod modules;
 pub mod replay;
@@ -29,7 +33,23 @@ pub mod skills;
 pub mod slice;
 pub mod stream;
 pub mod summary;
+pub mod trace;
 pub mod util;
+
+/// Test fixtures that must satisfy this project's path policy.
+///
+/// Compiled when the `test-support` feature is on, **and** for this crate's own
+/// unit tests. The second half matters: `cargo test -p pangu-core` does not turn
+/// the feature on, and a `#[cfg(test)]` module inside this crate has to reach
+/// this module to build its fixtures. Gating on the feature alone made that
+/// command fail to compile — which is the exact command
+/// `docs/CHECKPOINT_RECOVERY.md` §9.1 hands to an operator, so the manual was
+/// telling people to run something that did not build.
+///
+/// Integration tests in *other* crates still need the feature, because they are
+/// separate crates and can only see a public item.
+#[cfg(any(feature = "test-support", test))]
+pub mod testing;
 
 pub use artifact::{
     ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,

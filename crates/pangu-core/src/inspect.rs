@@ -24,7 +24,7 @@ use crate::artifact::{
 use crate::checkpoint::{ArtifactState, CheckpointArtifact, FailedPathStatus, SessionNode};
 use crate::error::{Error, Result};
 use crate::events::redact_text;
-use crate::util::{now_rfc3339, one_line, truncate_middle};
+use crate::util::{displayable_path, now_rfc3339, one_line, truncate_middle};
 
 /// Schema tag written into every inspection report.
 pub const ARTIFACT_INSPECTION_SCHEMA: &str = "pangu-artifact-inspection/1";
@@ -286,7 +286,12 @@ pub fn inspect_artifact_root(root: &Path) -> Result<ArtifactInspection> {
     Ok(ArtifactInspection {
         schema: ARTIFACT_INSPECTION_SCHEMA.to_string(),
         generated_at: now_rfc3339(),
-        root: bounded_text(&store_root.display().to_string(), MAX_ROOT_BYTES),
+        // Report the path as an operator would write it, not in the verbatim
+        // form Windows canonicalization produces. §9.3 has the operator archive
+        // this JSON as the off-machine evidence record, and `\\?\F:\...` is not
+        // a path anyone can act on outside the Win32 API — it does not survive
+        // being pasted into a shell, a ticket, or a different machine's tooling.
+        root: bounded_text(&displayable_path(&store_root), MAX_ROOT_BYTES),
         verdict,
         read_only: true,
         transaction_lock,
@@ -485,7 +490,7 @@ fn inspect_checkpoint(
     let inspection = CheckpointInspection {
         checkpoint_id: artifact.checkpoint_id.clone(),
         workspace: bounded_text(
-            &artifact.workspace.display().to_string(),
+            &displayable_path(&artifact.workspace),
             MAX_PATH_EVIDENCE_BYTES,
         ),
         state: artifact.state,
@@ -517,7 +522,7 @@ fn unusable_checkpoint(
 ) -> CheckpointInspection {
     let mut inspection = CheckpointInspection {
         checkpoint_id: checkpoint_id.to_string(),
-        workspace: directory.display().to_string(),
+        workspace: displayable_path(directory),
         state: ArtifactState::Incomplete,
         committed_marker: false,
         verified: false,
@@ -834,7 +839,9 @@ fn scan_for_replace_backups(
                 let relative = path.strip_prefix(base).unwrap_or(&path);
                 found.push(ReplaceBackupEvidence {
                     scope: scope.to_string(),
-                    path: bounded_text(&relative.display().to_string(), MAX_PATH_EVIDENCE_BYTES),
+                    // Evidence that §9.3 archives as JSON, so it uses the form a
+                    // reader elsewhere can act on.
+                    path: bounded_text(&displayable_path(relative), MAX_PATH_EVIDENCE_BYTES),
                 });
             } else {
                 *truncated = true;

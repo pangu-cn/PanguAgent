@@ -282,14 +282,7 @@ async fn symlink_escape_is_blocked_before_tool_execution() {
 #[tokio::test]
 async fn git_diff_reports_the_workspace_diff_through_the_verified_action_chain() {
     let root = temp_root("git-diff");
-    let git_available = std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    if !git_available {
-        return;
-    }
+    require_git();
     std::process::Command::new("git")
         .args(["init", "-q"])
         .current_dir(&root)
@@ -429,6 +422,25 @@ fn build_verify_agent(
     (agent, sink)
 }
 
+/// Assert that `git` is usable, or fail loudly.
+///
+/// These tests used `require_git();`, which reports `ok` while
+/// running nothing. On a machine without git — which is not unusual for a
+/// minimal container image — the suite claimed coverage it did not have.
+///
+/// `git` is a prerequisite for building this repository at all, so its absence
+/// is a broken environment rather than a reason to skip: the honest response is
+/// to say so. This mirrors `browser_cdp.rs`, where a missing browser is a
+/// failure rather than a silent skip, and for the same reason — a test that
+/// quietly does nothing is worse than no test, because it reads as a pass.
+fn require_git() {
+    assert!(
+        git_ready(),
+        "these tests drive real `git` repositories; install git, or the suite \
+         cannot claim to have checked anything"
+    );
+}
+
 fn git_ready() -> bool {
     std::process::Command::new("git")
         .arg("--version")
@@ -451,9 +463,7 @@ fn git(root: &Path, args: &[&str]) {
 
 #[tokio::test]
 async fn verify_runs_the_configured_command_and_yields_evidence() {
-    if !git_ready() {
-        return;
-    }
+    require_git();
     let root = temp_root("verify-ok");
     git(&root, &["init", "-q"]);
     std::fs::write(root.join("sample.txt"), "before\n").expect("seed");
@@ -506,9 +516,7 @@ async fn verify_runs_the_configured_command_and_yields_evidence() {
 
 #[tokio::test]
 async fn failing_verify_cannot_create_evidence_or_complete() {
-    if !git_ready() {
-        return;
-    }
+    require_git();
     let root = temp_root("verify-fail");
     // A repository with no commits: `git log` fails deterministically.
     git(&root, &["init", "-q"]);
@@ -551,9 +559,7 @@ async fn failing_verify_cannot_create_evidence_or_complete() {
 
 #[tokio::test]
 async fn verify_rejects_model_supplied_arguments() {
-    if !git_ready() {
-        return;
-    }
+    require_git();
     let root = temp_root("verify-args");
     git(&root, &["init", "-q"]);
 
@@ -583,9 +589,7 @@ async fn verify_rejects_model_supplied_arguments() {
 
 #[tokio::test]
 async fn agent_new_refuses_verify_command_mismatch() {
-    if !git_ready() {
-        return;
-    }
+    require_git();
     let root = temp_root("verify-mismatch");
     git(&root, &["init", "-q"]);
     let mut config = Config::embedded().expect("embedded config");

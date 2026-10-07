@@ -54,6 +54,93 @@ pub struct Config {
     /// no digest change.
     #[serde(default)]
     pub eval: EvalSection,
+    /// F9: the built-in browser. Disabled by default: the browser tools are
+    /// not advertised, so the model cannot call a capability the operator did
+    /// not enable.
+    #[serde(default)]
+    pub browser: BrowserSection,
+}
+
+/// F9: built-in browser configuration.
+///
+/// Disabled by default. When enabled, the browser tools become part of the
+/// advertised tool set and pass through the same L1–L4 chain as every other
+/// tool: navigation declares its host, and a click is a mutation rather than an
+/// observation.
+///
+/// `Default` is derived rather than written out: the default is "off, search for
+/// a browser, no network, no extra flags", and every field's own default already
+/// says exactly that — so a hand-written `impl` could only drift from it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserSection {
+    pub enabled: bool,
+    /// Absolute path to a Chromium-based browser. `None` = search the usual
+    /// locations.
+    pub executable: Option<String>,
+    /// Whether the page may reach the network. `false` (the default) restricts
+    /// what a loaded page can do on its own initiative; it is **not** a sandbox
+    /// — that is `[execution] runtime`'s job.
+    pub network: bool,
+    /// Extra command-line flags, appended verbatim after the built-in ones.
+    pub args: Vec<String>,
+}
+
+impl BrowserSection {
+    /// Validate the section, refusing a configuration that cannot work.
+    ///
+    /// Checked at config time rather than at first use, because an operator who
+    /// enabled the browser and pointed it at a missing executable should hear
+    /// about it at startup — not when a model first tries to click.
+    pub fn validate(&self) -> pangu_core::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if let Some(executable) = &self.executable {
+            let trimmed = executable.trim();
+            if trimmed.is_empty() {
+                return Err(pangu_core::Error::Config(
+                    "[browser] executable is set but empty; remove it to search the default \
+                     locations, or give an absolute path"
+                        .into(),
+                ));
+            }
+            if trimmed.chars().any(char::is_control) {
+                return Err(pangu_core::Error::Config(
+                    "[browser] executable contains a control character".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(pangu_core::Error::Config(
+                    "[browser] executable is longer than 4096 bytes".into(),
+                ));
+            }
+            let path = std::path::Path::new(trimmed);
+            if !path.is_absolute() {
+                return Err(pangu_core::Error::Config(format!(
+                    "[browser] executable must be an absolute path; got `{trimmed}`"
+                )));
+            }
+            if !path.is_file() {
+                return Err(pangu_core::Error::Config(format!(
+                    "[browser] executable points at {trimmed}, which is not a file"
+                )));
+            }
+        }
+        for argument in &self.args {
+            if argument.trim().is_empty() {
+                return Err(pangu_core::Error::Config(
+                    "[browser] args contains an empty entry".into(),
+                ));
+            }
+            if argument.chars().any(char::is_control) {
+                return Err(pangu_core::Error::Config(format!(
+                    "[browser] args contains a control character in `{argument}`"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// B3: controlled memory candidate queue configuration. Disabled by default:
@@ -746,6 +833,9 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.budget.validate()?;
+        // F9: a browser that cannot start must be reported at config time, not
+        // when a model first clicks.
+        self.browser.validate()?;
         if self.unattended && self.boundary.approval.mode != ApprovalMode::Never {
             return Err(Error::Config(
                 "unattended runs must use approval.mode = never".into(),
@@ -1400,18 +1490,34 @@ impl Config {
         // backend is part of the effective boundary claims.
         if self.execution.is_declared() {
             if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "execution".into(),
-                    serde_json::json!({
-                        "profile": self.execution.profile.as_str(),
-                        "description": &self.execution.description,
-                    }),
-                );
+                object.insert("execution".into(), execution_digest_value(&self.execution));
             }
         }
         pangu_core::hex_sha256(&serde_json::to_string(&value).unwrap_or_default())
     }
+}
 
+/// The execution fields that can change what a run is allowed to do.
+///
+/// `profile` is the operator's declaration. `runtime`, `image`, `network`,
+/// `memory_mib`, and `cpus` are what enforcement actually uses. Leaving the
+/// latter out made Docker, gVisor, and no runtime at all produce one digest as
+/// long as the profile text stayed `container`.
+pub(crate) fn execution_digest_value(
+    execution: &crate::execution::ExecutionSection,
+) -> serde_json::Value {
+    serde_json::json!({
+        "profile": execution.profile.as_str(),
+        "description": &execution.description,
+        "runtime": execution.runtime.as_str(),
+        "image": &execution.image,
+        "network": execution.network,
+        "memory_mib": execution.memory_mib,
+        "cpus": execution.cpus,
+    })
+}
+
+impl Config {
     pub fn explain(&self) -> String {
         let plan_line = if self.goal.plan_first {
             "plan_first      : true — run starts read-only; the model's `begin_act` control call starts the act phase\n"
@@ -1426,13 +1532,42 @@ impl Config {
                 .as_deref()
                 .map(|description| format!(" ({description})"))
                 .unwrap_or_default();
+            // F8: state whether the declared runtime is *enforced*, and say so
+            // plainly. `profile` alone is a declaration; an operator reading
+            // "container" must not conclude that a container exists. Reporting
+            // the runtime, or its absence, is what keeps that distinction
+            // visible at exactly the moment someone checks.
+            let enforcement = if self.execution.isolates() {
+                format!(
+                    "                  runtime `{}`: ENFORCED — commands are rejected rather than \
+                     run on the host if the probe fails\n",
+                    self.execution.runtime.as_str()
+                )
+            } else {
+                "                  runtime: local (declaration only — no OS-level isolation is \
+                 provided here; set execution.runtime to enforce one)\n"
+                    .to_string()
+            };
             format!(
-                "execution       : {}{description}\n                  {}\n",
+                "execution       : {}{description}\n                  {}\n{enforcement}",
                 self.execution.profile.as_str(),
                 self.execution.profile.scope_statement(),
             )
         } else {
-            String::new()
+            // Nothing was declared, which means `profile = local` and no runtime:
+            // commands run on the host under L1-L4 alone. Say that, rather than
+            // printing nothing.
+            //
+            // Silence was the previous behaviour, and it is the exact failure this
+            // project refuses elsewhere: a reader cannot tell "no sandbox is
+            // configured" from "this report does not cover sandboxes". Those are
+            // opposite conclusions from the same absent line. An unconfigured
+            // isolation is a fact worth one line; leaving it out let a clean
+            // `doctor` read as though isolation had been checked and found
+            // adequate.
+            "execution       : local (nothing declared — commands run on the host under L1-L4 \
+             only; no OS-level isolation is configured)\n"
+                .to_string()
         };
         let resolved = self.resolve_provider().ok();
         let provider_line = match &resolved {
@@ -1506,10 +1641,34 @@ impl Config {
         } else {
             String::new()
         };
+        // F9: report the browser only when enabled. An operator who turned it on
+        // should see it confirmed, and one who did not should not have to read
+        // past a disabled feature to find the state of the enabled ones.
+        let browser_line = if self.browser.enabled {
+            let executable = match &self.browser.executable {
+                Some(path) => path.clone(),
+                // Reporting a bare "auto" rather than the resolved path is
+                // deliberate: `doctor` does not launch anything, and resolving
+                // here would make it probe the filesystem for a browser the run
+                // may never use.
+                None => "auto-discovered on first use".to_string(),
+            };
+            format!(
+                "browser        : enabled — headless Chromium via CDP; executable: {executable}; \
+                 network: {}\n",
+                if self.browser.network { "yes" } else { "no" }
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{memory_line}{skills_line}{eval_line}{delegation_line}\nrules:\n{}\n",
+            "boundary digest : {}\nworkspace      : {}\nwritable roots : {:?}\nforbidden globs: {}\nbudget         : {} turns / {} in / {} out tokens / ${:.2} / {}s\napproval       : {} (timeout {}s)\negress         : {} (localhost {})\nchild env      : allow-list of {}\n{plan_line}{provider_line}{execution_line}{browser_line}{memory_line}{skills_line}{eval_line}{delegation_line}\nrules:\n{}\n",
             self.boundary_digest(),
-            self.workspace_abs().display(),
+            // Displayable, not canonical: this line is what an operator reads
+            // and pastes into a ticket or a config file, and the canonicalized
+            // workspace carries Windows' `\\?\` prefix, which is not a path
+            // anyone can use from a shell or on another host.
+            pangu_core::util::displayable_path(&self.workspace_abs()),
             self.boundary.writable_roots,
             self.boundary.forbidden_globs.join(", "),
             self.budget.max_turns,
@@ -1671,6 +1830,117 @@ mod tests {
         assert_eq!(config.budget.max_turns, 12);
         assert!(config.goal.require_evidence);
         assert!(!config.rules.is_empty());
+    }
+
+    /// F8: the default report must say that no OS-level isolation is configured.
+    ///
+    /// Printing nothing is not the same as saying "none". A reader cannot tell
+    /// "no sandbox is configured" from "this report does not cover sandboxes",
+    /// and those are opposite conclusions from the same absent line.
+    #[test]
+    fn the_default_report_says_no_os_isolation_is_configured() {
+        let report = Config::embedded().unwrap().explain();
+        assert!(
+            report.contains("no OS-level isolation is configured"),
+            "the default report must state the absence of isolation: {report}"
+        );
+        assert!(
+            !report.contains("ENFORCED"),
+            "the default configuration enforces no runtime: {report}"
+        );
+    }
+
+    /// F8: `doctor` must not let a bare `profile` read as isolation.
+    ///
+    /// An operator seeing "container" with no qualification would reasonably
+    /// conclude that commands run in a container. They do not — the profile is a
+    /// declaration. The report has to say which of the two it is, at exactly the
+    /// moment someone checks.
+    #[test]
+    fn the_report_says_a_profile_alone_provides_no_isolation() {
+        let mut config = Config::embedded().unwrap();
+        config.execution.profile = crate::execution::ExecutionProfile::Container;
+        // No runtime declared: the declaration stands alone.
+        config.execution.runtime = crate::runtime::SandboxRuntime::Local;
+
+        let report = config.explain();
+        assert!(report.contains("execution       : container"), "{report}");
+        assert!(
+            report.contains("no OS-level isolation is provided here"),
+            "a declaration-only profile must say it provides no isolation: {report}"
+        );
+        assert!(
+            !report.contains("ENFORCED"),
+            "nothing is enforced without a runtime: {report}"
+        );
+    }
+
+    /// F8: with a runtime declared, the report says it is enforced.
+    #[test]
+    fn the_report_says_a_declared_runtime_is_enforced() {
+        let mut config = Config::embedded().unwrap();
+        config.execution.profile = crate::execution::ExecutionProfile::Container;
+        config.execution.runtime = crate::runtime::SandboxRuntime::Oci;
+        config.execution.image = Some("alpine:3.20".into());
+
+        let report = config.explain();
+        assert!(
+            report.contains("runtime `oci`: ENFORCED"),
+            "a declared runtime must be reported as enforced: {report}"
+        );
+        // And it must say what happens when the probe fails, because that is the
+        // behaviour an operator is relying on.
+        assert!(
+            report.contains("rejected rather than run on the host"),
+            "the report must state the fail-closed behaviour: {report}"
+        );
+    }
+
+    /// F9: the browser appears in the report only when it is enabled.
+    ///
+    /// A disabled feature should not occupy a line an operator has to read past
+    /// to find the state of the enabled ones — and, more importantly, its absence
+    /// should be the visible signal that the tools are not advertised at all.
+    #[test]
+    fn the_report_mentions_the_browser_only_when_it_is_enabled() {
+        let disabled = Config::embedded().unwrap();
+        assert!(!disabled.browser.enabled);
+        assert!(
+            !disabled.explain().contains("browser        :"),
+            "a disabled browser must not produce a line: {}",
+            disabled.explain()
+        );
+
+        let mut enabled = Config::embedded().unwrap();
+        enabled.browser.enabled = true;
+        let report = enabled.explain();
+        assert!(report.contains("browser        : enabled"), "{report}");
+        // The network state is stated because it is a real restriction the
+        // operator chose, and "enabled" alone would not convey it.
+        assert!(report.contains("network: no"), "{report}");
+    }
+
+    /// A configured executable is reported verbatim; an unset one says so
+    /// rather than leaving a blank an operator could misread as "nothing".
+    #[test]
+    fn the_browser_line_distinguishes_a_configured_path_from_auto_discovery() {
+        let mut config = Config::embedded().unwrap();
+        config.browser.enabled = true;
+        config.browser.executable = Some("/opt/chrome/chrome".into());
+        assert!(
+            config.explain().contains("executable: /opt/chrome/chrome"),
+            "{}",
+            config.explain()
+        );
+
+        config.browser.executable = None;
+        assert!(
+            config
+                .explain()
+                .contains("executable: auto-discovered on first use"),
+            "{}",
+            config.explain()
+        );
     }
 
     #[test]
@@ -1991,6 +2261,15 @@ mod tests {
         declared.execution.description = Some("docker:ubuntu-24.04".into());
         declared.validate().unwrap();
         assert_ne!(declared.boundary_digest(), kept.boundary_digest());
+        let mut other_runtime = declared.clone();
+        other_runtime.execution.runtime = crate::runtime::SandboxRuntime::Gvisor;
+        other_runtime.execution.image = Some("alpine:3.20".into());
+        other_runtime.validate().unwrap();
+        assert_ne!(
+            other_runtime.boundary_digest(),
+            declared.boundary_digest(),
+            "changing the enforced runtime must change the boundary digest"
+        );
     }
 
     #[test]
@@ -2133,6 +2412,15 @@ control"
         undeclared_config.execution = crate::execution::ExecutionSection::default();
         let undeclared = GoalContract::from_config("c5", &undeclared_config).unwrap();
         assert_ne!(contract.digest(), undeclared.digest());
+        let mut other_runtime = config.clone();
+        other_runtime.execution.runtime = crate::runtime::SandboxRuntime::Oci;
+        other_runtime.execution.image = Some("alpine:3.20".into());
+        let other = GoalContract::from_config("c5", &other_runtime).unwrap();
+        assert_ne!(
+            contract.digest(),
+            other.digest(),
+            "the contract digest must distinguish the runtime that is actually enforced"
+        );
     }
 
     #[test]

@@ -190,7 +190,9 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 
 - `failed-operation` 需要“写到一半失败”。Windows 用“待移开目录内的文件以只读共享方式打开”（目录 rename 被拒），Unix 用“目标目录不可写”；以 root 运行时 Unix 机制无效，演练会记为 `skipped` 而不是伪装通过。
 - `replace-backup` 只在 Windows 存在 hand-off。POSIX 上该文件对 runtime 无意义，演练记录 `not-applicable`，并只验证“证据被报告且未丢失”。
-- CI 在 `ubuntu-latest` 与 `windows-latest` 上都运行该套演练，并把 `f7-drill-report.jsonl` 作为 artifact 上传（见 `.github/workflows/ci.yml`）。
+- CI 在 `ubuntu-latest` 与 `windows-latest` 上都运行该套演练，并把 `f7-drill-report-${{ matrix.os }}.jsonl` 作为 artifact 上传（见 `.github/workflows/ci.yml`）。
+  - **演练步骤排在 `Run all tests` 之后**，所以前面的测试一失败，这一步就是 `skipped`、不会有报告。`plan-a` 上曾连续 7 次如此（见 §8.1），期间**没有任何 drill 证据**——读 `skipped` 时不要把它当成"演练通过"。
+  - 报告缺失时该步骤会发 `::error` 注解而不是静默通过；注解按每行 `outcome` 分级：`pass` → `notice`，`skipped`/`not-applicable` → `warning`（**不算通过**），其余 → `error`。
 
 ## 7. 当前实现限制
 
@@ -211,9 +213,9 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 在考虑把该能力从“实验性 opt-in”升级为正式激活前，部署者应保存以下证据。已具备机器化手段和本地实测的项标为 `[x]`，仍需部署环境或人工签署的项保持 `[ ]`。**每个 `[ ]` 项对应的操作程序见第 9 节**，留证要求在那里写死；没有证据的勾选不算勾选。
 
 - [x] stale lock、failed operation、CAS drift、Windows replacement backup 有可重复的 operator drill（第 6 节），且 replacement hand-off 与无锁并发 writer 的限制已写成本手册第 4、7 节。
-- [x] 只读证据检查有工具（`pangu artifact inspect`）并有“不修改任何字节”的独立断言。
-- [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。（依赖部署环境）→ **见 §9.3**
-- [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。（需部署者书面确认）→ **见 §9.2**
+- [x] 只读证据检查有工具（`pangu artifact inspect`）并有“不修改任何字节”的独立断言（第 6 节 drill `inspection-read-only`：连续三次 inspect 前后对 store 与 workspace 取摘要并断言逐字节相同）。
+- [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。（依赖部署环境）→ **见 §9.3**；**机器可验的部分已有可执行 drill**（`cargo test -p pangu --test backup_drill`：副本单独 verified、删掉原件后仍 verified、篡改必被拒），跨介质/异地/保留期三项仍需部署者留证。
+- [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。（需部署者书面确认）→ **见 §9.2**。**这是唯一无法用测试替代的一项**，且按 §9 的顺序要求必须先于其它项完成。
 - [x] 配置、CLI、Journal、Artifact schema、inspection schema 和恢复手册版本相互匹配，并在 ADR/ROADMAP/README 中一致标为实验性 opt-in。
 - [x] 默认配置仍关闭 checkpoint，Git backend 仍明确未实现。
 - [x] Ubuntu 与 Windows CI 完成 `cargo fmt --check`、`cargo check/test/clippy --workspace --all-targets --all-features` 并保存跨平台 drill 报告（run 36210280753，提交 `1b0245d`，见 8.1）。
@@ -232,18 +234,22 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 | Windows 10.0.19045 x86_64（本机） | rustc 1.98.1 | `3aa11da` | 通过（373 项，0 失败） | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-10.0.19045.jsonl`](evidence/f7-drills-windows-10.0.19045.jsonl) |
 | Windows（GitHub runner） | `dtolnay/rust-toolchain@stable` | `105258e` | 通过 | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-105258e.jsonl`](evidence/f7-drills-windows-105258e.jsonl) |
 | Ubuntu（GitHub runner） | `dtolnay/rust-toolchain@stable` | `105258e` | 通过 | 0 error / 0 warning | 6 pass + 1 not-applicable | [`evidence/f7-drills-ubuntu-105258e.jsonl`](evidence/f7-drills-ubuntu-105258e.jsonl) |
+| Windows 10.0.19045 x86_64（本机） | 实测 | `8f60878` | 通过 | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-8f60878.jsonl`](evidence/f7-drills-windows-8f60878.jsonl) |
+| Windows 10.0.19045 x86_64（本机） | rustc 1.98.1 | `853017f` | 通过（707 项，0 失败） | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-853017f.jsonl`](evidence/f7-drills-windows-853017f.jsonl) |
 
 > 最后两行是 CI 在**修复 Ubuntu 测试失败之后**的第一次全绿运行（run [37398616832](https://github.com/pangu-cn/PanguAgent/actions/runs/37398616832)）。此前 `plan-a` 上每次 CI 都是 ubuntu 失败 / windows 通过（连续 7 次），提交 `1da46a0`、`7627b4d` 均如此；原因见 §11。
 >
 > `105258e` 行的 Ubuntu 与 Windows `failed-operation` 机制名不同（`read-only-directory` 对 `directory-rename-blocked-by-open-file`），这正是 8.1 已记录的平台差异，**属于同一分支的两种实现**，不是不一致的证据。
 
-> 最后一行是 **2026-10-05 本机实测**，不是 CI 结论，也**不满足 §9.1**：它仍属"CI 已覆盖的两个平台"，不是目标部署平台。它的作用是证明该 drill 在当前提交上仍可复现，按 §9.1 的判读规则全部为 `pass`（本平台存在 replacement hand-off 机制，故无 `not-applicable`）。
+> 表格末尾的三行本机记录（`8f60878` / `853017f` 及上一行）都是本机实测，不是 CI 结论，也**不满足 §9.1**：本机仍属"CI 已覆盖的两个平台"，不是目标部署平台。它们的作用是证明该 drill 在**当前提交**上仍可复现，按 §9.1 的判读规则全部为 `pass`（本平台存在 replacement hand-off 机制，故无 `not-applicable`）。
+>
+> `853017f` 是**本表写下时最新的本机记录**，也是 §9.3 那条 verbatim 路径修复落地的提交；此后每次改动 drill 或 checkpoint 相关代码都应追加一行，而不是改写旧行——旧行记录的是当时的提交，改写它会让证据与提交的对应关系失真。
 
-本机记录（2026-09-25，Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features`（142 项，0 失败）与 7 个 drill 全部通过。
+本机记录（2026-09-26，Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features`（142 项，0 失败）与 7 个 drill 全部通过。
 
 本机记录（2026-10-05，Windows 10.0.19045 / x86_64 / rustc 1.98.1，提交 `3aa11da`）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --all-targets --no-fail-fast`（373 项，0 失败）与 7 个 drill 全部通过；drill 报告转录见 [`evidence/f7-drills-windows-10.0.19045.jsonl`](evidence/f7-drills-windows-10.0.19045.jsonl)。
 
-CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/runs/36210280753)，2026-09-26，提交 `1b0245d`）：`ubuntu-latest` 与 `windows-latest` 两个 job 全部步骤通过。`docs/evidence/` 下的两份报告是从该 run 的 drill 步骤产出的原始内容转录（GitHub artifact 下载需认证，CI 同时把每行发成可公开读取的注解）。
+CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/runs/36210280753)，2026-09-26，提交 `1b0245d`，分支 `f7-checkpoint-rollback`）：`ubuntu-latest` 与 `windows-latest` 两个 job 全部步骤通过，且 `Run F7 checkpoint operator drills` 与 `Publish F7 drill report` 在两个 job 上都是 `success`（已按 run 的 job 列表核对，2026-10-07）。`docs/evidence/` 下的两份报告是从该 run 的 drill 步骤产出的原始内容转录（GitHub artifact 下载需认证，CI 同时把每行发成可公开读取的注解）。
 
 **关于工具链版本**：CI 用的是浮动的 `@stable`，本表不写 CI 的 rustc 具体版本——那只能从 run 日志读到，而 job 日志需要 admin 权限。本机行的 1.98.0 是实测值；按 1.98.0 构建于 2026-08-18、Rust 六周一个发布窗口推算，run 时的 stable 很可能仍是 1.98.0，但这是**推断**，不当作证据。
 
@@ -279,6 +285,9 @@ cargo test -p pangu-core --lib -- artifact::tests::restore_ \
                                        artifact::tests::corrupt_blob_fails_before_restore \
                                        artifact::tests::snapshot_rejects
 cargo test -p pangu --test rollback_cli
+
+# 第 3 步：§9.3 的备份可读性（副本独立可用、篡改必被拒）。
+cargo test -p pangu --test backup_drill -- --nocapture
 ```
 
 第 2 步必须**看输出里的实际通过项数**，不能只看退出码为 0：条件编译的测试在被跳过的平台上根本不会被收集，过滤到一个空集合也会返回成功。至少要能对上表里适用本平台的条目。
@@ -306,6 +315,26 @@ cargo test -p pangu --test rollback_cli
 
 **留证**：把 jsonl 转录到 [`docs/evidence/`](evidence/)（格式见该目录 README），并在 §8.1 表格加一行；第 2 步的通过项数与平台条件编译的适用情况一并写进该行的说明。任何一个 drill 为 `not-applicable` 或 `skipped` 时，必须在该行注明原因，不能只写"通过"。
 
+**本机实测记录（Windows 10.0.19045，提交 `8f60878`）**——用来固定"条件编译到底跳过了什么"，**不构成目标平台验收**：
+
+| 第 2 步的项目 | 本机结果 |
+|---------------|---------|
+| `artifact::tests::restore_*` | 5 pass（`corrupt_blob_fails_before_restore` + 4 个 restore 用例） |
+| `artifact::tests::snapshot_rejects_symlinks_instead_of_silently_omitting_them` | `not-applicable`：`#[cfg(unix)]`，`cargo test -- --list` 中**不存在该条目** |
+| `artifact::tests::snapshot_rejects_special_filesystem_entries` | `not-applicable`，同上 |
+| `artifact::tests::restore_applies_directory_permissions_after_children` | `not-applicable`，同上 |
+| `rollback_cli::rollback_subcommand_restores_a_checkpoint_in_a_real_process` | 1 pass |
+
+"`--list` 中不存在"是**实测**（`cargo test -p pangu-core --lib -- --list` 过滤后为空），不是从 `#[cfg]` 推断的：条件编译的测试在被跳过的平台上根本不会被收集，因此**过滤到一个空集合也会返回成功**——只看退出码会把"三项都没跑"读成"三项都通过"。
+
+### 9.1.1 本项为什么仍然开着
+
+F8 起，"真拉起执行"由 `crates/pangu-toolkit/tests/runtime_dispatch.rs` 用**记录 argv 的桩**验证（见 [`docs/evidence/README.md`](evidence/README.md)）。那证明的是**启动器**正确：命令真的被交给运行时、带上了隔离标志、输出被取回；它**不**证明 Docker 对这些标志的实现真的隔离了什么——那是运行时自身的属性。
+
+同样，本机（Windows 10.0.19045）**没有可用的容器运行时**：`docker version` 30 秒无响应，Docker Desktop 的 Linux 引擎报 `Access is denied`，无 WSL 发行版、无 Podman。因此**"命令在真实容器内执行"这一条在本机为未执行**，既不是通过也不是跳过。它需要在 `ubuntu-latest`（CI 上已有条件）或操作者指定的目标平台上跑一次。
+
+这与 §9.1 原本的要求是同一件事的两半：**目标部署平台**既决定 symlink/权限两栏能否记为通过，也决定真实容器内执行能否被观测。两者都不能用本机记录代替。
+
 ### 9.2 并发 writer、外部 effect、无人工输入时的停止策略（需部署者书面确认）
 
 这是**唯一的纯人的决定**，无法用测试替代：它约束的是 Pangu 之外的世界。
@@ -327,11 +356,39 @@ cargo test -p pangu --test rollback_cli
 
 **留证**：一份带日期、部署环境标识和签署人的书面记录（变更单或仓库内文档均可），并在 §8.1 下方引用其位置。
 
+### 9.2.1 本机预填的答案草案（**未签署，不构成确认**）
+
+§9.2 是唯一无法用测试替代的一项，但不意味着它无从下手：代码已经确定了其中**哪些部分不需要人来判断**。下面是按本仓库现状可以查证的事实，供签署人核对后自行落笔——**这不是确认，勾选它不会让该项变成完成**。
+
+| 问题 | 可查证的事实 | 仍需签署人回答的部分 |
+|------|-------------|---------------------|
+| 1. 谁在写同一个 workspace | — | **全部**。这只有部署者知道（编辑器、构建、同步盘、CI、其它 agent）。 |
+| 2. 如何保证恢复期间没有 writer | 并发的 **Pangu** 写入者已被 workspace 写锁串行化（受限子 Agent 持锁；见 `BOUNDARY.md`） | 除 Pangu 之外的写入者靠什么流程保证不在写。**锁是协作机制，不是 OS 强制**；对这些写入者 Pangu 只能 digest/CAS 检测，**检测不是预防**。 |
+| 3. 外部不可逆副作用 | Pangu 阻断整次 rollback 且**不做外部补偿**（§4.5；drill `external-effect` 已验）。落地位置：`crates/pangu-core/src/artifact.rs:1469` 的拒绝分支 | 谁负责手工补偿、谁批准。 |
+| 4. 无人工输入时 | `--dangerously-unattended` 与 rollback 不兼容；无人值守下 rollback 一律 fail closed。落地位置：`crates/pangu/src/main.rs:1979`（`args.unattended` 即 bail）与 `:2014`（unattended 审批模式即 bail） | 确认部署中**不会**出现期望"无人值守自动回滚"的流程。 |
+| 5. 升级路径 | 锁超时后 Pangu **不会**删除锁文件，只报出持锁者身份。落地位置：`crates/pangu-core/src/lockfile.rs:50` 注释说明为何不删（单看锁文件无法区分"持锁者在工作"与"持锁者已消失"） | 第一个联系谁、多久内响应，以及**谁在超时后核实并手工清理锁**。 |
+
+上表的代码位置由 `crates/pangu/tests/activation_gate.rs` 看守：该测试会读取本文件的
+这一段，并断言每个被引用的行号仍落在相应代码中。若有人改动了实现而没更新本表，
+测试会失败——**签署人因此可以依赖这些引用，而不必自己去翻代码**。
+
+第 2 题在第 1 题答完之后往往要重写一次——若答案里出现了同步盘或 CI，处置手段就随之改变。
+
 ### 9.3 恢复期间的备份与独立审计可用性（依赖部署环境）
 
 在**真正需要恢复之前**验证，不是出事时才发现备份不可用。
 
-**怎么做**：在目标平台造一次真实的 checkpoint，然后：
+**机器可验的部分已有可执行 drill**（`crates/pangu/tests/backup_drill.rs`）：
+
+```bash
+cargo test -p pangu --test backup_drill -- --nocapture
+```
+
+它证明：副本**搬走后**单独 `verified`；**删掉原始目录后**副本仍 `verified`（排除"其实是通过链接读到了原件"）；篡改副本一个字节**必被拒绝**（一个无法让自己失败的备份不是证据）。
+
+**该 drill 覆盖不到、必须由部署者留证的部分**：跨介质或异地副本、保留期长于事故响应窗口、不被日志轮转自动删除。这三项无法用单机测试代替，缺它们就仍然不满足本项。
+
+**怎么做**（在目标平台造一次真实 checkpoint，然后）：
 
 ```bash
 # 1. 留一份恢复前的只读副本与校验记录（Artifact root + workspace + Journal）。

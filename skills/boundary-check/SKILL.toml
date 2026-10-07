@@ -1,0 +1,6 @@
+schema = "pangu-skill-manifest/1"
+name = "boundary-check"
+version = "1.0.0"
+description = "Decide whether a proposed action is inside Pangu's boundary, and explain which layer refuses it when it is not. Advisory only: it never authorizes anything and never substitutes for a real run's evaluation."
+files = ["SKILL.md"]
+scripts = []

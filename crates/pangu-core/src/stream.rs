@@ -686,8 +686,21 @@ impl EventSink for StreamWriter {
 mod tests {
     use super::*;
 
+    /// The OS temp directory with symlinked ancestors resolved.
+    ///
+    /// The journal and artifact layers reject any path containing a symlink
+    /// component, and the sandbox canonicalizes its workspace before comparing
+    /// prefixes. On Linux container images `/tmp` is often a symlink, so a raw
+    /// `temp_dir()` path is refused there while working on a machine whose temp
+    /// directory is a real directory — the test passes locally and fails in CI for a
+    /// reason unrelated to the code under test. Resolving the base once removes the
+    /// whole class of mistake.
+    fn temp_base() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        std::fs::canonicalize(&base).unwrap_or(base)
+    }
     fn temp_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        temp_base().join(format!(
             "pangu-stream-{label}-{}-{}.jsonl",
             std::process::id(),
             std::time::SystemTime::now()
