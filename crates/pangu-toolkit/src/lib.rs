@@ -605,6 +605,7 @@ impl Toolkit {
             "browser_click" => {
                 let selector = browser::required_selector(&args)?;
                 let session = handle.session()?;
+                require_current_page(action, &session.snapshot()?.url)?;
                 session.click(&selector)?;
                 Ok(browser::output(
                     format!("clicked {selector}"),
@@ -614,6 +615,7 @@ impl Toolkit {
             "browser_type" => {
                 let text = required_string(&args, "text")?;
                 let session = handle.session()?;
+                require_current_page(action, &session.snapshot()?.url)?;
                 session.type_text(&text)?;
                 Ok(browser::output(
                     format!("typed {} characters", text.chars().count()),

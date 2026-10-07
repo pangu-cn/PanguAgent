@@ -574,6 +574,15 @@ fn wait_for_endpoint(profile_dir: &std::path::Path) -> Result<String> {
                     && port.parse::<u16>().ok().filter(|port| *port > 0).is_some()
                 {
                     let path = lines.next().unwrap_or("/devtools/browser").trim();
+                    if !path.starts_with("/devtools/")
+                        || path.chars().any(|character| {
+                            character.is_control() || matches!(character, '?' | '#' | '\\' | ' ')
+                        })
+                    {
+                        return Err(Error::Other(format!(
+                            "the browser published an unexpected debugger path: {path}"
+                        )));
+                    }
                     return Ok(format!("ws://127.0.0.1:{port}{path}"));
                 }
             }
