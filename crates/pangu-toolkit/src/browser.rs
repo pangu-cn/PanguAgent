@@ -243,6 +243,30 @@ pub fn required_selector(args: &Value) -> Result<String> {
 /// The truncation flag is stated in the output rather than kept internal: a
 /// caller that does not know the text was clipped would treat a partial page as
 /// the whole page.
+pub fn require_allowed_page_url(
+    url: &str,
+    mut check_host: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let parsed = url::Url::parse(url).map_err(|error| anyhow!("landed URL is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!(
+            "navigation landed on `{}`, which is not an allowed http(s) page",
+            parsed.scheme()
+        );
+    }
+    let host_name = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("navigation landed on a URL with no host"))?
+        .to_ascii_lowercase();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let host = if host_name.contains(':') {
+        format!("[{host_name}]:{port}")
+    } else {
+        format!("{host_name}:{port}")
+    };
+    check_host(&host).map_err(|error| anyhow!("navigation landed outside the boundary: {error}"))
+}
+
 pub fn render_snapshot(url: &str, title: &str, text: &str, truncated: bool) -> String {
     let mut rendered = format!("url: {url}\ntitle: {title}\n");
     if truncated {
@@ -334,6 +358,18 @@ pub fn description(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_redirected_page_is_checked_again() {
+        let error =
+            require_allowed_page_url("https://outside.example/", |_| Err(anyhow!("host denied")))
+                .expect_err("the landed host must be checked");
+        assert!(error.to_string().contains("outside"), "{error}");
+
+        let error = require_allowed_page_url("file:///etc/passwd", |_| Ok(()))
+            .expect_err("a redirect to file: must be refused");
+        assert!(error.to_string().contains("file"), "{error}");
+    }
 
     #[test]
     fn every_advertised_tool_has_a_schema_and_a_description() {

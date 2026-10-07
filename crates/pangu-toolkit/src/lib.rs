@@ -567,6 +567,16 @@ impl Toolkit {
                     // `open` that yielded only "ok" would oblige the model to
                     // read next, doubling the calls for the common case.
                     let snapshot = session.snapshot()?;
+                    // The requested host was checked before navigation. A redirect
+                    // can land somewhere else, so the page actually reached must
+                    // pass the same egress check before its content is returned.
+                    browser::require_allowed_page_url(&snapshot.url, |host| {
+                        action
+                            .sandbox()
+                            .check_host(host)
+                            .map(|_| ())
+                            .map_err(|error| anyhow!(error))
+                    })?;
                     Ok(browser::output(
                         browser::render_snapshot(
                             &snapshot.url,
