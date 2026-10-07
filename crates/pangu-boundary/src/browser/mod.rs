@@ -95,17 +95,14 @@ impl BrowserConfig {
             "--no-first-run".to_string(),
             "--no-default-browser-check".to_string(),
         ];
+        args.extend(self.extra_args.iter().cloned());
+        // Chromium lets a later switch override an earlier one. The profile,
+        // debugger endpoint, and offline restrictions therefore come last.
+        args.push(format!("--user-data-dir={}", self.profile_dir.display()));
         if !self.network {
-            // Navigation checks cannot stop a script from changing the page.
-            // Disabling JavaScript removes that path while data and about pages
-            // remain readable.
             args.push("--disable-javascript".to_string());
             args.push("--disable-background-networking".to_string());
         }
-        args.extend(self.extra_args.iter().cloned());
-        // Chromium lets a later switch override an earlier one. The profile and
-        // debugger endpoint therefore come last, after operator-supplied args.
-        args.push(format!("--user-data-dir={}", self.profile_dir.display()));
         args.push("--remote-debugging-port=0".to_string());
         args.push("--remote-debugging-address=127.0.0.1".to_string());
         args

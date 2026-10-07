@@ -268,6 +268,7 @@ impl BrowserSession {
     pub fn snapshot(&mut self) -> Result<PageSnapshot> {
         self.require_local_page()?;
         let url = self.evaluate("document.location.href")?;
+        self.require_local_subresources()?;
         let title = self.evaluate("document.title")?;
         let text = self.evaluate("document.body ? document.body.innerText : ''")?;
 
@@ -578,6 +579,25 @@ impl BrowserSession {
                 "the current page is outside the disabled-network boundary: {url}"
             )))
         }
+    }
+
+    fn require_local_subresources(&mut self) -> Result<()> {
+        if self.network {
+            return Ok(());
+        }
+        let resources = self.evaluate(
+            "JSON.stringify(Array.from(document.querySelectorAll('[src], [href]')).map(el => el.src || el.href || ''))",
+        )?;
+        let values: Vec<String> = serde_json::from_str(&resources).unwrap_or_default();
+        if let Some(resource) = values
+            .into_iter()
+            .find(|resource| !local_page_url(resource))
+        {
+            return Err(Error::Other(format!(
+                "the page references a resource outside the disabled-network boundary: {resource}"
+            )));
+        }
+        Ok(())
     }
 }
 
