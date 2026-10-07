@@ -422,6 +422,24 @@ async fn git_diff_reports_the_workspace_diff_through_the_verified_action_chain()
 }
 
 #[tokio::test]
+async fn git_query_rejects_repository_changes() {
+    let root = temp_root("git-query");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new("git_query", json!({"command": "push"}))]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Failed);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("not read-only"), "{rendered}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn output_limit_failure_cannot_create_evidence() {
     let root = temp_root("output-limit");
     std::fs::write(root.join("large.txt"), "x".repeat(512)).expect("seed large file");

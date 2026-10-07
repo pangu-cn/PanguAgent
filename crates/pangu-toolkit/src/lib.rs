@@ -311,6 +311,17 @@ impl Toolkit {
                 timeout_ms: None,
             },
             Capability {
+                name: "git_query".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: Vec::new(),
+                hosts: Vec::new(),
+                processes: vec!["git".into()],
+                timeout_ms: None,
+            },
+            Capability {
                 name: "git_diff".into(),
                 version: "1".into(),
                 risk: Risk::ReadOnly,
@@ -868,6 +879,19 @@ impl ToolExecutor for Toolkit {
                 }),
             ),
             ToolSpec::new(
+                "git_query",
+                "Run one read-only git query: diff, status, log, or show. It cannot change the repository or contact a remote.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command"],
+                    "properties": {
+                        "command": {"type": "string", "enum": ["diff", "status", "log", "show"]},
+                        "path": {"type": "string"}
+                    }
+                }),
+            ),
+            ToolSpec::new(
                 "git_diff",
                 "Show the working-tree or staged diff of the workspace (read-only git).",
                 json!({
@@ -1265,6 +1289,29 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "git_query" => {
+                ensure_allowed_keys(&call.args, &["command", "path"])?;
+                let command = required_string(&call.args, "command")?;
+                if !matches!(command.as_str(), "diff" | "status" | "log" | "show") {
+                    bail!("git query is not read-only");
+                }
+                let mut argv = vec!["git".to_string(), command.clone()];
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                    EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                );
+                if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                    if path.is_empty() || path.contains("..") || Path::new(path).has_root() {
+                        bail!("path must be a relative in-workspace path");
+                    }
+                    argv.push("--".to_string());
+                    argv.push(path.to_string());
+                    assessment = assessment.read(PathBuf::from(path));
+                }
+                sandbox.validate_argv(&argv)?;
+                assessment.argv = argv;
+                assessment.preview = format!("git {command}");
+                Ok(assessment)
+            }
             "git_diff" => {
                 ensure_allowed_keys(&call.args, &["staged", "path"])?;
                 let staged = call
@@ -1319,7 +1366,7 @@ impl ToolExecutor for Toolkit {
             "read_feed" => execute_feed(action).await,
             "save_snapshot" => execute_snapshot(action).await,
             "http_fetch" => execute_http(action).await,
-            "git_diff" => execute_command(action, self.runtime.as_deref()).await,
+            "git_query" | "git_diff" => execute_command(action, self.runtime.as_deref()).await,
             "run_command" => execute_command(action, self.runtime.as_deref()).await,
             "verify" => execute_verify(action, self.runtime.as_deref()).await,
             name if browser::is_browser_tool(name) => {

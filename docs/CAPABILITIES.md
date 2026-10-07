@@ -198,6 +198,10 @@ RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
 
 没有“搜索整个互联网”的工具。任意站点抓取必须先由操作者把主机写入 allow-list，再使用 `http_fetch` 或 `read_feed`。
 
+## 3d. 只读 Git 查询
+
+外部 GitHub、GitLab 和 Postman MCP 持有凭据，也能创建 PR、合并代码或发送 API 请求。这里不接入这些服务。`git_query` 只允许 `diff`、`status`、`log` 和 `show`，参数继续经过现有只读 argv 白名单。`push`、`commit`、`reset`、PR 和远程 API 调试都没有工具入口；测试执行仍由操作者预先配置的 `verify` 承担，而且每次都需要人工批准。
+
 ## 4. MCP 协议支持
 
 分两部分实现：
