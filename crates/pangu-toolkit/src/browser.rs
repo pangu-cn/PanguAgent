@@ -312,20 +312,45 @@ pub fn require_validated_screenshot_path(
 }
 
 fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
-    let left: Vec<_> = left.components().collect();
-    let right: Vec<_> = right.components().collect();
+    let left = lexical_components(left);
+    let right = lexical_components(right);
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
-            let left = left.as_os_str().to_string_lossy();
-            let right = right.as_os_str().to_string_lossy();
             // Windows paths are case-insensitive. Linux paths are not, so a
             // case-only difference must remain a different file there.
             if cfg!(windows) {
                 left.eq_ignore_ascii_case(&right)
             } else {
-                left == right
+                *left == right
             }
         })
+}
+
+fn lexical_components(path: &std::path::Path) -> Vec<String> {
+    let mut components = Vec::new();
+    let mut prefix_len = 0usize;
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // Never pop a root or drive prefix. Doing so could make an
+                // absolute path compare equal to a different relative path.
+                if components.len() > prefix_len {
+                    components.pop();
+                } else {
+                    components.push("..".to_string());
+                }
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                components.push(component.as_os_str().to_string_lossy().into_owned());
+                prefix_len = components.len();
+            }
+            std::path::Component::Normal(name) => {
+                components.push(name.to_string_lossy().into_owned());
+            }
+        }
+    }
+    components
 }
 
 pub fn require_validated_browser_action(name: &str, browser_session: bool) -> Result<()> {
@@ -518,6 +543,11 @@ mod tests {
         } else {
             case_difference.expect_err("Linux path comparison remains case-sensitive");
         }
+        require_validated_screenshot_path(
+            std::path::Path::new("artifacts/./screenshot.png"),
+            &[std::path::PathBuf::from("artifacts/screenshot.png")],
+        )
+        .expect("a current-directory component does not change the file");
     }
 
     #[test]
