@@ -440,19 +440,29 @@ impl BrowserSession {
 /// reaches this path; compromising the socket first is not required.
 pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
     let root = std::env::temp_dir().join("pangu-browser");
+    std::fs::create_dir_all(&root).map_err(|error| {
+        Error::Other(format!(
+            "cannot prepare the browser profile root {}: {error}",
+            root.display()
+        ))
+    })?;
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         Error::Other(format!(
             "cannot resolve browser profile {}: {error}",
             path.display()
         ))
     })?;
-    if let Ok(canonical_root) = std::fs::canonicalize(&root) {
-        if !profile_is_child_of(&canonical, &canonical_root) {
-            return Err(Error::Other(format!(
-                "refusing to delete browser profile outside pangu-browser: {}",
-                canonical.display()
-            )));
-        }
+    let canonical_root = std::fs::canonicalize(&root).map_err(|error| {
+        Error::Other(format!(
+            "cannot resolve the browser profile root {}: {error}",
+            root.display()
+        ))
+    })?;
+    if !profile_is_child_of(&canonical, &canonical_root) {
+        return Err(Error::Other(format!(
+            "refusing to delete browser profile outside pangu-browser: {}",
+            canonical.display()
+        )));
     }
     std::fs::remove_dir_all(path).map_err(|error| {
         Error::Other(format!(
@@ -883,6 +893,18 @@ mod tests {
 
     #[test]
     fn ending_a_session_removes_its_temporary_profile() {
+        let shared_root = std::env::temp_dir().join("pangu-browser");
+        let _ = std::fs::remove_dir_all(&shared_root);
+        let unrelated =
+            std::env::temp_dir().join(format!("pangu-unrelated-{}", std::process::id()));
+        std::fs::create_dir_all(&unrelated).expect("unrelated");
+        let missing_root = remove_profile_dir(&unrelated);
+        assert!(
+            missing_root.is_err(),
+            "a missing profile root must not make cleanup unrestricted"
+        );
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(unrelated);
         let root = std::env::temp_dir()
             .join("pangu-browser")
             .join(format!("profile-{}", std::process::id()));
