@@ -353,6 +353,7 @@ impl BrowserSession {
     /// would believe a real user action happened.
     pub fn click(&mut self, selector: &str) -> Result<()> {
         self.require_local_page()?;
+        self.require_local_subresources()?;
         let box_reply = self.call(
             "Runtime.evaluate",
             json!({
@@ -403,6 +404,7 @@ impl BrowserSession {
     /// while its handlers never ran.
     pub fn type_text(&mut self, text: &str) -> Result<()> {
         self.require_local_page()?;
+        self.require_local_subresources()?;
         for character in text.chars() {
             self.call(
                 "Input.dispatchKeyEvent",
@@ -592,7 +594,11 @@ impl BrowserSession {
              ...Array.from(document.styleSheets).flatMap(sheet => { try { return Array.from(sheet.cssRules).map(rule => rule.cssText || ''); } catch (error) { return [String(error)]; } })\
              ])",
         )?;
-        let values: Vec<String> = serde_json::from_str(&resources).unwrap_or_default();
+        let values: Vec<String> = serde_json::from_str(&resources).map_err(|error| {
+            Error::Other(format!(
+                "could not read the page resources while network is disabled: {error}"
+            ))
+        })?;
         if let Some(resource) = values.into_iter().find(|resource| {
             let lower = resource.to_ascii_lowercase();
             lower.contains("http://")
