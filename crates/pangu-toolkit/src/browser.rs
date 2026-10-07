@@ -326,6 +326,16 @@ fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
         })
 }
 
+fn strip_verbatim_prefix(component: &str) -> String {
+    if let Some(rest) = component.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    component
+        .strip_prefix(r"\\?\")
+        .unwrap_or(component)
+        .to_string()
+}
+
 fn lexical_components(path: &std::path::Path) -> Vec<String> {
     let mut components = Vec::new();
     let mut prefix_len = 0usize;
@@ -342,7 +352,9 @@ fn lexical_components(path: &std::path::Path) -> Vec<String> {
                 }
             }
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                components.push(component.as_os_str().to_string_lossy().into_owned());
+                components.push(strip_verbatim_prefix(
+                    &component.as_os_str().to_string_lossy(),
+                ));
                 prefix_len = components.len();
             }
             std::path::Component::Normal(name) => {
@@ -548,6 +560,13 @@ mod tests {
             &[std::path::PathBuf::from("artifacts/screenshot.png")],
         )
         .expect("a current-directory component does not change the file");
+        require_validated_screenshot_path(
+            std::path::Path::new(r"\\?\C:\work\artifacts\screenshot.png"),
+            &[std::path::PathBuf::from(
+                r"C:\work\artifacts\screenshot.png",
+            )],
+        )
+        .expect("a Windows verbatim prefix does not change the file");
     }
 
     #[test]
