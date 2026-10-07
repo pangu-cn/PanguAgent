@@ -34,7 +34,7 @@ L1–L4 链。
 |------|------|------|--------|
 | `browser_open` | `NeedsHuman` | `ExternalRead` | 会访问**主机**，与 `http_fetch` 同类，必须声明 host |
 | `browser_read` | `ReadOnly` | `NoEffect` | 读取当前页面，不改变任何东西 |
-| `browser_screenshot` | `ReadOnly` | `NoEffect` | 同上，是观察而非改变 |
+| `browser_screenshot` | `Reversible` | `Workspace` / `Reversible` | 页面本身不变，但 PNG 会写入运行产物目录；`NoEffect` 不能诚实声明这次写入 |
 | `browser_click` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 点下去会发生什么**由页面决定**，且本程序无法撤销 —— 状态改动落在它不控制的服务器上 |
 | `browser_type` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | 输入可能触发会行动的处理器，同样无法撤销 |
 

@@ -197,6 +197,24 @@ async fn a_click_and_a_type_produce_an_effect_the_agent_will_accept() {
         );
     }
 
+    let screenshot = pangu_core::ToolCall::new("browser_screenshot", serde_json::json!({}));
+    let assessment = toolkit
+        .assess(&screenshot, &sandbox)
+        .await
+        .expect("browser_screenshot must be assessable");
+    assert_eq!(assessment.risk, pangu_boundary::Risk::Reversible);
+    let effect = assessment
+        .effect
+        .expect("a screenshot must declare the file it writes");
+    effect
+        .validate_for_risk(assessment.risk)
+        .expect("the screenshot effect must pass the same rule as every other action");
+    assert_eq!(
+        effect.reversibility,
+        pangu_agent::Reversibility::Reversible,
+        "saving a PNG is a write, so NoEffect would hide it from the effect ledger"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

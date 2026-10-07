@@ -306,6 +306,84 @@ impl Toolkit {
                 timeout_ms: None,
             });
         }
+        // F9: the browser tools exist only when a browser is configured, and
+        // the manifest is the declared capability surface. Omitting them here
+        // while `specs()` advertises them makes the declaration deny five
+        // tools the model can actually call.
+        if self.browser.is_some() {
+            capabilities.extend([
+                Capability {
+                    name: "browser_open".into(),
+                    version: "1".into(),
+                    risk: Risk::NeedsHuman,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ExternalRead,
+                        Reversibility::NoEffect,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: vec!["allowlisted".into()],
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_read".into(),
+                    version: "1".into(),
+                    risk: Risk::ReadOnly,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ProcessRead,
+                        Reversibility::NoEffect,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: empty(),
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_screenshot".into(),
+                    version: "1".into(),
+                    risk: Risk::Reversible,
+                    effect: EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::Reversible,
+                    ),
+                    reads: empty(),
+                    writes: vec!["artifact".into()],
+                    hosts: empty(),
+                    processes: empty(),
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_click".into(),
+                    version: "1".into(),
+                    risk: Risk::NeedsHuman,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ExternalMutation,
+                        Reversibility::Irreversible,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: empty(),
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+                Capability {
+                    name: "browser_type".into(),
+                    version: "1".into(),
+                    risk: Risk::NeedsHuman,
+                    effect: EffectDescriptor::new(
+                        EffectScope::ExternalMutation,
+                        Reversibility::Irreversible,
+                    ),
+                    reads: empty(),
+                    writes: empty(),
+                    hosts: empty(),
+                    processes: vec!["browser".into()],
+                    timeout_ms: None,
+                },
+            ]);
+        }
         CapabilityManifest::new(capabilities)
     }
 
@@ -359,12 +437,25 @@ impl Toolkit {
         match kind {
             "read" => {
                 ensure_allowed_keys(&call.args, &[])?;
-                Ok(
-                    ToolAssessment::new(Risk::ReadOnly).with_effect(EffectDescriptor::new(
-                        EffectScope::ProcessRead,
-                        Reversibility::NoEffect,
-                    )),
-                )
+                // A screenshot is not an observation in the effect ledger: it
+                // writes a PNG into the run's artifact directory. Calling that
+                // `NoEffect` would let a write skip the reversible-write gate
+                // while the manifest, which records the write, says otherwise.
+                if call.name == "browser_screenshot" {
+                    Ok(
+                        ToolAssessment::new(Risk::Reversible).with_effect(EffectDescriptor::new(
+                            EffectScope::Workspace,
+                            Reversibility::Reversible,
+                        )),
+                    )
+                } else {
+                    Ok(
+                        ToolAssessment::new(Risk::ReadOnly).with_effect(EffectDescriptor::new(
+                            EffectScope::ProcessRead,
+                            Reversibility::NoEffect,
+                        )),
+                    )
+                }
             }
             "external_mutation" => {
                 let mut assessment =
@@ -1673,6 +1764,42 @@ mod tests {
             configured.verify_command(),
             vec!["cargo".to_string(), "test".to_string()]
         );
+    }
+
+    #[test]
+    fn manifest_matches_specs_one_to_one_with_a_browser() {
+        let toolkit = Toolkit::new().with_browser(
+            pangu_boundary::browser::BrowserConfig {
+                executable: PathBuf::from("browser"),
+                profile_dir: PathBuf::from("profile"),
+                network: false,
+                extra_args: Vec::new(),
+            },
+            PathBuf::from("artifacts"),
+        );
+        let specs = toolkit.specs();
+        let manifest = toolkit.manifest();
+        manifest
+            .validate()
+            .expect("a browser-enabled manifest validates");
+        let mut spec_names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        let mut manifest_names: Vec<&str> = manifest.names();
+        spec_names.sort();
+        manifest_names.sort();
+        assert_eq!(
+            spec_names, manifest_names,
+            "enabling a browser must not make specs() and manifest() diverge"
+        );
+        for name in ["browser_click", "browser_type"] {
+            let capability = manifest
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} must be declared"));
+            assert_eq!(capability.risk, Risk::NeedsHuman);
+            capability
+                .effect
+                .validate_for_risk(capability.risk)
+                .unwrap_or_else(|error| panic!("{name} has an effect L1 rejects: {error}"));
+        }
     }
 
     #[test]

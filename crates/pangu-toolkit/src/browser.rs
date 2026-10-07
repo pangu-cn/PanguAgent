@@ -9,7 +9,7 @@
 //! |------|------|--------|-----|
 //! | `browser_open` | `NeedsHuman` | `ExternalRead` | It reaches a **host**, exactly like `http_fetch`. The host must be declared so the network boundary sees it. |
 //! | `browser_read` | `ReadOnly` | `NoEffect` | Reading the current page changes nothing. |
-//! | `browser_screenshot` | `ReadOnly` | `NoEffect` | Same: an observation, not a change. |
+//! | `browser_screenshot` | `Reversible` | `Workspace` / `Reversible` | The observation itself changes nothing, but saving the PNG writes a run artifact. `NoEffect` cannot honestly declare that write. |
 //! | `browser_click` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | A click can submit a form or buy something. The page decides what it does, so this is **not** read-only even though the input is one coordinate pair, and it is not reversible either: this program cannot undo a state change that lives on a server it does not control. |
 //! | `browser_type` | `NeedsHuman` | `ExternalMutation` / `Irreversible` | Typing into a field can trigger a handler that acts. Same reasoning as `browser_click`. |
 //!

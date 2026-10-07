@@ -55,7 +55,8 @@ network = false
 | 工具 | 风险 | 效果 |
 |------|------|------|
 | `browser_open` | `NeedsHuman` | `ExternalRead`（会访问主机，声明其 host） |
-| `browser_read` / `browser_screenshot` | `ReadOnly` | `NoEffect` |
+| `browser_read` | `ReadOnly` | `NoEffect` |
+| `browser_screenshot` | `Reversible` | `Workspace` / `Reversible`（保存 PNG，不是无效果观察） |
 | `browser_click` / `browser_type` | `NeedsHuman` | **`ExternalMutation` / `Irreversible`** |
 
 **点击不是只读，也不是可撤销的**：点下去会发生什么由页面决定，状态落在本程序不控制的服务器上。`Reversible` 既声称了一个不存在的撤销能力，也会被 L1 的 `validate_for_risk` 在每次调用时拒绝。默认关闭时浏览器工具**根本不出现在工具表里**。已在真实 Chrome 154 上端到端验证（点击触发页面自己的 `onclick`、截图是合法 PNG）。详见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) 第 2b 节。
