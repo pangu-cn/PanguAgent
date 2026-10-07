@@ -216,7 +216,8 @@ pub fn resolve_config(
             .refusal()
         })?,
     };
-    for argument in &extra_args {
+    for (index, argument) in extra_args.iter().enumerate() {
+        let next = extra_args.get(index + 1).map(String::as_str);
         let forbidden = [
             "--remote-debugging-address",
             "--remote-debugging-port",
@@ -229,7 +230,8 @@ pub fn resolve_config(
             normalized == *prefix
                 || normalized.starts_with(&format!("{prefix}="))
                 || normalized.starts_with(&format!("{prefix} "))
-        }) {
+        }) || (forbidden.contains(&normalized) && next.is_some())
+        {
             bail!("[browser] args must not override the loopback debugger endpoint: {argument}");
         }
     }
@@ -671,7 +673,7 @@ mod tests {
             None,
             std::path::PathBuf::from("/tmp/p"),
             false,
-            vec!["--remote-debugging-address 0.0.0.0".into()],
+            vec!["--remote-debugging-address".into(), "0.0.0.0".into()],
         )
         .expect_err("must refuse");
         assert!(
