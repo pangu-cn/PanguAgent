@@ -462,6 +462,14 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
 }
 
 pub(crate) fn create_private_profile_dir(path: &std::path::Path) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Other(format!(
+                "refusing to use a symlinked browser profile: {}",
+                path.display()
+            )));
+        }
+    }
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -906,6 +914,22 @@ mod tests {
             assert_eq!(mode, 0o700, "other users must not read browser cookies");
         }
         let _ = std::fs::remove_dir_all(root);
+        #[cfg(unix)]
+        {
+            let linked = std::env::temp_dir()
+                .join("pangu-browser")
+                .join(format!("link-{}", std::process::id()));
+            let target =
+                std::env::temp_dir().join(format!("pangu-link-target-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&target);
+            std::fs::create_dir_all(&target).expect("link target");
+            let _ = std::fs::remove_file(&linked);
+            std::os::unix::fs::symlink(&target, &linked).expect("symlink");
+            let refused = create_private_profile_dir(&linked);
+            assert!(refused.is_err(), "a profile symlink must not be followed");
+            let _ = std::fs::remove_file(linked);
+            let _ = std::fs::remove_dir_all(target);
+        }
     }
 
     #[test]
