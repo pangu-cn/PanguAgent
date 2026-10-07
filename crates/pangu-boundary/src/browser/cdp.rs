@@ -332,6 +332,7 @@ impl BrowserSession {
     /// Take a PNG screenshot of the visible viewport.
     pub fn screenshot(&mut self) -> Result<Vec<u8>> {
         self.require_local_page()?;
+        self.require_local_subresources()?;
         let reply = self.call(
             "Page.captureScreenshot",
             json!({"format": "png", "captureBeyondViewport": false}),
@@ -586,13 +587,21 @@ impl BrowserSession {
             return Ok(());
         }
         let resources = self.evaluate(
-            "JSON.stringify(Array.from(document.querySelectorAll('[src], [href]')).map(el => el.src || el.href || ''))",
+            "JSON.stringify([\
+             ...Array.from(document.querySelectorAll('[src], [href], [srcset], link[rel], meta[http-equiv]')).flatMap(el => [el.src || '', el.href || '', el.srcset || '', el.content || '']),\
+             ...Array.from(document.styleSheets).flatMap(sheet => { try { return Array.from(sheet.cssRules).map(rule => rule.cssText || ''); } catch (error) { return [String(error)]; } })\
+             ])",
         )?;
         let values: Vec<String> = serde_json::from_str(&resources).unwrap_or_default();
-        if let Some(resource) = values
-            .into_iter()
-            .find(|resource| !local_page_url(resource))
-        {
+        if let Some(resource) = values.into_iter().find(|resource| {
+            let lower = resource.to_ascii_lowercase();
+            lower.contains("http://")
+                || lower.contains("https://")
+                || lower.contains("ws://")
+                || lower.contains("wss://")
+                || lower.contains("file://")
+                || lower.contains("ftp://")
+        }) {
             return Err(Error::Other(format!(
                 "the page references a resource outside the disabled-network boundary: {resource}"
             )));
