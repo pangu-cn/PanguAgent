@@ -256,6 +256,39 @@ impl Toolkit {
                 timeout_ms: None,
             },
             Capability {
+                name: "search_index".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "read_feed".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ExternalRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: vec!["allowlisted".into()],
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "save_snapshot".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: empty(),
+                writes: vec!["workspace".into()],
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
                 name: "http_fetch".into(),
                 version: "1".into(),
                 risk: Risk::NeedsHuman,
@@ -785,6 +818,36 @@ impl ToolExecutor for Toolkit {
                 }),
             ),
             ToolSpec::new(
+                "search_index",
+                "Search a local JSONL index. It does not contact a search provider.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "query"],
+                    "properties": {"path": {"type": "string"}, "query": {"type": "string", "minLength": 1}}
+                }),
+            ),
+            ToolSpec::new(
+                "read_feed",
+                "Read titles and links from one allow-listed RSS or Atom feed.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["url"],
+                    "properties": {"url": {"type": "string", "format": "uri"}}
+                }),
+            ),
+            ToolSpec::new(
+                "save_snapshot",
+                "Save previously fetched text as a bounded UTF-8 snapshot. It does not fetch.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["content", "path"],
+                    "properties": {"content": {"type": "string"}, "path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
                 "http_fetch",
                 "Perform a bounded HTTP GET to an allow-listed host.",
                 json!({
@@ -1023,6 +1086,60 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "search_index" => {
+                ensure_allowed_keys(&call.args, &["path", "query"])?;
+                let path = required_path(&call.args, "path")?;
+                let query = required_string(&call.args, "query")?;
+                if query.len() > 512 {
+                    bail!("search query is too long");
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!(
+                    "search index {} query_sha256={}",
+                    path.display(),
+                    short_hash(&query)
+                );
+                Ok(assessment)
+            }
+            "save_snapshot" => {
+                ensure_allowed_keys(&call.args, &["content", "path"])?;
+                let content = required_string(&call.args, "content")?;
+                if content.len() > sandbox.max_write_bytes {
+                    bail!("snapshot content exceeds configured limit");
+                }
+                let path = required_path(&call.args, "path")?;
+                let mut assessment = ToolAssessment::new(Risk::Reversible)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::Reversible,
+                    ))
+                    .write(path.clone());
+                assessment.preview = format!(
+                    "snapshot {} bytes={} sha256={}",
+                    path.display(),
+                    content.len(),
+                    short_hash(&content)
+                );
+                Ok(assessment)
+            }
+            "read_feed" => {
+                ensure_allowed_keys(&call.args, &["url"])?;
+                let url = required_string(&call.args, "url")?;
+                let host = checked_http_host(sandbox, &url)?;
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::ExternalRead,
+                        Reversibility::NoEffect,
+                    ))
+                    .host(host);
+                assessment.preview = format!("read_feed {}", url_preview(&url));
+                Ok(assessment)
+            }
             "http_fetch" => {
                 ensure_allowed_keys(&call.args, &["url"])?;
                 let url = required_string(&call.args, "url")?;
@@ -1198,6 +1315,9 @@ impl ToolExecutor for Toolkit {
             "read_slice" => execute_slice(action).await,
             "replace_in_files" => execute_replace(action).await,
             "write_file" => execute_write(action).await,
+            "search_index" => execute_search_index(action).await,
+            "read_feed" => execute_feed(action).await,
+            "save_snapshot" => execute_snapshot(action).await,
             "http_fetch" => execute_http(action).await,
             "git_diff" => execute_command(action, self.runtime.as_deref()).await,
             "run_command" => execute_command(action, self.runtime.as_deref()).await,
@@ -1761,6 +1881,126 @@ where
         bail!("command output exceeds configured limit");
     }
     Ok(output)
+}
+
+async fn execute_search_index(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified index missing"))?;
+    let query = required_string(&action.call().args, "query")?.to_ascii_lowercase();
+    let content = read_bounded(path, action.sandbox().max_tool_output_bytes).await?;
+    let mut matches = Vec::new();
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+        let text = value.get("text").and_then(Value::as_str).unwrap_or("");
+        if title.to_ascii_lowercase().contains(&query) || text.to_ascii_lowercase().contains(&query)
+        {
+            matches.push(format!(
+                "{title}: {}",
+                text.chars().take(240).collect::<String>()
+            ));
+        }
+        if matches.len() >= MAX_SEARCH_RESULTS {
+            break;
+        }
+    }
+    Ok(ToolOutput::evidenced(
+        matches.join("\n"),
+        format!("index:{}", short_hash(&query)),
+    ))
+}
+
+async fn execute_feed(action: &VerifiedAction) -> Result<ToolOutput> {
+    let body = fetch_checked_text(action).await?;
+    let mut entries = Vec::new();
+    for marker in ["<title>", "<link>"] {
+        for value in xml_values(&body, marker) {
+            entries.push(format!(
+                "{}{}",
+                marker.trim_start_matches('<').trim_end_matches('>'),
+                value
+            ));
+            if entries.len() >= MAX_SEARCH_RESULTS {
+                break;
+            }
+        }
+    }
+    Ok(ToolOutput::evidenced(
+        entries.join("\n"),
+        format!(
+            "feed:{}",
+            action
+                .resources()
+                .hosts
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        ),
+    ))
+}
+
+async fn execute_snapshot(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .write_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified snapshot path missing"))?;
+    let body = pangu_core::redact_text(&required_string(&action.call().args, "content")?);
+    if body.len() > action.sandbox().max_write_bytes {
+        bail!("snapshot content exceeds configured limit");
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("snapshot path has no parent"))?;
+    if !parent.is_dir() {
+        bail!("snapshot parent directory does not exist");
+    }
+    tokio::fs::write(path, body.as_bytes()).await?;
+    Ok(ToolOutput::evidenced(
+        format!("saved {} bytes", body.len()),
+        format!("snapshot:{}", path.display()),
+    ))
+}
+
+fn xml_values(input: &str, marker: &str) -> Vec<String> {
+    let end = marker.replace('<', "</");
+    input
+        .match_indices(marker)
+        .filter_map(|(start, _)| {
+            let from = start + marker.len();
+            let to = input[from..].find(&end)? + from;
+            Some(input[from..to].trim().chars().take(240).collect())
+        })
+        .take(MAX_SEARCH_RESULTS)
+        .collect()
+}
+
+fn checked_http_host(sandbox: &Sandbox, raw_url: &str) -> Result<String> {
+    if raw_url.len() > 2_048 {
+        bail!("URL is too long");
+    }
+    let checked = sandbox.check_url(raw_url).map_err(|error| anyhow!(error))?;
+    let parsed = url::Url::parse(&checked).map_err(|_| anyhow!("invalid URL"))?;
+    let host_name = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("URL has no host"))?
+        .to_ascii_lowercase();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    Ok(if host_name.contains(':') {
+        format!("[{host_name}]:{port}")
+    } else {
+        format!("{host_name}:{port}")
+    })
+}
+
+async fn fetch_checked_text(action: &VerifiedAction) -> Result<String> {
+    let output = execute_http(action).await?;
+    Ok(pangu_core::redact_text(&output.content))
 }
 
 async fn execute_http(action: &VerifiedAction) -> Result<ToolOutput> {

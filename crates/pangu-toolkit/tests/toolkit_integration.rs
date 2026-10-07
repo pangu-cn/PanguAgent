@@ -226,6 +226,33 @@ async fn filesystem_batch_tools_stay_inside_verified_paths() {
 }
 
 #[tokio::test]
+async fn local_search_index_does_not_contact_a_provider() {
+    let root = temp_root("search-index");
+    std::fs::write(
+        root.join("index.jsonl"),
+        "{\"title\":\"Boundary\",\"text\":\"sandbox token=secret\"}\n{\"title\":\"Other\",\"text\":\"unrelated\"}\n",
+    )
+    .expect("index");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new(
+                "search_index",
+                json!({"path": "index.jsonl", "query": "boundary"}),
+            )]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    assert!(!rendered.contains("token=secret"), "{rendered}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn traversal_and_forbidden_paths_are_blocked_before_tool_execution() {
     let root = temp_root("blocked-paths");
     let outside = root.with_extension("outside.txt");

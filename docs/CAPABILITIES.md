@@ -186,6 +186,18 @@ RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
 
 这四项与 `read_file`、`write_file` 互补，不扩大可读或可写根。批量替换没有通配符，也不支持正则，避免一次调用隐式扩大写入面。多格式转换尚未实现；在转换后的字节边界、编码失败和审计摘要有明确规则前，不把它描述成已支持。
 
+## 3c. 受控检索
+
+外部搜索 MCP 可以把查询发给第三方，也可以抓取任意站点。这里不接入 Tavily、Firecrawl 或 Serper，而是提供三个边界不同的原生工具：
+
+| 工具 | 网络 | 边界 |
+|------|------|------|
+| `search_index` | 不访问网络 | 搜索工作区内的 JSONL 本地索引；查询和结果都走现有脱敏 |
+| `read_feed` | 仅白名单 URL | 读取一个 RSS/Atom 地址的标题和链接，复用 `http_fetch` 的 URL 与主机检查 |
+| `save_snapshot` | 不访问网络 | 保存调用方提供的已获取文本；写入前再次脱敏并受写入上限约束 |
+
+没有“搜索整个互联网”的工具。任意站点抓取必须先由操作者把主机写入 allow-list，再使用 `http_fetch` 或 `read_feed`。
+
 ## 4. MCP 协议支持
 
 分两部分实现：
