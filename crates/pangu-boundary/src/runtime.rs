@@ -267,7 +267,18 @@ impl RuntimeConfig {
     }
 
     fn resolve_explicit_with(&self, kind: SandboxRuntime) -> Runtime {
-        let probe = self.probe(kind);
+        let probe = match safe_mount_source(&host_mount_path(&self.workspace)) {
+            Ok(_) => self.probe(kind),
+            Err(reason) => RuntimeProbe::Unusable {
+                reason: format!(
+                    "workspace `{}` cannot be mounted safely: {reason}",
+                    host_mount_path(&self.workspace)
+                ),
+                remedy: "use a workspace path without ':' or ',' so the runtime mount argument \
+                         cannot be reinterpreted"
+                    .into(),
+            },
+        };
         let (launcher, workspace_mount) = match &probe {
             RuntimeProbe::Usable { .. } => {
                 let (program, args, mount) = self.build_command(kind);
@@ -313,7 +324,8 @@ impl RuntimeConfig {
     /// probe is invoked identically when it matters. Two separate argv builders
     /// would let a probe succeed under arguments the real path never uses.
     fn build_command(&self, kind: SandboxRuntime) -> (String, Vec<String>, Option<String>) {
-        let host_mount = host_mount_path(&self.workspace);
+        let host_mount = safe_mount_source(&host_mount_path(&self.workspace))
+            .expect("an unsafe mount path is refused before a command is built");
         match kind {
             SandboxRuntime::Local | SandboxRuntime::Auto => (String::new(), Vec::new(), None),
             SandboxRuntime::Firecracker => (
@@ -647,6 +659,36 @@ fn host_mount_path(workspace: &Path) -> String {
     strip_verbatim(&workspace.display().to_string())
 }
 
+/// Reject a mount source that would change the meaning of a runtime argument.
+///
+/// Docker's `--volume` and gVisor's `--bind` use `source:target[:option...]`.
+/// A Windows drive prefix is legitimate and is the first `X:` only; any later
+/// colon starts another field. A comma starts a mount option in both syntaxes.
+/// Interpolating either would silently mount a different source, target, or
+/// option set. The path is operator configuration rather than model input, but
+/// a misconfigured path must still fail instead of changing the sandbox boundary.
+fn safe_mount_source(path: &str) -> std::result::Result<String, &'static str> {
+    let after_drive = windows_drive_prefix(path)
+        .map(|prefix_len| &path[prefix_len..])
+        .unwrap_or(path);
+    if after_drive.contains([':', ',']) {
+        Err("workspace path contains a mount separator")
+    } else {
+        Ok(path.to_string())
+    }
+}
+
+/// The length of a Windows drive prefix (`C:`), when `path` has one.
+fn windows_drive_prefix(path: &str) -> Option<usize> {
+    let mut chars = path.chars();
+    let drive = chars.next()?;
+    if drive.is_ascii_alphabetic() && chars.next() == Some(':') {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 /// Run a probe command with a bounded wait, returning its combined output.
 fn run_probe(argv: &[String]) -> std::result::Result<String, String> {
     let (program, args) = argv.split_first().ok_or("empty probe command")?;
@@ -707,6 +749,40 @@ mod tests {
     /// version of this test asserted Windows semantics on Linux and failed
     /// there. The function's contract is about the *text* it produces, so this
     /// checks that text on every platform.
+    #[test]
+    fn a_mount_source_may_have_one_windows_drive_prefix_but_no_later_separator() {
+        assert_eq!(
+            safe_mount_source(r"C:\work\ws").as_deref(),
+            Ok(r"C:\work\ws")
+        );
+        assert_eq!(safe_mount_source("/work/ws").as_deref(), Ok("/work/ws"));
+        assert!(
+            safe_mount_source(r"C:\work\unsafe:path").is_err(),
+            "a colon after the drive prefix starts another mount field"
+        );
+        assert!(
+            safe_mount_source("/work/unsafe,path").is_err(),
+            "a comma starts a mount option"
+        );
+        assert_eq!(
+            safe_mount_source(r"\\server\share\ws").as_deref(),
+            Ok(r"\\server\share\ws"),
+            "backslashes are path separators, not mount-field separators"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_workspace_path_refuses_the_runtime_before_probing() {
+        let mut config = config(SandboxRuntime::Oci);
+        config.workspace = PathBuf::from(r"C:\work\unsafe,path");
+        let runtime = config.resolve();
+        assert!(
+            !runtime.allows_execution(),
+            "a path that changes mount syntax must not become a usable runtime"
+        );
+        assert!(runtime.launcher().is_none());
+    }
+
     #[test]
     fn a_verbatim_host_path_is_not_handed_to_the_runtime() {
         assert_eq!(strip_verbatim(r"\\?\C:\work\ws"), r"C:\work\ws");

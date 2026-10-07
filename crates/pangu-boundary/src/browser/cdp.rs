@@ -210,7 +210,14 @@ impl BrowserSession {
     /// Navigate the page, waiting for the load event.
     pub fn navigate(&mut self, url: &str) -> Result<()> {
         self.call("Page.enable", json!({}))?;
-        self.call("Page.navigate", json!({"url": url}))?;
+        let result = self.call("Page.navigate", json!({"url": url}))?;
+        // Chromium reports a failed navigation inside a successful CDP result,
+        // as `errorText`, rather than as a protocol error. Waiting for the load
+        // event after that reports "the page did not finish loading" and throws
+        // away the real reason.
+        if let Some(error) = navigation_error_text(&result) {
+            return Err(Error::Other(format!("navigation failed: {error}")));
+        }
         self.wait_for_load()?;
         Ok(())
     }
@@ -424,6 +431,19 @@ impl BrowserSession {
 /// reaches this path; compromising the socket first is not required.
 fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
     id.filter(|id| *id < next_id)
+}
+
+/// The navigation failure carried inside an otherwise successful CDP result.
+///
+/// `Page.navigate` returns `{"result":{"frameId":"...","errorText":"net::ERR_..."}}`
+/// when the URL cannot be loaded. An empty or whitespace-only value is not a
+/// failure: a successful result has no `errorText`.
+fn navigation_error_text(result: &Value) -> Option<&str> {
+    result
+        .get("errorText")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }
 
 /// Turn a CDP reply into a result or an error.
@@ -686,6 +706,25 @@ mod tests {
         assert_eq!(retainable_reply_id(Some(3), 3), None);
         assert_eq!(retainable_reply_id(Some(u64::MAX), 3), None);
         assert_eq!(retainable_reply_id(None, 3), None);
+    }
+
+    #[test]
+    fn a_navigation_result_keeps_its_error_text() {
+        let failed = json!({"frameId": "abc", "errorText": "net::ERR_NAME_NOT_RESOLVED"});
+        assert_eq!(
+            navigation_error_text(&failed),
+            Some("net::ERR_NAME_NOT_RESOLVED")
+        );
+        assert_eq!(
+            navigation_error_text(&json!({"frameId": "abc"})),
+            None,
+            "a result without errorText loaded successfully"
+        );
+        assert_eq!(
+            navigation_error_text(&json!({"errorText": "   "})),
+            None,
+            "whitespace is not a navigation failure"
+        );
     }
 
     #[test]
