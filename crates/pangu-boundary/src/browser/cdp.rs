@@ -1002,9 +1002,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
         #[cfg(unix)]
         {
-            let linked = std::env::temp_dir()
-                .join("pangu-browser")
-                .join(format!("link-{}", std::process::id()));
+            let link_root = std::env::temp_dir().join("pangu-browser");
+            std::fs::create_dir_all(&link_root).expect("link root");
+            let linked = link_root.join(format!("link-{}", std::process::id()));
             let target =
                 std::env::temp_dir().join(format!("pangu-link-target-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&target);
@@ -1015,9 +1015,7 @@ mod tests {
             assert!(refused.is_err(), "a profile symlink must not be followed");
             let _ = std::fs::remove_file(linked);
             let _ = std::fs::remove_dir_all(target);
-            let parent_link = std::env::temp_dir()
-                .join("pangu-browser")
-                .join(format!("parent-link-{}", std::process::id()));
+            let parent_link = link_root.join(format!("parent-link-{}", std::process::id()));
             let parent_target =
                 std::env::temp_dir().join(format!("pangu-parent-target-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&parent_target);
