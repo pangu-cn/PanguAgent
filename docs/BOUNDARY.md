@@ -212,14 +212,14 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 
 关于 `profile`：
 
-- **声明不是验证**。Pangu 不启动、不管理、不验证 `profile` 所声称的后端；从进程内部看它们与 local 无法区分。声明只进入 contract（digest 仅在声明时携带）、`RunStarted` 审计载荷和 `doctor`/`explain` 输出。
+- **声明不是验证**。Pangu 不启动、不管理、不验证 `profile` 所声称的后端；从进程内部看它们与 local 无法区分。声明进入 contract、`RunStarted` 审计载荷和 `doctor`/`explain` 输出；digest 仅在声明时携带。
 - **声明不改变任何闸门**。L1–L4 在所有 profile 下逐位相同。
 - 各 profile 的真实保护范围由 `doctor`/`explain` 引用固定话术陈述（见 `ExecutionProfile::scope_statement`）；修改话术与修改代码同等对待。
 - 提醒部署者：checkpoint 的 Artifact store 存在于声明的后端内；container/remote profile 下应确保 artifact_root 位于持久化存储，否则后端被替换时恢复点随之丢失。
 
 关于 `runtime`（F8，与上面的声明分开）：
 
-- **这是强制字段**。声明非 `local` 后，Pangu 会真正启动该运行时并在其中执行命令，而不是只写一行日志。
+- **这是强制字段**。声明非 `local` 后，Pangu 会真正启动该运行时并在其中执行命令，而不是只写一行日志。`runtime`、`image`、`network`、`memory_mib`、`cpus` 都进入 boundary digest 与 contract digest；只记录 `profile` 会让 Docker、gVisor 和未启用运行时得到同一个摘要。
 - **探测后才可用**：只看二进制是否存在不够，必须在沙箱里真正跑通一条命令。探测报告的是**观察到的行为**，不是无法支撑的安全断言。
 - **fail-closed，无宿主机退回**：探测失败即**拒绝执行命令**。理由见下条。
 - **为什么没有退回**：运行记录里写着操作者声明的运行时，实际却在宿主机上跑，会让这条记录变成假的——操作者会以为自己拥有并不存在的隔离。`local` 仍然可用且诚实，但必须是主动选择的，不能是失败后的兜底。

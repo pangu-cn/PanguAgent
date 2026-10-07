@@ -572,10 +572,7 @@ impl GoalContract {
             if let Some(object) = value.as_object_mut() {
                 object.insert(
                     "execution".into(),
-                    serde_json::json!({
-                        "profile": self.execution.profile.as_str(),
-                        "description": &self.execution.description,
-                    }),
+                    crate::config::execution_digest_value(&self.execution),
                 );
             }
         }

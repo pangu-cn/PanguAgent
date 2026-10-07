@@ -1490,18 +1490,34 @@ impl Config {
         // backend is part of the effective boundary claims.
         if self.execution.is_declared() {
             if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "execution".into(),
-                    serde_json::json!({
-                        "profile": self.execution.profile.as_str(),
-                        "description": &self.execution.description,
-                    }),
-                );
+                object.insert("execution".into(), execution_digest_value(&self.execution));
             }
         }
         pangu_core::hex_sha256(&serde_json::to_string(&value).unwrap_or_default())
     }
+}
 
+/// The execution fields that can change what a run is allowed to do.
+///
+/// `profile` is the operator's declaration. `runtime`, `image`, `network`,
+/// `memory_mib`, and `cpus` are what enforcement actually uses. Leaving the
+/// latter out made Docker, gVisor, and no runtime at all produce one digest as
+/// long as the profile text stayed `container`.
+pub(crate) fn execution_digest_value(
+    execution: &crate::execution::ExecutionSection,
+) -> serde_json::Value {
+    serde_json::json!({
+        "profile": execution.profile.as_str(),
+        "description": &execution.description,
+        "runtime": execution.runtime.as_str(),
+        "image": &execution.image,
+        "network": execution.network,
+        "memory_mib": execution.memory_mib,
+        "cpus": execution.cpus,
+    })
+}
+
+impl Config {
     pub fn explain(&self) -> String {
         let plan_line = if self.goal.plan_first {
             "plan_first      : true — run starts read-only; the model's `begin_act` control call starts the act phase\n"
@@ -2245,6 +2261,15 @@ mod tests {
         declared.execution.description = Some("docker:ubuntu-24.04".into());
         declared.validate().unwrap();
         assert_ne!(declared.boundary_digest(), kept.boundary_digest());
+        let mut other_runtime = declared.clone();
+        other_runtime.execution.runtime = crate::runtime::SandboxRuntime::Gvisor;
+        other_runtime.execution.image = Some("alpine:3.20".into());
+        other_runtime.validate().unwrap();
+        assert_ne!(
+            other_runtime.boundary_digest(),
+            declared.boundary_digest(),
+            "changing the enforced runtime must change the boundary digest"
+        );
     }
 
     #[test]
@@ -2387,6 +2412,15 @@ control"
         undeclared_config.execution = crate::execution::ExecutionSection::default();
         let undeclared = GoalContract::from_config("c5", &undeclared_config).unwrap();
         assert_ne!(contract.digest(), undeclared.digest());
+        let mut other_runtime = config.clone();
+        other_runtime.execution.runtime = crate::runtime::SandboxRuntime::Oci;
+        other_runtime.execution.image = Some("alpine:3.20".into());
+        let other = GoalContract::from_config("c5", &other_runtime).unwrap();
+        assert_ne!(
+            contract.digest(),
+            other.digest(),
+            "the contract digest must distinguish the runtime that is actually enforced"
+        );
     }
 
     #[test]
