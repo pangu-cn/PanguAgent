@@ -180,6 +180,52 @@ async fn workspace_tools_execute_through_the_verified_action_chain() {
 }
 
 #[tokio::test]
+async fn filesystem_batch_tools_stay_inside_verified_paths() {
+    let root = temp_root("filesystem-batch");
+    std::fs::create_dir(root.join("nested")).expect("nested");
+    std::fs::write(root.join("nested/a.txt"), "alpha NEEDLE tail").expect("seed a");
+    std::fs::write(root.join("nested/b.txt"), "beta only").expect("seed b");
+
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![
+                ToolCall::new("walk_files", json!({"path": "."})),
+                ToolCall::new("dir_tree", json!({"path": "."})),
+                ToolCall::new(
+                    "read_slice",
+                    json!({"path": "nested/a.txt", "offset": 6, "length": 6}),
+                ),
+                ToolCall::new(
+                    "replace_in_files",
+                    json!({
+                        "paths": ["nested/a.txt", "nested/b.txt"],
+                        "find": "NEEDLE",
+                        "replace": "THREAD"
+                    }),
+                ),
+            ]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/a.txt")).expect("replaced"),
+        "alpha THREAD tail"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/b.txt")).expect("untouched"),
+        "beta only"
+    );
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("NEEDLE"), "{rendered}");
+    assert!(rendered.contains("nested"), "{rendered}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn traversal_and_forbidden_paths_are_blocked_before_tool_execution() {
     let root = temp_root("blocked-paths");
     let outside = root.with_extension("outside.txt");

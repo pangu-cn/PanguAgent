@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 use pangu_agent::{
     Capability, CapabilityManifest, EffectDescriptor, EffectScope, Reversibility, ToolAssessment,
@@ -196,6 +196,50 @@ impl Toolkit {
                 effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
                 reads: vec!["workspace".into()],
                 writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "walk_files".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "dir_tree".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "read_slice".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "replace_in_files".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: vec!["workspace".into()],
+                writes: vec!["workspace".into()],
                 hosts: empty(),
                 processes: empty(),
                 timeout_ms: None,
@@ -683,6 +727,54 @@ impl ToolExecutor for Toolkit {
                 }),
             ),
             ToolSpec::new(
+                "walk_files",
+                "List regular files below a readable directory. Symbolic links are skipped.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
+                "dir_tree",
+                "Show the structure of a readable directory. Symbolic links are skipped.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
+                "read_slice",
+                "Read one bounded byte range from a readable UTF-8 file.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "offset", "length"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "integer", "minimum": 0},
+                        "length": {"type": "integer", "minimum": 1}
+                    }
+                }),
+            ),
+            ToolSpec::new(
+                "replace_in_files",
+                "Replace one literal string in explicitly named writable files.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["paths", "find", "replace"],
+                    "properties": {
+                        "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "find": {"type": "string", "minLength": 1},
+                        "replace": {"type": "string"}
+                    }
+                }),
+            ),
+            ToolSpec::new(
                 "write_file",
                 "Create or replace a UTF-8 file inside a writable root.",
                 json!({
@@ -848,6 +940,65 @@ impl ToolExecutor for Toolkit {
                     "search {} query_sha256={}",
                     path.display(),
                     short_hash(&query)
+                );
+                Ok(assessment)
+            }
+            "walk_files" | "dir_tree" => {
+                ensure_allowed_keys(&call.args, &["path"])?;
+                let path = required_path(&call.args, "path")?;
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!("{} {}", call.name, path.display());
+                Ok(assessment)
+            }
+            "read_slice" => {
+                ensure_allowed_keys(&call.args, &["path", "offset", "length"])?;
+                let path = required_path(&call.args, "path")?;
+                let offset = required_u64(&call.args, "offset")?;
+                let length = required_u64(&call.args, "length")?;
+                if length == 0 || length > sandbox.max_tool_output_bytes as u64 {
+                    bail!("slice length exceeds configured output limit");
+                }
+                if offset.saturating_add(length) > 1024 * 1024 * 1024 {
+                    bail!("slice range is too large");
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview =
+                    format!("slice {} offset={offset} length={length}", path.display());
+                Ok(assessment)
+            }
+            "replace_in_files" => {
+                ensure_allowed_keys(&call.args, &["paths", "find", "replace"])?;
+                let paths = required_paths(&call.args, "paths")?;
+                let find = required_string(&call.args, "find")?;
+                let replacement = required_string(&call.args, "replace")?;
+                if paths.is_empty()
+                    || find.is_empty()
+                    || find.len() > 4_096
+                    || replacement.len() > sandbox.max_write_bytes
+                {
+                    bail!("replacement text exceeds configured limits");
+                }
+                let mut assessment = ToolAssessment::new(Risk::Reversible).with_effect(
+                    EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                );
+                for path in paths {
+                    assessment = assessment.read(path.clone()).write(path);
+                }
+                assessment.preview = format!(
+                    "replace {} files find_sha256={} replace_sha256={}",
+                    assessment.write_paths.len(),
+                    short_hash(&find),
+                    short_hash(&replacement)
                 );
                 Ok(assessment)
             }
@@ -1042,6 +1193,10 @@ impl ToolExecutor for Toolkit {
             "read_file" => execute_read(action).await,
             "list_dir" => execute_list(action).await,
             "search" => execute_search(action).await,
+            "walk_files" => execute_walk(action).await,
+            "dir_tree" => execute_tree(action).await,
+            "read_slice" => execute_slice(action).await,
+            "replace_in_files" => execute_replace(action).await,
             "write_file" => execute_write(action).await,
             "http_fetch" => execute_http(action).await,
             "git_diff" => execute_command(action, self.runtime.as_deref()).await,
@@ -1354,6 +1509,174 @@ fn search_tree<'a>(
         }
         Ok(())
     })
+}
+
+async fn execute_walk(action: &VerifiedAction) -> Result<ToolOutput> {
+    let root = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified walk root missing"))?;
+    let mut files = Vec::new();
+    collect_files(action.sandbox(), root, &mut files, 0).await?;
+    Ok(ToolOutput::evidenced(
+        files.join("\n"),
+        format!("walk:{}", root.display()),
+    ))
+}
+
+async fn execute_tree(action: &VerifiedAction) -> Result<ToolOutput> {
+    let root = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified tree root missing"))?;
+    let mut lines = Vec::new();
+    collect_tree(action.sandbox(), root, &mut lines, 0).await?;
+    Ok(ToolOutput::evidenced(
+        lines.join("\n"),
+        format!("tree:{}", root.display()),
+    ))
+}
+
+async fn execute_slice(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified slice path missing"))?;
+    let offset = required_u64(&action.call().args, "offset")?;
+    let length = required_u64(&action.call().args, "length")?;
+    if length == 0 || length > action.sandbox().max_tool_output_bytes as u64 {
+        bail!("slice length exceeds configured output limit");
+    }
+    let length = length as usize;
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("slice target must be a regular file");
+    }
+    if offset > metadata.len() {
+        bail!("slice offset is past the end of the file");
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut bytes = vec![0; length];
+    let read = file.read(&mut bytes).await?;
+    bytes.truncate(read);
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    Ok(ToolOutput::evidenced(
+        text,
+        format!("slice:{}:{offset}:{read}", path.display()),
+    ))
+}
+
+async fn execute_replace(action: &VerifiedAction) -> Result<ToolOutput> {
+    let find = required_string(&action.call().args, "find")?;
+    let replacement = required_string(&action.call().args, "replace")?;
+    if find.is_empty() || replacement.len() > action.sandbox().max_write_bytes {
+        bail!("replacement text exceeds configured limits");
+    }
+    let mut changed = 0usize;
+    for path in &action.resources().write_paths {
+        let metadata = tokio::fs::symlink_metadata(path).await?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("replacement target must be a regular file");
+        }
+        let content = read_bounded(path, action.sandbox().max_tool_output_bytes).await?;
+        if !content.contains(&find) {
+            continue;
+        }
+        let next = content.replace(&find, &replacement);
+        if next.len() > action.sandbox().max_write_bytes {
+            bail!("replacement exceeds configured write limit");
+        }
+        tokio::fs::write(path, next).await?;
+        changed += 1;
+    }
+    Ok(ToolOutput::evidenced(
+        format!("replaced {changed} files"),
+        format!("replace:{changed}"),
+    ))
+}
+
+fn collect_files<'a>(
+    sandbox: &'a Sandbox,
+    root: &'a Path,
+    files: &'a mut Vec<String>,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > 32 || files.len() >= MAX_LIST_ENTRIES {
+            return Ok(());
+        }
+        let mut entries = tokio::fs::read_dir(root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !sandbox.resolve_read(&path).is_allowed() {
+                continue;
+            }
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                collect_files(sandbox, &path, files, depth + 1).await?;
+            } else if metadata.is_file() {
+                files.push(path.display().to_string());
+            }
+        }
+        Ok(())
+    })
+}
+
+fn collect_tree<'a>(
+    sandbox: &'a Sandbox,
+    root: &'a Path,
+    lines: &'a mut Vec<String>,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > 32 || lines.len() >= MAX_LIST_ENTRIES {
+            return Ok(());
+        }
+        let mut entries = tokio::fs::read_dir(root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !sandbox.resolve_read(&path).is_allowed() {
+                continue;
+            }
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            let prefix = "  ".repeat(depth);
+            lines.push(format!("{prefix}{}", entry.file_name().to_string_lossy()));
+            if metadata.is_dir() {
+                collect_tree(sandbox, &path, lines, depth + 1).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn required_paths(args: &Value, key: &str) -> Result<Vec<PathBuf>> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("`{key}` must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("`{key}` must contain strings"))
+        })
+        .collect()
+}
+
+fn required_u64(args: &Value, key: &str) -> Result<u64> {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("`{key}` must be an unsigned integer"))
 }
 
 async fn execute_write(action: &VerifiedAction) -> Result<ToolOutput> {

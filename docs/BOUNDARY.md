@@ -90,7 +90,8 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 
 `goal.plan_first = true` 时，运行从只读 plan 阶段开始：
 
-- plan 阶段中，风险高于 `read_only` 的动作在任何闸门前被拒绝，并回灌指向 `begin_act` 的错误信息；只读探索（`read_file`/`list_dir`/`search`/`git_diff`）不受影响。
+- plan 阶段中，风险高于 `read_only` 的动作在任何闸门前被拒绝，并回灌指向 `begin_act` 的错误信息；只读探索（`read_file`/`list_dir`/`search`/`walk_files`/`dir_tree`/`read_slice`/`git_diff`）不受影响。
+- `walk_files` 与 `dir_tree` 只从 L3 已验证的目录出发，递归时再次检查每个子路径并跳过符号链接。`read_slice` 只读取已验证普通文件中的一个有界字节区间。`replace_in_files` 只修改调用中显式列出、且逐个通过 L3 写入校验的普通文件；它不按目录或通配符扩展写入目标。
 - `begin_act` 是 agent 拥有的控制调用（与 `finish` 同类）：不执行任何动作、不过任何闸门、只结束只读阶段并发 `PhaseChanged` 事件。它不是授权——act 阶段的每个变更动作仍逐项经过 L1–L4。
 - 阶段规则冻结进 `GoalContract`（digest 仅在启用时携带，保持既有 digest 稳定）；模型不能更改、不能重入、不能以重试绕过。
 - `write_file` 的审批请求携带有界、脱敏的 unified diff；无法内联时明确说明原因（非 UTF-8、过大、不可读），不伪造 diff。
