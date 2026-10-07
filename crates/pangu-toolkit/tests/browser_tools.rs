@@ -19,6 +19,31 @@ use pangu_agent::ToolExecutor;
 use pangu_boundary::{Config, Sandbox};
 use pangu_toolkit::Toolkit;
 
+/// A browser config that points at a path, without requiring a browser to exist.
+///
+/// These tests exercise `assess`, which validates the URL and the arguments and
+/// refuses **before** anything is launched. Gating them on
+/// `find_executable().is_some()` made them silently pass on any machine without a
+/// browser — reporting "ok" while testing nothing, which is the failure mode this
+/// whole file exists to avoid.
+///
+/// The path does not have to be a real browser for a rejection to be testable:
+/// `assess` never runs it. Tests that actually launch a browser live in
+/// `pangu-boundary/tests/browser_cdp.rs`, where a missing browser is a loud
+/// failure rather than a skip.
+fn config_at(root: &std::path::Path) -> pangu_boundary::browser::BrowserConfig {
+    pangu_boundary::browser::BrowserConfig {
+        executable: std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\nonexistent\chrome.exe"
+        } else {
+            "/nonexistent/chrome"
+        }),
+        profile_dir: root.join("profile"),
+        network: false,
+        extra_args: Vec::new(),
+    }
+}
+
 fn sandbox_for(root: &std::path::Path) -> Sandbox {
     let mut config = Config::embedded().expect("embedded");
     config.boundary.workspace = root.to_path_buf();
@@ -122,20 +147,10 @@ async fn a_browser_call_without_a_browser_is_refused_before_execution() {
 /// a page could load from a host the operator never allowed.
 #[tokio::test]
 async fn navigation_to_a_host_outside_the_boundary_is_refused() {
-    if pangu_boundary::browser::BrowserConfig::find_executable().is_none() {
-        // Without a browser the config cannot be built; the mapping test still
-        // covers the classification, so skip rather than report a false pass.
-        eprintln!("skipped: no browser installed, cannot build a browser config");
-        return;
-    }
     let root = temp_root("host");
     let sandbox = sandbox_for(&root);
-    let config = pangu_boundary::browser::BrowserConfig {
-        executable: pangu_boundary::browser::BrowserConfig::find_executable().expect("checked"),
-        profile_dir: root.join("profile"),
-        network: false,
-        extra_args: Vec::new(),
-    };
+    let config = config_at(&root);
+
     let toolkit = Toolkit::new().with_browser(config, root.join("artifacts"));
 
     // The embedded config allows no hosts, so any navigation must be refused by
@@ -162,18 +177,10 @@ async fn navigation_to_a_host_outside_the_boundary_is_refused() {
 /// A non-http scheme is refused: `file:` would read the host filesystem.
 #[tokio::test]
 async fn a_file_url_is_refused() {
-    if pangu_boundary::browser::BrowserConfig::find_executable().is_none() {
-        eprintln!("skipped: no browser installed");
-        return;
-    }
     let root = temp_root("scheme");
     let sandbox = sandbox_for(&root);
-    let config = pangu_boundary::browser::BrowserConfig {
-        executable: pangu_boundary::browser::BrowserConfig::find_executable().expect("checked"),
-        profile_dir: root.join("profile"),
-        network: false,
-        extra_args: Vec::new(),
-    };
+    let config = config_at(&root);
+
     let toolkit = Toolkit::new().with_browser(config, root.join("artifacts"));
 
     let call = pangu_core::ToolCall::new(
@@ -194,18 +201,10 @@ async fn a_file_url_is_refused() {
 /// An unexpected argument is refused rather than ignored.
 #[tokio::test]
 async fn unknown_arguments_are_refused() {
-    if pangu_boundary::browser::BrowserConfig::find_executable().is_none() {
-        eprintln!("skipped: no browser installed");
-        return;
-    }
     let root = temp_root("args");
     let sandbox = sandbox_for(&root);
-    let config = pangu_boundary::browser::BrowserConfig {
-        executable: pangu_boundary::browser::BrowserConfig::find_executable().expect("checked"),
-        profile_dir: root.join("profile"),
-        network: false,
-        extra_args: Vec::new(),
-    };
+    let config = config_at(&root);
+
     let toolkit = Toolkit::new().with_browser(config, root.join("artifacts"));
 
     // Silently ignoring an unexpected argument would mean the model's stated
