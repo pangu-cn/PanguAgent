@@ -473,20 +473,39 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
 }
 
 pub(crate) fn create_private_profile_dir(path: &std::path::Path) -> Result<()> {
+    let temp = std::env::temp_dir();
     let mut current = std::path::PathBuf::new();
     for component in path.components() {
         current.push(component);
-        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
-            if metadata.file_type().is_symlink() {
-                return Err(Error::Other(format!(
-                    "refusing to use a symlinked browser profile: {}",
-                    current.display()
-                )));
+        if current.starts_with(&temp) && current != temp {
+            if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+                if metadata.file_type().is_symlink() {
+                    return Err(Error::Other(format!(
+                        "refusing to use a symlinked browser profile: {}",
+                        current.display()
+                    )));
+                }
             }
         }
     }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Other(format!(
+                "refusing to use a symlinked browser profile: {}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Error::Other(format!(
+                "cannot create the browser profile root {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
+    builder.recursive(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -959,9 +978,14 @@ mod tests {
 
     #[test]
     fn a_browser_profile_is_private_to_its_owner() {
-        let root = std::env::temp_dir()
-            .join("pangu-browser")
-            .join(format!("private-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "pangu-browser-private-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         create_private_profile_dir(&root).expect("private profile");
         assert!(root.is_dir());
