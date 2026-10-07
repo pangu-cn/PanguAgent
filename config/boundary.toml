@@ -273,5 +273,7 @@ enabled = false
 network = false
 
 # 追加到内置参数之后的额外命令行参数（逐字传入）。
+# 不能覆盖 --remote-debugging-address、--remote-debugging-port 或
+# --remote-debugging-socket；调试端口固定在 127.0.0.1。
 # args = ["--lang=en-US"]
 

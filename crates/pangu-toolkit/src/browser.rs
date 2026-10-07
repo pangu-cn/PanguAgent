@@ -216,6 +216,19 @@ pub fn resolve_config(
             .refusal()
         })?,
     };
+    for argument in &extra_args {
+        let forbidden = [
+            "--remote-debugging-address",
+            "--remote-debugging-port",
+            "--remote-debugging-socket",
+        ];
+        if forbidden
+            .iter()
+            .any(|prefix| argument == prefix || argument.starts_with(&format!("{prefix}=")))
+        {
+            bail!("[browser] args must not override the loopback debugger endpoint: {argument}");
+        }
+    }
     Ok(BrowserConfig {
         executable: resolved,
         profile_dir,
@@ -645,6 +658,21 @@ mod tests {
         assert_eq!(
             required_selector(&json!({"selector": " #go "})).expect("valid"),
             "#go"
+        );
+    }
+
+    #[test]
+    fn debugger_endpoint_overrides_are_refused() {
+        let error = resolve_config(
+            None,
+            std::path::PathBuf::from("/tmp/p"),
+            false,
+            vec!["--remote-debugging-address=0.0.0.0".into()],
+        )
+        .expect_err("must refuse");
+        assert!(
+            error.to_string().contains("must not override the loopback"),
+            "{error}"
         );
     }
 
