@@ -97,6 +97,7 @@ impl BrowserConfig {
             "--no-default-browser-check".to_string(),
             // The endpoint must be a real port so the session can connect.
             "--remote-debugging-port=0".to_string(),
+            "--remote-debugging-address=127.0.0.1".to_string(),
         ];
         if !self.network {
             // `--disable-features=NetworkService` is not used: it disables the
@@ -272,6 +273,9 @@ mod tests {
         assert!(args.iter().any(|a| a == "--headless=new"));
         assert!(args.iter().any(|a| a == "--user-data-dir=/tmp/p"));
         assert!(args.iter().any(|a| a == "--remote-debugging-port=0"));
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--remote-debugging-address=127.0.0.1"));
     }
 
     #[test]

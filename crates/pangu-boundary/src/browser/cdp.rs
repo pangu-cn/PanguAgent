@@ -588,13 +588,15 @@ fn open_tab(endpoint: &str) -> Result<String> {
             .or_else(|_| request_over_http(address, port, "GET", "/json/new?about:blank"))?;
         let parsed: Value = serde_json::from_str(&target)
             .map_err(|error| Error::Other(format!("could not read the new tab reply: {error}")))?;
-        return parsed
+        let url = parsed
             .get("webSocketDebuggerUrl")
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| {
                 Error::Other("the browser opened a tab but returned no debugger URL".into())
-            });
+            })?;
+        require_loopback_websocket(&url)?;
+        return Ok(url);
     }
     Err(Error::Other(format!(
         "the browser endpoint {endpoint} is not a WebSocket URL"
@@ -602,6 +604,26 @@ fn open_tab(endpoint: &str) -> Result<String> {
 }
 
 /// A bounded single-request HTTP call, used only for `/json/new`.
+fn require_loopback_websocket(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("ws://")
+        .ok_or_else(|| Error::Other(format!("unsupported CDP endpoint: {url}")))?;
+    let authority = rest
+        .split_once('/')
+        .map(|(authority, _)| authority)
+        .unwrap_or(rest);
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+        return Err(Error::Other(format!(
+            "refusing a CDP endpoint that is not loopback: {url}"
+        )));
+    }
+    Ok(())
+}
+
 fn request_over_http(address: &str, port: &str, method: &str, path: &str) -> Result<String> {
     let mut stream = TcpStream::connect(format!("{address}:{port}")).map_err(|error| {
         Error::Other(format!("cannot reach the browser's HTTP endpoint: {error}"))
@@ -704,6 +726,7 @@ fn request_over_http(address: &str, port: &str, method: &str, path: &str) -> Res
 
 /// Connect a WebSocket to a CDP endpoint URL.
 fn connect_websocket(url: &str) -> Result<WebSocket> {
+    require_loopback_websocket(url)?;
     let rest = url
         .strip_prefix("ws://")
         .ok_or_else(|| Error::Other(format!("unsupported CDP endpoint: {url}")))?;
@@ -953,6 +976,14 @@ mod tests {
             let _ = std::fs::remove_file(parent_link);
             let _ = std::fs::remove_dir_all(parent_target);
         }
+    }
+
+    #[test]
+    fn a_non_loopback_debugger_url_is_refused() {
+        let error = require_loopback_websocket("ws://10.0.0.8:9222/devtools/page/1")
+            .expect_err("remote debugger");
+        assert!(error.to_string().contains("not loopback"), "{error}");
+        require_loopback_websocket("ws://127.0.0.1:9222/devtools/page/1").expect("loopback");
     }
 
     #[test]
