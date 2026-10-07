@@ -66,15 +66,7 @@ const OTHER_DIGEST: &str = "1111111111111111111111111111111111111111111111111111
 /// Building the whole record in memory and handing it to `write_all` in one call
 /// makes the append atomic, which is what the format actually requires.
 fn record_drill(drill: &str, outcome: &str, detail: &str) {
-    let line = serde_json::json!({
-        "schema": "pangu-f7-drill/1",
-        "drill": drill,
-        "os": std::env::consts::OS,
-        "arch": std::env::consts::ARCH,
-        "commit": std::env::var("PANGU_DRILL_COMMIT").unwrap_or_else(|_| "unknown".into()),
-        "outcome": outcome,
-        "detail": detail,
-    });
+    let line = drill_line(drill, outcome, detail);
     match std::env::var_os("PANGU_DRILL_REPORT") {
         Some(path) => {
             let path = PathBuf::from(path);
@@ -86,20 +78,46 @@ fn record_drill(drill: &str, outcome: &str, detail: &str) {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).expect("drill report directory");
             }
-            // One record, one `write_all`: the newline goes in the same buffer so
-            // there is no window between the record and its terminator.
-            let mut record = line.to_string().into_bytes();
-            record.push(b'\n');
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .expect("open drill report");
-            file.write_all(&record).expect("write drill report line");
-            file.sync_all().expect("flush drill report");
+            append_record(&path, &line);
         }
         None => println!("drill-report: {line}"),
     }
+}
+
+/// Build one record. Split out so it can be tested without an environment
+/// variable.
+fn drill_line(drill: &str, outcome: &str, detail: &str) -> String {
+    serde_json::json!({
+        "schema": "pangu-f7-drill/1",
+        "drill": drill,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "commit": std::env::var("PANGU_DRILL_COMMIT").unwrap_or_else(|_| "unknown".into()),
+        "outcome": outcome,
+        "detail": detail,
+    })
+    .to_string()
+}
+
+/// Append one record to `path` atomically.
+///
+/// The newline goes into the same buffer, so there is no window between the
+/// record and its terminator. Takes the path explicitly rather than reading
+/// `PANGU_DRILL_REPORT`: the concurrency test needs several threads writing to a
+/// file of its own, and `std::env::set_var` is process-global — an earlier
+/// version of that test set the variable and consequently captured the seven
+/// real drills running in parallel beside it, which made CI see 647 lines
+/// instead of 640.
+fn append_record(path: &Path, line: &str) {
+    let mut record = line.as_bytes().to_vec();
+    record.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open drill report");
+    file.write_all(&record).expect("write drill report line");
+    file.sync_all().expect("flush drill report");
 }
 
 /// A change detector for a directory tree. It is not a security primitive: it
@@ -894,14 +912,18 @@ fn drill_cli_inspect_reports_the_incident_and_exits_non_zero() {
 
 /// Concurrent writers must not splice their records together.
 ///
-/// This reproduces, in-process, what CI hit on Linux: several threads appending
-/// to one report file, with the assertion that every resulting line is still a
-/// complete JSON object. The original `writeln!(file, ...)` failed this because
+/// This reproduces what CI hit on Windows: several threads appending to one
+/// report file, with the assertion that every resulting line is still a complete
+/// JSON object. The original `writeln!(file, ...)` failed this because
 /// `write_fmt` issues more than one `write`, and `O_APPEND` only makes a single
 /// one atomic.
 ///
-/// It is a direct test of `record_drill` rather than of the drills, so it runs
-/// in milliseconds and does not need a workspace.
+/// It drives `append_record` directly with its own path, deliberately **not**
+/// `record_drill`: an earlier version set `PANGU_DRILL_REPORT` and relied on it,
+/// but the environment is process-global and the seven real drills run in
+/// parallel beside this test — they wrote into this file, so CI saw 647 lines
+/// where 640 were expected. Passing the path explicitly keeps the test isolated
+/// from whatever else is running.
 #[test]
 fn concurrent_drill_records_are_written_as_whole_lines() {
     let dir = std::env::temp_dir().join(format!(
@@ -912,23 +934,21 @@ fn concurrent_drill_records_are_written_as_whole_lines() {
     fs::create_dir_all(&dir).expect("race dir");
     let report = dir.join("report.jsonl");
 
-    // Point `record_drill` at the file for the duration of the test. The
-    // environment is process-global, so no other test may read it concurrently;
-    // `record_drill` is only called by this test here.
-    std::env::set_var("PANGU_DRILL_REPORT", &report);
-    std::env::set_var("PANGU_DRILL_COMMIT", "concurrency-test");
-
-    let threads: Vec<_> = (0..16)
+    const WRITERS: usize = 16;
+    const ROUNDS: usize = 40;
+    let threads: Vec<_> = (0..WRITERS)
         .map(|worker| {
+            let report = report.clone();
             std::thread::spawn(move || {
-                for round in 0..40 {
-                    record_drill(
+                for round in 0..ROUNDS {
+                    let line = drill_line(
                         "concurrency",
                         "pass",
                         // Vary the length so a short record can land in the middle
                         // of a long one if the writes are not atomic.
                         &format!("worker={worker} round={round} {}", "x".repeat(round * 7)),
                     );
+                    append_record(&report, &line);
                 }
             })
         })
@@ -941,7 +961,7 @@ fn concurrent_drill_records_are_written_as_whole_lines() {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         lines.len(),
-        16 * 40,
+        WRITERS * ROUNDS,
         "every record must have produced exactly one line; got {}",
         lines.len()
     );
@@ -958,11 +978,8 @@ fn concurrent_drill_records_are_written_as_whole_lines() {
         );
     }
 
-    std::env::remove_var("PANGU_DRILL_REPORT");
-    std::env::remove_var("PANGU_DRILL_COMMIT");
     let _ = fs::remove_dir_all(&dir);
 }
-
 fn pangu_config(fixture: &Fixture) -> String {
     let mut config = Config::embedded().expect("embedded config");
     config.boundary.workspace = fixture.workspace.clone();
