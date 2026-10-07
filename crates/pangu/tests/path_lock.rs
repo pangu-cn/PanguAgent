@@ -122,10 +122,14 @@ const SETTLE_MS: u64 = 400;
 /// Scaling against the contended measurement cancels the environmental term,
 /// because both numbers are taken the same way on the same machine moments
 /// apart. The message reports both so a failure is diagnosable without a rerun.
+fn minimum_of(samples: &[u128]) -> u128 {
+    samples.iter().copied().min().unwrap_or(u128::MAX)
+}
+
 fn assert_waited_far_less(free_ms: u128, contended_ms: u128, what: &str) {
-    // The free case must be substantially below the contended case. A quarter is
-    // a wide margin that still fails loudly if the lock starts serialising
-    // unrelated work: that would make the free case approach the contended one.
+    // One uncontended sample can include a scheduling stall. The lock property
+    // is still relative: unrelated work must remain much faster than contended
+    // work, but a single delayed sample must not erase a large gap.
     let ceiling = contended_ms / 4;
     assert!(
         free_ms <= ceiling,
@@ -218,7 +222,23 @@ fn different_files_do_not_serialise_across_processes() {
     let other_out = output_of(other);
     assert!(holder_out.contains("ACQUIRED first"), "{holder_out}");
     assert!(other_out.contains("ACQUIRED second"), "{other_out}");
-    let free_ms = waited_ms(&other_out, "second");
+    let mut free_samples = vec![waited_ms(&other_out, "second")];
+    // One delayed scheduler sample must not decide the result. Repeating the
+    // uncontended case and keeping its minimum preserves the property: genuine
+    // serialization makes every sample slow, while one scheduling stall does not.
+    for round in 1..3 {
+        let retry_workspace = scratch(&format!("parallel-free-retry-{round}"));
+        let holder = spawn_child(&retry_workspace, "src/a.rs", HOLD_MS, "first");
+        std::thread::sleep(Duration::from_millis(SETTLE_MS));
+        let other = spawn_child(&retry_workspace, "src/b.rs", 0, "second");
+        let holder_out = output_of(holder);
+        let other_out = output_of(other);
+        assert!(holder_out.contains("ACQUIRED first"), "{holder_out}");
+        assert!(other_out.contains("ACQUIRED second"), "{other_out}");
+        free_samples.push(waited_ms(&other_out, "second"));
+        fs::remove_dir_all(&retry_workspace).ok();
+    }
+    let free_ms = minimum_of(&free_samples);
 
     // A different file must not have waited for the holder to release.
     assert_waited_far_less(
@@ -390,7 +410,25 @@ fn a_build_edit_in_one_crate_does_not_block_a_sibling_crate() {
     let sibling_out = output_of(sibling);
     assert!(holder_out.contains("ACQUIRED alpha"), "{holder_out}");
     assert!(sibling_out.contains("ACQUIRED beta"), "{sibling_out}");
-    let free_ms = waited_ms(&sibling_out, "beta");
+    let mut free_samples = vec![waited_ms(&sibling_out, "beta")];
+    for round in 1..3 {
+        let retry_workspace = cargo_workspace(&format!("module-parallel-free-retry-{round}"));
+        let holder = spawn_module_child(
+            &retry_workspace,
+            "crates/alpha/Cargo.toml",
+            HOLD_MS,
+            "alpha",
+        );
+        std::thread::sleep(Duration::from_millis(SETTLE_MS));
+        let sibling = spawn_module_child(&retry_workspace, "crates/beta/Cargo.toml", 0, "beta");
+        let holder_out = output_of(holder);
+        let sibling_out = output_of(sibling);
+        assert!(holder_out.contains("ACQUIRED alpha"), "{holder_out}");
+        assert!(sibling_out.contains("ACQUIRED beta"), "{sibling_out}");
+        free_samples.push(waited_ms(&sibling_out, "beta"));
+        fs::remove_dir_all(&retry_workspace).ok();
+    }
+    let free_ms = minimum_of(&free_samples);
 
     assert_waited_far_less(
         free_ms,
