@@ -292,6 +292,24 @@ impl WebSocket {
         }
 
         let payload = self.take(length, deadline)?;
+        if opcode == Opcode::Close && payload.len() >= 2 {
+            let status = u16::from_be_bytes([payload[0], payload[1]]);
+            if !valid_close_status(status) {
+                return Err(Error::Other(format!(
+                    "websocket close frame used status code {status}, which the protocol forbids"
+                )));
+            }
+            if std::str::from_utf8(&payload[2..]).is_err() {
+                return Err(Error::Other(
+                    "websocket close reason is not valid UTF-8".into(),
+                ));
+            }
+        }
+        if opcode == Opcode::Text && std::str::from_utf8(&payload).is_err() {
+            return Err(Error::Other(
+                "websocket text frame is not valid UTF-8".into(),
+            ));
+        }
         Ok(WsFrame { opcode, payload })
     }
 
@@ -318,6 +336,10 @@ impl WebSocket {
         }
         Ok(self.buffer.drain(..count).collect())
     }
+}
+
+fn valid_close_status(status: u16) -> bool {
+    matches!(status, 1000 | 1001 | 1002 | 1003 | 1007..=1011 | 3000..=4999)
 }
 
 fn opcode_byte(opcode: Opcode) -> u8 {
@@ -618,6 +640,14 @@ mod tests {
         let close = vec![0x88, 1, 0];
         let error = decode_one(&close).expect_err("one-byte close status");
         assert!(error.to_string().contains("two bytes"), "{error}");
+
+        let forbidden = vec![0x88, 2, 0x03, 0xED];
+        let error = decode_one(&forbidden).expect_err("status 1005 is forbidden");
+        assert!(error.to_string().contains("1005"), "{error}");
+
+        let invalid_text = vec![0x81, 1, 0xFF];
+        let error = decode_one(&invalid_text).expect_err("text must be UTF-8");
+        assert!(error.to_string().contains("UTF-8"), "{error}");
     }
 
     #[test]
