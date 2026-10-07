@@ -537,97 +537,91 @@ impl Toolkit {
         let name = action.call().name.as_str();
         let args = action.call().args.clone();
 
-        let outcome = slot.with(
-            config,
-            self.runtime.as_deref(),
-            artifact_dir.as_ref().clone(),
-            |handle| match name {
-                "browser_open" => {
-                    let url = required_string(&args, "url")?;
-                    browser::require_navigation_url(
-                        &url,
-                        |url| {
-                            action
-                                .sandbox()
-                                .check_url(url)
-                                .map(|_| ())
-                                .map_err(|error| anyhow!(error))
-                        },
-                        &action.resources().hosts,
-                    )?;
-                    let session = handle.session()?;
-                    session.navigate(&url)?;
-                    // Returning the page immediately saves a round trip: an
-                    // `open` that yielded only "ok" would oblige the model to
-                    // read next, doubling the calls for the common case.
-                    let snapshot = session.snapshot()?;
-                    // The requested host was checked before navigation. A redirect
-                    // can land somewhere else, so the page actually reached must
-                    // pass the same egress check before its content is returned.
-                    require_current_page(action, &snapshot.url)?;
-                    Ok(browser::output(
-                        browser::render_snapshot(
-                            &snapshot.url,
-                            &snapshot.title,
-                            &snapshot.text,
-                            snapshot.truncated,
-                        ),
-                        Some(format!("navigated to {}", snapshot.url)),
-                    ))
-                }
-                "browser_read" => {
-                    let session = handle.session()?;
-                    let snapshot = session.snapshot()?;
-                    require_current_page(action, &snapshot.url)?;
-                    Ok(browser::output(
-                        browser::render_snapshot(
-                            &snapshot.url,
-                            &snapshot.title,
-                            &snapshot.text,
-                            snapshot.truncated,
-                        ),
-                        None,
-                    ))
-                }
-                "browser_screenshot" => {
-                    let session = handle.session()?;
-                    require_current_page(action, &session.snapshot()?.url)?;
-                    let path = artifact_dir.as_ref().join("screenshot.png");
-                    browser::require_validated_screenshot_path(
-                        &path,
-                        &action.resources().write_paths,
-                    )?;
-                    let png = session.screenshot()?;
-                    let bytes = png.len();
-                    let name = handle.save_screenshot(&png)?;
-                    Ok(browser::output(
-                        format!("screenshot saved as {name} ({bytes} bytes, PNG)"),
-                        // The evidence is the file that now exists, not a claim
-                        // that a capture happened.
-                        Some(format!("screenshot:{name}:{bytes}")),
-                    ))
-                }
-                "browser_click" => {
-                    let selector = browser::required_selector(&args)?;
-                    let session = handle.session()?;
-                    session.click(&selector)?;
-                    Ok(browser::output(
-                        format!("clicked {selector}"),
-                        Some(format!("clicked:{selector}")),
-                    ))
-                }
-                "browser_type" => {
-                    let text = required_string(&args, "text")?;
-                    let session = handle.session()?;
-                    session.type_text(&text)?;
-                    Ok(browser::output(
-                        format!("typed {} characters", text.chars().count()),
-                        Some(format!("typed:{}", text.chars().count())),
-                    ))
-                }
-                other => bail!("`{other}` has no browser handler"),
-            },
-        );
+        let outcome = slot.with(config, self.runtime.as_deref(), |handle| match name {
+            "browser_open" => {
+                let url = required_string(&args, "url")?;
+                browser::require_navigation_url(
+                    &url,
+                    |url| {
+                        action
+                            .sandbox()
+                            .check_url(url)
+                            .map(|_| ())
+                            .map_err(|error| anyhow!(error))
+                    },
+                    &action.resources().hosts,
+                )?;
+                let session = handle.session()?;
+                session.navigate(&url)?;
+                // Returning the page immediately saves a round trip: an
+                // `open` that yielded only "ok" would oblige the model to
+                // read next, doubling the calls for the common case.
+                let snapshot = session.snapshot()?;
+                // The requested host was checked before navigation. A redirect
+                // can land somewhere else, so the page actually reached must
+                // pass the same egress check before its content is returned.
+                require_current_page(action, &snapshot.url)?;
+                Ok(browser::output(
+                    browser::render_snapshot(
+                        &snapshot.url,
+                        &snapshot.title,
+                        &snapshot.text,
+                        snapshot.truncated,
+                    ),
+                    Some(format!("navigated to {}", snapshot.url)),
+                ))
+            }
+            "browser_read" => {
+                let session = handle.session()?;
+                let snapshot = session.snapshot()?;
+                require_current_page(action, &snapshot.url)?;
+                Ok(browser::output(
+                    browser::render_snapshot(
+                        &snapshot.url,
+                        &snapshot.title,
+                        &snapshot.text,
+                        snapshot.truncated,
+                    ),
+                    None,
+                ))
+            }
+            "browser_screenshot" => {
+                let session = handle.session()?;
+                require_current_page(action, &session.snapshot()?.url)?;
+                let path = browser::validated_screenshot_path(
+                    artifact_dir.as_ref(),
+                    &action.resources().write_paths,
+                )?;
+                let png = session.screenshot()?;
+                let bytes = png.len();
+                let name = handle.save_screenshot_at(&path, &png)?;
+                Ok(browser::output(
+                    format!("screenshot saved as {name} ({bytes} bytes, PNG)"),
+                    // The evidence is the file that now exists, not a claim
+                    // that a capture happened.
+                    Some(format!("screenshot:{name}:{bytes}")),
+                ))
+            }
+            "browser_click" => {
+                let selector = browser::required_selector(&args)?;
+                let session = handle.session()?;
+                session.click(&selector)?;
+                Ok(browser::output(
+                    format!("clicked {selector}"),
+                    Some(format!("clicked:{selector}")),
+                ))
+            }
+            "browser_type" => {
+                let text = required_string(&args, "text")?;
+                let session = handle.session()?;
+                session.type_text(&text)?;
+                Ok(browser::output(
+                    format!("typed {} characters", text.chars().count()),
+                    Some(format!("typed:{}", text.chars().count())),
+                ))
+            }
+            other => bail!("`{other}` has no browser handler"),
+        });
         if let Err(error) = &outcome {
             if browser::page_must_not_remain_open(error) {
                 // A refused page must not stay available to the next browser

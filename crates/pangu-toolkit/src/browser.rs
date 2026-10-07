@@ -50,8 +50,6 @@ pub fn is_browser_tool(name: &str) -> bool {
 /// One live session, plus the state needed to report what was enforced.
 pub struct BrowserHandle {
     session: BrowserSession,
-    /// Where screenshots are written, inside the writable boundary.
-    artifact_dir: std::path::PathBuf,
 }
 
 impl BrowserHandle {
@@ -60,11 +58,7 @@ impl BrowserHandle {
     /// When `runtime` is `Some` and unusable, this refuses: launching the
     /// browser on the host after the operator asked for isolation would make the
     /// audit record false, which is the same rule the command executor follows.
-    pub fn launch(
-        config: &BrowserConfig,
-        runtime: Option<&Runtime>,
-        artifact_dir: std::path::PathBuf,
-    ) -> Result<Self> {
+    pub fn launch(config: &BrowserConfig, runtime: Option<&Runtime>) -> Result<Self> {
         if let Some(runtime) = runtime {
             if !runtime.allows_execution() {
                 return Err(anyhow!("{}", runtime.refusal()));
@@ -79,10 +73,7 @@ impl BrowserHandle {
             .as_ref()
             .map(|(program, leading)| (program.as_str(), leading.as_slice()));
         let session = BrowserSession::launch(config, launcher_ref)?;
-        Ok(Self {
-            session,
-            artifact_dir,
-        })
+        Ok(Self { session })
     }
 
     /// The session handle.
@@ -98,20 +89,19 @@ impl BrowserHandle {
     /// Written inside the writable boundary rather than to a temp directory so
     /// the artifact is covered by the same rules as every other run artifact,
     /// and so its existence is recorded rather than assumed.
-    pub fn save_screenshot(&mut self, data: &[u8]) -> Result<String> {
-        std::fs::create_dir_all(&self.artifact_dir).map_err(|error| {
+    pub fn save_screenshot_at(&mut self, path: &std::path::Path, data: &[u8]) -> Result<String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("screenshot path has no parent"))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
             anyhow!(
                 "cannot create the screenshot directory {}: {error}",
-                self.artifact_dir.display()
+                parent.display()
             )
         })?;
-        // L3 validated this exact filename. A counter would write a different
-        // path from the one the assessment declared.
-        let name = "screenshot.png".to_string();
-        let path = self.artifact_dir.join(&name);
-        std::fs::write(&path, data)
+        std::fs::write(path, data)
             .map_err(|error| anyhow!("cannot write the screenshot {}: {error}", path.display()))?;
-        Ok(name)
+        Ok("screenshot.png".to_string())
     }
 }
 
@@ -143,7 +133,6 @@ impl BrowserSlot {
         &self,
         config: &BrowserConfig,
         runtime: Option<&Runtime>,
-        artifact_dir: std::path::PathBuf,
         body: impl FnOnce(&mut BrowserHandle) -> Result<T>,
     ) -> Result<T> {
         let mut guard = self
@@ -151,7 +140,7 @@ impl BrowserSlot {
             .lock()
             .map_err(|_| anyhow!("the browser session lock was poisoned by an earlier panic"))?;
         if guard.is_none() {
-            *guard = Some(BrowserHandle::launch(config, runtime, artifact_dir)?);
+            *guard = Some(BrowserHandle::launch(config, runtime)?);
         }
         let handle = guard.as_mut().expect("just ensured to be Some");
         body(handle)
@@ -293,6 +282,19 @@ pub fn require_validated_navigation_host(url: &str, validated_hosts: &[String]) 
         bail!("navigation host `{host}` was not validated by L3");
     }
     Ok(())
+}
+
+pub fn validated_screenshot_path(
+    configured_dir: &std::path::Path,
+    validated_paths: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf> {
+    let requested = configured_dir.join("screenshot.png");
+    require_validated_screenshot_path(&requested, validated_paths)?;
+    validated_paths
+        .iter()
+        .find(|validated| same_path(validated, &requested))
+        .cloned()
+        .ok_or_else(|| anyhow!("screenshot path was not validated by L3"))
 }
 
 pub fn require_validated_screenshot_path(
@@ -560,6 +562,15 @@ mod tests {
             &[std::path::PathBuf::from("artifacts/screenshot.png")],
         )
         .expect("a current-directory component does not change the file");
+        let selected = validated_screenshot_path(
+            std::path::Path::new("artifacts"),
+            &[std::path::PathBuf::from("artifacts/./screenshot.png")],
+        )
+        .expect("the canonical validated path is the one written");
+        assert_eq!(
+            selected,
+            std::path::PathBuf::from("artifacts/./screenshot.png")
+        );
         if cfg!(windows) {
             require_validated_screenshot_path(
                 std::path::Path::new(r"\\?\C:\work\artifacts\screenshot.png"),
