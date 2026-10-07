@@ -93,6 +93,14 @@ impl BrowserHandle {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("screenshot path has no parent"))?;
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "refusing to write a screenshot through a symlink: {}",
+                    path.display()
+                );
+            }
+        }
         std::fs::create_dir_all(parent).map_err(|error| {
             anyhow!(
                 "cannot create the screenshot directory {}: {error}",

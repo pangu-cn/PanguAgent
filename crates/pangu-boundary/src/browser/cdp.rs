@@ -575,6 +575,7 @@ fn wait_for_endpoint(profile_dir: &std::path::Path) -> Result<String> {
                 {
                     let path = lines.next().unwrap_or("/devtools/browser").trim();
                     if !path.starts_with("/devtools/")
+                        || path.contains("..")
                         || path.chars().any(|character| {
                             character.is_control() || matches!(character, '?' | '#' | '\\' | ' ')
                         })
