@@ -18,8 +18,21 @@ use pangu_boundary::runtime::{RuntimeConfig, RuntimeProbe, SandboxRuntime};
 /// for a test.
 const EXPECTED_MAX: Duration = Duration::from_secs(90);
 
+/// The OS temp directory with symlinked ancestors resolved.
+///
+/// The journal and artifact layers reject any path containing a symlink
+/// component, and the sandbox canonicalizes its workspace before comparing
+/// prefixes. On Linux container images `/tmp` is often a symlink, so a raw
+/// `temp_dir()` path is refused there while working on a machine whose temp
+/// directory is a real directory — the test passes locally and fails in CI for a
+/// reason unrelated to the code under test. Resolving the base once removes the
+/// whole class of mistake.
+fn temp_base() -> std::path::PathBuf {
+    let base = std::env::temp_dir();
+    std::fs::canonicalize(&base).unwrap_or(base)
+}
 fn workspace(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
+    let path = temp_base().join(format!(
         "pangu-probe-timeout-{label}-{}",
         std::process::id()
     ));

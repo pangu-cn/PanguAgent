@@ -36,6 +36,15 @@ pub mod summary;
 pub mod trace;
 pub mod util;
 
+/// Test fixtures that must satisfy this project's path policy.
+///
+/// Behind a feature because it is only needed by tests, and reachable from
+/// integration tests because those are separate crates and cannot see a
+/// `#[cfg(test)]` item inside a library. See the module for why one shared
+/// implementation replaced the copies that had drifted.
+#[cfg(feature = "test-support")]
+pub mod testing;
+
 pub use artifact::{
     ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
     RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,

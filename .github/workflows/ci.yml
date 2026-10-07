@@ -175,25 +175,45 @@ jobs:
       - name: Install a browser for the real-runtime tests
         # `browser_cdp.rs` drives a real Chromium over CDP; it cannot be verified
         # against a stand-in. Ubuntu runners do not ship a browser, so one is
-        # installed explicitly rather than having the suite silently skip.
+        # installed explicitly.
         #
-        # `--ignore-missing` keeps this from failing the job if the package name
-        # moves; the test step below is what reports whether a browser was
-        # actually found, so a missing browser surfaces as a skipped test rather
-        # than as an unrelated dependency error here.
+        # No `set -e`: a packaging failure here must not fail the job. Whether a
+        # browser actually became available is reported by the test step below,
+        # which is the only place that knows. Failing here instead would produce a
+        # red job whose cause is "apt", not "the browser automation is broken" —
+        # a misleading signal, and the kind this repository avoids.
+        #
+        # `chromium-browser` on recent Ubuntu is a transitional package that
+        # installs a snap shim; the snap is unavailable in a container, so the
+        # plain `chromium` package is preferred where it exists.
         if: runner.os == 'Linux'
         run: |
+          set +e
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends chromium-browser || \
-            sudo apt-get install -y --no-install-recommends chromium || true
-          # google-chrome and chromium take different paths, so both are checked
-          # and the result is visible rather than implied.
+          for package in chromium chromium-browser google-chrome-stable; do
+            if sudo apt-get install -y --no-install-recommends "$package"; then
+              echo "installed: $package"
+              break
+            fi
+            echo "not installable here: $package"
+          done
+          found=0
           for candidate in /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser /snap/bin/chromium; do
             if [ -x "$candidate" ]; then
-              echo "browser found: $candidate"
-              "$candidate" --version || true
+              # A snap transitional shim exists but does not run; `--version`
+              # is what distinguishes a usable browser from a stub that would
+              # only fail later, inside a test, for a confusing reason.
+              if "$candidate" --version >/dev/null 2>&1; then
+                echo "browser usable: $candidate ($("$candidate" --version 2>&1))"
+                found=1
+              else
+                echo "browser present but not runnable: $candidate"
+              fi
             fi
           done
+          if [ "$found" -eq 0 ]; then
+            echo "::warning title=real-runtime tests::no usable browser was installed"
+          fi
 
       - name: Run tests that need a real runtime
         # Some claims cannot be checked by a default `cargo test`: they need a

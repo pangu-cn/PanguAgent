@@ -17,8 +17,21 @@ use std::sync::Arc;
 use pangu_boundary::runtime::{RuntimeConfig, SandboxRuntime};
 
 /// A workspace under the OS temp dir.
+/// The OS temp directory with symlinked ancestors resolved.
+///
+/// The journal and artifact layers reject any path containing a symlink
+/// component, and the sandbox canonicalizes its workspace before comparing
+/// prefixes. On Linux container images `/tmp` is often a symlink, so a raw
+/// `temp_dir()` path is refused there while working on a machine whose temp
+/// directory is a real directory — the test passes locally and fails in CI for a
+/// reason unrelated to the code under test. Resolving the base once removes the
+/// whole class of mistake.
+fn temp_base() -> std::path::PathBuf {
+    let base = std::env::temp_dir();
+    std::fs::canonicalize(&base).unwrap_or(base)
+}
 fn workspace(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("pangu-f8-{label}-{}", std::process::id()));
+    let path = temp_base().join(format!("pangu-f8-{label}-{}", std::process::id()));
     std::fs::create_dir_all(&path).expect("create workspace");
     path
 }

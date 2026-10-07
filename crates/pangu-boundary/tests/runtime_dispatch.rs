@@ -69,12 +69,25 @@ fn with_stub_on_path<T>(bin: &Path, body: impl FnOnce() -> T) -> T {
     }
 }
 
+/// The OS temp directory with symlinked ancestors resolved.
+///
+/// The journal and artifact layers reject any path containing a symlink
+/// component, and the sandbox canonicalizes its workspace before comparing
+/// prefixes. On Linux container images `/tmp` is often a symlink, so a raw
+/// `temp_dir()` path is refused there while working on a machine whose temp
+/// directory is a real directory — the test passes locally and fails in CI for a
+/// reason unrelated to the code under test. Resolving the base once removes the
+/// whole class of mistake.
+fn temp_base() -> std::path::PathBuf {
+    let base = std::env::temp_dir();
+    std::fs::canonicalize(&base).unwrap_or(base)
+}
 fn temp_root(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!(
+    let path = temp_base().join(format!(
         "pangu-runtime-stub-{label}-{}-{nanos}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
