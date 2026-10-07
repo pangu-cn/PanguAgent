@@ -274,6 +274,17 @@ impl WebSocket {
             }
             _ => unreachable!("0x7F & mask cannot exceed 127"),
         };
+        if matches!(opcode, Opcode::Ping | Opcode::Pong | Opcode::Close) && length > 125 {
+            return Err(Error::Other(format!(
+                "websocket control frame of {length} bytes exceeds the 125-byte limit"
+            )));
+        }
+        if opcode == Opcode::Close && length == 1 {
+            return Err(Error::Other(
+                "websocket close frame has a one-byte payload; a status code needs two bytes"
+                    .into(),
+            ));
+        }
         if length > MAX_FRAME_BYTES {
             return Err(Error::Other(format!(
                 "websocket frame of {length} bytes exceeds the {MAX_FRAME_BYTES}-byte limit"
@@ -595,6 +606,18 @@ mod tests {
         raw.extend_from_slice(&((MAX_FRAME_BYTES as u64) + 1).to_be_bytes());
         let error = decode_one(&raw).expect_err("must reject");
         assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn an_oversized_or_truncated_control_frame_is_rejected() {
+        let mut ping = vec![0x89, 126, 0, 126];
+        ping.extend(std::iter::repeat_n(b'x', 126));
+        let error = decode_one(&ping).expect_err("control payload above 125");
+        assert!(error.to_string().contains("125"), "{error}");
+
+        let close = vec![0x88, 1, 0];
+        let error = decode_one(&close).expect_err("one-byte close status");
+        assert!(error.to_string().contains("two bytes"), "{error}");
     }
 
     #[test]
