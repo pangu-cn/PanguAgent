@@ -570,7 +570,9 @@ fn wait_for_endpoint(profile_dir: &std::path::Path) -> Result<String> {
         if let Ok(contents) = std::fs::read_to_string(&marker) {
             let mut lines = contents.lines();
             if let Some(port) = lines.next().map(str::trim) {
-                if !port.is_empty() {
+                if port.chars().all(|character| character.is_ascii_digit())
+                    && port.parse::<u16>().ok().filter(|port| *port > 0).is_some()
+                {
                     let path = lines.next().unwrap_or("/devtools/browser").trim();
                     return Ok(format!("ws://127.0.0.1:{port}{path}"));
                 }

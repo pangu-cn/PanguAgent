@@ -229,6 +229,8 @@ pub fn resolve_config(
             "--proxy-bypass-list",
             "--load-extension",
             "--disable-extensions-except",
+            "--disk-cache-dir",
+            "--crash-dumps-dir",
         ];
         let normalized = argument.trim().to_ascii_lowercase();
         if forbidden.iter().any(|prefix| {
@@ -678,7 +680,7 @@ mod tests {
             None,
             std::path::PathBuf::from("/tmp/p"),
             false,
-            vec!["--User-Data-Dir".into(), "/tmp/other".into()],
+            vec!["--Disk-Cache-Dir=/tmp/cache".into()],
         )
         .expect_err("must refuse");
         assert!(
