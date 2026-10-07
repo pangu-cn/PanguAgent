@@ -417,7 +417,9 @@ impl Drop for BrowserSession {
         // The profile holds cookies and cache outside the workspace. Leaving it
         // in the system temporary directory would preserve that state after the
         // session ends.
-        remove_profile_dir(&self.profile_dir);
+        if let Err(error) = remove_profile_dir(&self.profile_dir) {
+            eprintln!("pangu: {error}");
+        }
     }
 }
 
@@ -441,8 +443,20 @@ impl BrowserSession {
 /// `next_id` counts upward from the start of the session, so an id at or above
 /// it was never requested and can never be awaited. An ordinary `browser_open`
 /// reaches this path; compromising the socket first is not required.
-pub(crate) fn remove_profile_dir(path: &std::path::Path) {
-    let _ = std::fs::remove_dir_all(path);
+pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    if !text.contains("pangu-browser") {
+        return Err(Error::Other(format!(
+            "refusing to delete browser profile outside pangu-browser: {}",
+            path.display()
+        )));
+    }
+    std::fs::remove_dir_all(path).map_err(|error| {
+        Error::Other(format!(
+            "cannot delete browser profile {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
@@ -792,11 +806,18 @@ mod tests {
 
     #[test]
     fn ending_a_session_removes_its_temporary_profile() {
-        let root = std::env::temp_dir().join(format!("pangu-profile-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join("pangu-browser")
+            .join(format!("profile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("profile");
         std::fs::write(root.join("Cookies"), b"secret").expect("cookie");
-        remove_profile_dir(&root);
+        remove_profile_dir(&root).expect("the temporary profile must be removable");
+        let refused = remove_profile_dir(std::path::Path::new("/tmp/not-pangu"));
+        assert!(
+            refused.is_err(),
+            "cleanup must not delete an unrelated directory"
+        );
         assert!(
             !root.exists(),
             "the temporary profile must not survive the session"
