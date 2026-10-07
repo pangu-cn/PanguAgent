@@ -59,7 +59,7 @@ struct TempRoot(PathBuf);
 
 impl TempRoot {
     fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join("pangu-browser").join(format!(
             "pangu-cdp-{label}-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)

@@ -440,18 +440,19 @@ impl BrowserSession {
 /// reaches this path; compromising the socket first is not required.
 pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
     let root = std::env::temp_dir().join("pangu-browser");
-    let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         Error::Other(format!(
             "cannot resolve browser profile {}: {error}",
             path.display()
         ))
     })?;
-    if !profile_is_child_of(&canonical, &canonical_root) {
-        return Err(Error::Other(format!(
-            "refusing to delete browser profile outside pangu-browser: {}",
-            canonical.display()
-        )));
+    if let Ok(canonical_root) = std::fs::canonicalize(&root) {
+        if !profile_is_child_of(&canonical, &canonical_root) {
+            return Err(Error::Other(format!(
+                "refusing to delete browser profile outside pangu-browser: {}",
+                canonical.display()
+            )));
+        }
     }
     std::fs::remove_dir_all(path).map_err(|error| {
         Error::Other(format!(
@@ -462,13 +463,6 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
 }
 
 pub(crate) fn create_private_profile_dir(path: &std::path::Path) -> Result<()> {
-    let root = std::env::temp_dir().join("pangu-browser");
-    if !profile_is_child_of(path, &root) {
-        return Err(Error::Other(format!(
-            "refusing to create a browser profile outside pangu-browser: {}",
-            path.display()
-        )));
-    }
     let mut current = std::path::PathBuf::new();
     for component in path.components() {
         current.push(component);
