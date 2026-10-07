@@ -190,7 +190,9 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 
 - `failed-operation` 需要“写到一半失败”。Windows 用“待移开目录内的文件以只读共享方式打开”（目录 rename 被拒），Unix 用“目标目录不可写”；以 root 运行时 Unix 机制无效，演练会记为 `skipped` 而不是伪装通过。
 - `replace-backup` 只在 Windows 存在 hand-off。POSIX 上该文件对 runtime 无意义，演练记录 `not-applicable`，并只验证“证据被报告且未丢失”。
-- CI 在 `ubuntu-latest` 与 `windows-latest` 上都运行该套演练，并把 `f7-drill-report.jsonl` 作为 artifact 上传（见 `.github/workflows/ci.yml`）。
+- CI 在 `ubuntu-latest` 与 `windows-latest` 上都运行该套演练，并把 `f7-drill-report-${{ matrix.os }}.jsonl` 作为 artifact 上传（见 `.github/workflows/ci.yml`）。
+  - **演练步骤排在 `Run all tests` 之后**，所以前面的测试一失败，这一步就是 `skipped`、不会有报告。`plan-a` 上曾连续 7 次如此（见 §8.1），期间**没有任何 drill 证据**——读 `skipped` 时不要把它当成"演练通过"。
+  - 报告缺失时该步骤会发 `::error` 注解而不是静默通过；注解按每行 `outcome` 分级：`pass` → `notice`，`skipped`/`not-applicable` → `warning`（**不算通过**），其余 → `error`。
 
 ## 7. 当前实现限制
 
@@ -211,7 +213,7 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 在考虑把该能力从“实验性 opt-in”升级为正式激活前，部署者应保存以下证据。已具备机器化手段和本地实测的项标为 `[x]`，仍需部署环境或人工签署的项保持 `[ ]`。**每个 `[ ]` 项对应的操作程序见第 9 节**，留证要求在那里写死；没有证据的勾选不算勾选。
 
 - [x] stale lock、failed operation、CAS drift、Windows replacement backup 有可重复的 operator drill（第 6 节），且 replacement hand-off 与无锁并发 writer 的限制已写成本手册第 4、7 节。
-- [x] 只读证据检查有工具（`pangu artifact inspect`）并有“不修改任何字节”的独立断言。
+- [x] 只读证据检查有工具（`pangu artifact inspect`）并有“不修改任何字节”的独立断言（第 6 节 drill `inspection-read-only`：连续三次 inspect 前后对 store 与 workspace 取摘要并断言逐字节相同）。
 - [ ] 恢复期间有可用的 workspace/Artifact 备份和独立审计记录。（依赖部署环境）→ **见 §9.3**；**机器可验的部分已有可执行 drill**（`cargo test -p pangu --test backup_drill`：副本单独 verified、删掉原件后仍 verified、篡改必被拒），跨介质/异地/保留期三项仍需部署者留证。
 - [ ] 明确并发 writer、外部 effect 和无人工输入时的停止策略。（需部署者书面确认）→ **见 §9.2**。**这是唯一无法用测试替代的一项**，且按 §9 的顺序要求必须先于其它项完成。
 - [x] 配置、CLI、Journal、Artifact schema、inspection schema 和恢复手册版本相互匹配，并在 ADR/ROADMAP/README 中一致标为实验性 opt-in。
@@ -233,18 +235,21 @@ PANGU_DRILL_REPORT="$PWD/evidence.jsonl" PANGU_DRILL_COMMIT="$(git rev-parse HEA
 | Windows（GitHub runner） | `dtolnay/rust-toolchain@stable` | `105258e` | 通过 | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-105258e.jsonl`](evidence/f7-drills-windows-105258e.jsonl) |
 | Ubuntu（GitHub runner） | `dtolnay/rust-toolchain@stable` | `105258e` | 通过 | 0 error / 0 warning | 6 pass + 1 not-applicable | [`evidence/f7-drills-ubuntu-105258e.jsonl`](evidence/f7-drills-ubuntu-105258e.jsonl) |
 | Windows 10.0.19045 x86_64（本机） | 实测 | `8f60878` | 通过 | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-8f60878.jsonl`](evidence/f7-drills-windows-8f60878.jsonl) |
+| Windows 10.0.19045 x86_64（本机） | rustc 1.98.1 | `853017f` | 通过（707 项，0 失败） | 0 error / 0 warning | 7 pass | [`evidence/f7-drills-windows-853017f.jsonl`](evidence/f7-drills-windows-853017f.jsonl) |
 
 > 最后两行是 CI 在**修复 Ubuntu 测试失败之后**的第一次全绿运行（run [37398616832](https://github.com/pangu-cn/PanguAgent/actions/runs/37398616832)）。此前 `plan-a` 上每次 CI 都是 ubuntu 失败 / windows 通过（连续 7 次），提交 `1da46a0`、`7627b4d` 均如此；原因见 §11。
 >
 > `105258e` 行的 Ubuntu 与 Windows `failed-operation` 机制名不同（`read-only-directory` 对 `directory-rename-blocked-by-open-file`），这正是 8.1 已记录的平台差异，**属于同一分支的两种实现**，不是不一致的证据。
 
-> 最后一行是 **2026-10-05 本机实测**，不是 CI 结论，也**不满足 §9.1**：它仍属"CI 已覆盖的两个平台"，不是目标部署平台。它的作用是证明该 drill 在当前提交上仍可复现，按 §9.1 的判读规则全部为 `pass`（本平台存在 replacement hand-off 机制，故无 `not-applicable`）。
+> 表格末尾的三行本机记录（`8f60878` / `853017f` 及上一行）都是本机实测，不是 CI 结论，也**不满足 §9.1**：本机仍属"CI 已覆盖的两个平台"，不是目标部署平台。它们的作用是证明该 drill 在**当前提交**上仍可复现，按 §9.1 的判读规则全部为 `pass`（本平台存在 replacement hand-off 机制，故无 `not-applicable`）。
+>
+> `853017f` 是**本表写下时最新的本机记录**，也是 §9.3 那条 verbatim 路径修复落地的提交；此后每次改动 drill 或 checkpoint 相关代码都应追加一行，而不是改写旧行——旧行记录的是当时的提交，改写它会让证据与提交的对应关系失真。
 
-本机记录（2026-09-25，Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features`（142 项，0 失败）与 7 个 drill 全部通过。
+本机记录（2026-09-26，Windows 10.0.26200.9457 / x86_64 / rustc 1.98.0）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-targets --all-features`（142 项，0 失败）与 7 个 drill 全部通过。
 
 本机记录（2026-10-05，Windows 10.0.19045 / x86_64 / rustc 1.98.1，提交 `3aa11da`）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --all-targets --no-fail-fast`（373 项，0 失败）与 7 个 drill 全部通过；drill 报告转录见 [`evidence/f7-drills-windows-10.0.19045.jsonl`](evidence/f7-drills-windows-10.0.19045.jsonl)。
 
-CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/runs/36210280753)，2026-09-26，提交 `1b0245d`）：`ubuntu-latest` 与 `windows-latest` 两个 job 全部步骤通过。`docs/evidence/` 下的两份报告是从该 run 的 drill 步骤产出的原始内容转录（GitHub artifact 下载需认证，CI 同时把每行发成可公开读取的注解）。
+CI 记录（run [36210280753](https://github.com/pangu-cn/PanguAgent/actions/runs/36210280753)，2026-09-26，提交 `1b0245d`，分支 `f7-checkpoint-rollback`）：`ubuntu-latest` 与 `windows-latest` 两个 job 全部步骤通过，且 `Run F7 checkpoint operator drills` 与 `Publish F7 drill report` 在两个 job 上都是 `success`（已按 run 的 job 列表核对，2026-10-07）。`docs/evidence/` 下的两份报告是从该 run 的 drill 步骤产出的原始内容转录（GitHub artifact 下载需认证，CI 同时把每行发成可公开读取的注解）。
 
 **关于工具链版本**：CI 用的是浮动的 `@stable`，本表不写 CI 的 rustc 具体版本——那只能从 run 日志读到，而 job 日志需要 admin 权限。本机行的 1.98.0 是实测值；按 1.98.0 构建于 2026-08-18、Rust 六周一个发布窗口推算，run 时的 stable 很可能仍是 1.98.0，但这是**推断**，不当作证据。
 

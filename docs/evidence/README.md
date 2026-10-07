@@ -12,12 +12,15 @@
 | `f7-drills-windows-105258e.jsonl` | GitHub Actions `windows-latest` | `105258e` | 7 pass |
 | `f7-drills-ubuntu-105258e.jsonl` | GitHub Actions `ubuntu-latest` | `105258e` | 6 pass + 1 not-applicable |
 | `f7-drills-windows-8f60878.jsonl` | 本机实测 Windows 10.0.19045 / x86_64 | `8f60878` | 7 pass |
+| `f7-drills-windows-853017f.jsonl` | 本机实测 Windows 10.0.19045 / rustc 1.98.1 | `853017f` | 7 pass |
 
 `105258e` 的两份是修复 Ubuntu 测试失败后的第一次全绿运行（run [37398616832](https://github.com/pangu-cn/PanguAgent/actions/runs/37398616832)）；此前 `plan-a` 上 ubuntu 侧连续 7 次失败，原因见 [`CHECKPOINT_RECOVERY.md`](../CHECKPOINT_RECOVERY.md) §11。
 
 `f7-drills-windows-10.0.19045.jsonl` 是**本机**记录，不是 CI 结论，也**不构成** §9.1 要求的"目标部署平台"验收——它只证明该套 drill 在该提交上可复现。条目格式仍严格遵循下面的 schema。
 
 `f7-drills-windows-8f60878.jsonl` 同样是**本机**记录，用于证明该套 drill 在 F8/F9 改动之后仍可复现（7 pass）。它**不构成** §9.1 的目标平台验收，理由同上。
+
+`f7-drills-windows-853017f.jsonl` 是本表写入时最新的一份**本机**记录，对应当前 HEAD（修掉证据里 verbatim 路径的那次改动之后），同样**不构成** §9.1 的目标平台验收。每次改动 drill 或 checkpoint 相关代码后应**追加**新行，而不是改写旧行：旧行记录的是当时的提交，改写会让证据与提交的对应关系失真。
 
 ## F8 沙箱"真拉起执行"的证据
 
