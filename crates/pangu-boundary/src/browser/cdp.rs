@@ -511,12 +511,16 @@ pub(crate) fn create_private_profile_dir(path: &std::path::Path) -> Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(path).map_err(|error| {
-        Error::Other(format!(
-            "cannot create the browser profile directory {}: {error}",
-            path.display()
-        ))
-    })?;
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(Error::Other(format!(
+                "cannot create the browser profile directory {}: {error}",
+                path.display()
+            )));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
