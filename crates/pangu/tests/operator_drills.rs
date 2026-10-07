@@ -437,10 +437,24 @@ fn drill_failed_operation_is_recorded_and_never_auto_retried() {
     // than a mid-restore write failure, which is what this drill is for.
     let blocked = Blocked::mid_restore(&fixture.workspace);
     if matches!(blocked.mechanism(), "unsupported") {
+        // `not-applicable`, not `skipped`: the mechanism this drill rehearses
+        // cannot exist for this account (root ignores directory permissions), so
+        // there is nothing here to exercise. `docs/evidence/README.md` fixes that
+        // vocabulary and treats both as *not a pass*.
+        //
+        // The distinction is recorded rather than silent because it decides what
+        // the report means: a `not-applicable` line tells the release owner that
+        // this drill needs a non-privileged account to count, whereas dropping
+        // the line would let its absence read as "nothing to see". CI runs the
+        // drills as a non-root user, so there the drill does execute — this path
+        // exists for the case where someone runs them as root and needs to know
+        // that the result does not cover the branch.
         record_drill(
             "failed-operation",
-            "skipped",
-            "this account cannot express a mid-restore write failure",
+            "not-applicable",
+            "root bypasses directory permissions, so a mid-restore write failure \
+             is not expressible for this account; re-run as a non-privileged user \
+             for this drill to count",
         );
         fixture.cleanup();
         return;
