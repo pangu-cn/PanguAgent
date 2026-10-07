@@ -180,6 +180,15 @@ impl ExecutionSection {
                         .into(),
                 ));
             }
+            // Docker and gVisor consume the image as a positional argument.
+            // A value beginning with '-' is parsed as another option, so it can
+            // override `--network=none` or add a mount after validation.
+            if image.starts_with('-') {
+                return Err(Error::Config(
+                    "execution.image must not start with '-': the runtime parses that as an option"
+                        .into(),
+                ));
+            }
         }
         // A sandbox needs something to execute in. Catching this at config time
         // means the operator learns before the run, not from every refused
@@ -238,6 +247,21 @@ mod tests {
             ..Default::default()
         };
         assert!(described.is_declared());
+    }
+
+    #[test]
+    fn an_image_that_looks_like_a_runtime_option_is_rejected() {
+        let image = ExecutionSection {
+            profile: ExecutionProfile::Container,
+            runtime: crate::runtime::SandboxRuntime::Oci,
+            image: Some("--network=bridge".into()),
+            ..Default::default()
+        };
+        let error = image.validate().expect_err("option-shaped image");
+        assert!(
+            error.to_string().contains("must not start"),
+            "the refusal must name the option hazard: {error}"
+        );
     }
 
     #[test]
