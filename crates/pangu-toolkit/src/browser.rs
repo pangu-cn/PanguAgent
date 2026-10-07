@@ -258,6 +258,11 @@ pub fn required_selector(args: &Value) -> Result<String> {
 /// The truncation flag is stated in the output rather than kept internal: a
 /// caller that does not know the text was clipped would treat a partial page as
 /// the whole page.
+pub fn page_must_not_remain_open(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("landed outside the boundary") || text.contains("not an allowed http(s) page")
+}
+
 pub fn require_allowed_page_url(
     url: &str,
     mut check_host: impl FnMut(&str) -> Result<()>,
@@ -385,6 +390,7 @@ mod tests {
         let error = require_allowed_page_url("file:///etc/passwd", |_| Ok(()))
             .expect_err("a redirect to file: must be refused");
         assert!(error.to_string().contains("file"), "{error}");
+        assert!(page_must_not_remain_open(&error));
     }
 
     #[test]

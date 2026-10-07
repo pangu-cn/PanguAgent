@@ -629,20 +629,24 @@ impl Toolkit {
                 other => bail!("`{other}` has no browser handler"),
             },
         );
-        if matches!(name, "browser_click" | "browser_type") {
+        if let Err(error) = &outcome {
+            if browser::page_must_not_remain_open(error) {
+                // A refused page must not stay available to the next browser
+                // action. This covers redirects from open/read/screenshot as
+                // well as navigation caused by click or typing.
+                slot.close();
+            }
+        } else if matches!(name, "browser_click" | "browser_type") {
             match slot.with_open(|handle| {
                 let url = handle.session()?.snapshot()?.url;
-                require_current_page(action, &url).map(|()| url)
+                require_current_page(action, &url)
             }) {
-                Ok(_) => {}
-                Err(error) if error.to_string().contains("landed outside the boundary") => {
-                    // The mutation already reached the page. Keeping that page
-                    // open would let a later read observe a forbidden host.
+                Ok(()) => {}
+                Err(error) if browser::page_must_not_remain_open(&error) => {
                     slot.close();
                     return Err(error);
                 }
-                Err(error) if outcome.is_ok() => return Err(error),
-                Err(_) => {}
+                Err(error) => return Err(error),
             }
         }
         outcome
