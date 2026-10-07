@@ -93,6 +93,18 @@ impl BrowserHandle {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("screenshot path has no parent"))?;
+        let mut current = std::path::PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+                if metadata.file_type().is_symlink() {
+                    bail!(
+                        "refusing to write a screenshot through a symlink: {}",
+                        current.display()
+                    );
+                }
+            }
+        }
         if let Ok(metadata) = std::fs::symlink_metadata(path) {
             if metadata.file_type().is_symlink() {
                 bail!(
@@ -241,11 +253,20 @@ pub fn resolve_config(
             "--crash-dumps-dir",
         ];
         let normalized = argument.trim().to_ascii_lowercase();
-        if forbidden.iter().any(|prefix| {
+        let single_dash: Vec<String> = forbidden
+            .iter()
+            .map(|prefix| prefix.replacen("--", "-", 1))
+            .collect();
+        let prefixes: Vec<&str> = forbidden
+            .iter()
+            .copied()
+            .chain(single_dash.iter().map(String::as_str))
+            .collect();
+        if prefixes.iter().any(|prefix| {
             normalized == *prefix
                 || normalized.starts_with(&format!("{prefix}="))
                 || normalized.starts_with(&format!("{prefix} "))
-        }) || (forbidden.iter().any(|prefix| normalized == *prefix) && next.is_some())
+        }) || (prefixes.iter().any(|prefix| normalized == *prefix) && next.is_some())
         {
             bail!("[browser] args must not override the loopback debugger endpoint: {argument}");
         }
