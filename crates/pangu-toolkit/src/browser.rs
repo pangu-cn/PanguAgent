@@ -258,6 +258,35 @@ pub fn required_selector(args: &Value) -> Result<String> {
 /// The truncation flag is stated in the output rather than kept internal: a
 /// caller that does not know the text was clipped would treat a partial page as
 /// the whole page.
+pub fn navigation_host(url: &str) -> Result<String> {
+    let parsed =
+        url::Url::parse(url).map_err(|error| anyhow!("`url` is not a valid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!(
+            "browser navigation only supports http and https; got `{}`",
+            parsed.scheme()
+        );
+    }
+    let host_name = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("the URL has no host"))?
+        .to_ascii_lowercase();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    Ok(if host_name.contains(':') {
+        format!("[{host_name}]:{port}")
+    } else {
+        format!("{host_name}:{port}")
+    })
+}
+
+pub fn require_validated_navigation_host(url: &str, validated_hosts: &[String]) -> Result<()> {
+    let host = navigation_host(url)?;
+    if !validated_hosts.iter().any(|validated| validated == &host) {
+        bail!("navigation host `{host}` was not validated by L3");
+    }
+    Ok(())
+}
+
 pub fn require_validated_browser_action(name: &str, browser_session: bool) -> Result<()> {
     // Open is authorized by its checked host, and screenshot by its writable
     // artifact path. Read, click, and type use the browser session itself.
@@ -412,6 +441,17 @@ mod tests {
             .expect("screenshot is authorized by its write path");
         require_validated_browser_action("browser_open", false)
             .expect("open is authorized by its checked host");
+        require_validated_navigation_host(
+            "https://allowed.example/path",
+            &["allowed.example:443".into()],
+        )
+        .expect("the validated host may be opened");
+        let error = require_validated_navigation_host(
+            "https://other.example/",
+            &["allowed.example:443".into()],
+        )
+        .expect_err("a different host must not reuse the approval");
+        assert!(error.to_string().contains("other.example"), "{error}");
     }
 
     #[test]

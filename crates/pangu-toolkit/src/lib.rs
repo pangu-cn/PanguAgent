@@ -495,27 +495,7 @@ impl Toolkit {
             "external_read" => {
                 ensure_allowed_keys(&call.args, &["url"])?;
                 let url = required_string(&call.args, "url")?;
-                let parsed = url::Url::parse(&url)
-                    .map_err(|error| anyhow!("`url` is not a valid URL: {error}"))?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    bail!(
-                        "browser navigation only supports http and https; got `{}`",
-                        parsed.scheme()
-                    );
-                }
-                if parsed.host_str().is_none() {
-                    bail!("the URL has no host");
-                }
-                let host_name = parsed
-                    .host_str()
-                    .expect("checked above")
-                    .to_ascii_lowercase();
-                let port = parsed.port_or_known_default().unwrap_or(443);
-                let host = if host_name.contains(':') {
-                    format!("[{host_name}]:{port}")
-                } else {
-                    format!("{host_name}:{port}")
-                };
+                let host = browser::navigation_host(&url)?;
                 // Validate the host through the same boundary `http_fetch`
                 // uses: navigation is an outbound request.
                 sandbox.check_host(&host)?;
@@ -561,6 +541,7 @@ impl Toolkit {
             |handle| match name {
                 "browser_open" => {
                     let url = required_string(&args, "url")?;
+                    browser::require_validated_navigation_host(&url, &action.resources().hosts)?;
                     let session = handle.session()?;
                     session.navigate(&url)?;
                     // Returning the page immediately saves a round trip: an
