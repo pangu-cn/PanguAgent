@@ -248,13 +248,26 @@ impl WebSocket {
             value @ 0..=125 => value as usize,
             126 => {
                 let bytes = self.take(2, deadline)?;
-                u16::from_be_bytes([bytes[0], bytes[1]]) as usize
+                let value = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+                // RFC 6455 forbids a 16-bit length below 126. Accepting it lets
+                // two parsers disagree about where the payload starts.
+                if value < 126 {
+                    return Err(Error::Other(
+                        "websocket frame used a non-minimal 16-bit length".into(),
+                    ));
+                }
+                value
             }
             127 => {
                 let bytes = self.take(8, deadline)?;
                 let mut array = [0u8; 8];
                 array.copy_from_slice(&bytes);
                 let value = u64::from_be_bytes(array);
+                if value < 65536 {
+                    return Err(Error::Other(
+                        "websocket frame used a non-minimal 64-bit length".into(),
+                    ));
+                }
                 usize::try_from(value).map_err(|_| {
                     Error::Other("websocket frame length does not fit in memory".into())
                 })?
@@ -582,6 +595,19 @@ mod tests {
         raw.extend_from_slice(&((MAX_FRAME_BYTES as u64) + 1).to_be_bytes());
         let error = decode_one(&raw).expect_err("must reject");
         assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn a_non_minimal_extended_length_is_rejected() {
+        let short = vec![0x81, 126, 0, 2, b'h', b'i'];
+        let error = decode_one(&short).expect_err("16-bit form below 126");
+        assert!(error.to_string().contains("non-minimal"), "{error}");
+
+        let mut long = vec![0x81, 127];
+        long.extend_from_slice(&300u64.to_be_bytes());
+        long.extend(std::iter::repeat_n(b'x', 300));
+        let error = decode_one(&long).expect_err("64-bit form below 65536");
+        assert!(error.to_string().contains("non-minimal"), "{error}");
     }
 
     #[test]

@@ -235,6 +235,12 @@ impl BrowserSession {
                     {
                         return Ok(());
                     }
+                    // A command can fail after its first result was accepted.
+                    // Keeping only the reply and waiting for the load event would
+                    // turn that failure into a generic load timeout.
+                    if message.get("error").is_some() {
+                        return unwrap_reply("Page.navigate", message).map(|_| ());
+                    }
                     self.retain_if_requested(message);
                 }
                 None => {
