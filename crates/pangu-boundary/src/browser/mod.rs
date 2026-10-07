@@ -96,9 +96,10 @@ impl BrowserConfig {
             "--no-default-browser-check".to_string(),
         ];
         if !self.network {
-            // `--disable-features=NetworkService` is not used: it disables the
-            // network stack entirely and breaks even localhost. Blocking is done
-            // at the request level in the session instead.
+            // Navigation checks cannot stop a script from changing the page.
+            // Disabling JavaScript removes that path while data and about pages
+            // remain readable.
+            args.push("--disable-javascript".to_string());
             args.push("--disable-background-networking".to_string());
         }
         args.extend(self.extra_args.iter().cloned());

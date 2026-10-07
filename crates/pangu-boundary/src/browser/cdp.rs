@@ -266,6 +266,7 @@ impl BrowserSession {
     /// user never sees and would let a page hide text from a human while
     /// showing it to the model.
     pub fn snapshot(&mut self) -> Result<PageSnapshot> {
+        self.require_local_page()?;
         let url = self.evaluate("document.location.href")?;
         let title = self.evaluate("document.title")?;
         let text = self.evaluate("document.body ? document.body.innerText : ''")?;
@@ -329,6 +330,7 @@ impl BrowserSession {
 
     /// Take a PNG screenshot of the visible viewport.
     pub fn screenshot(&mut self) -> Result<Vec<u8>> {
+        self.require_local_page()?;
         let reply = self.call(
             "Page.captureScreenshot",
             json!({"format": "png", "captureBeyondViewport": false}),
@@ -348,6 +350,7 @@ impl BrowserSession {
     /// that is covered by an overlay or scrolled out of view, and the caller
     /// would believe a real user action happened.
     pub fn click(&mut self, selector: &str) -> Result<()> {
+        self.require_local_page()?;
         let box_reply = self.call(
             "Runtime.evaluate",
             json!({
@@ -397,6 +400,7 @@ impl BrowserSession {
     /// events that most frameworks listen to, so a form would appear filled
     /// while its handlers never ran.
     pub fn type_text(&mut self, text: &str) -> Result<()> {
+        self.require_local_page()?;
         for character in text.chars() {
             self.call(
                 "Input.dispatchKeyEvent",
@@ -561,6 +565,22 @@ fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
 
 /// The navigation failure carried inside an otherwise successful CDP result.
 ///
+impl BrowserSession {
+    fn require_local_page(&mut self) -> Result<()> {
+        if self.network {
+            return Ok(());
+        }
+        let url = self.evaluate("document.location.href")?;
+        if local_page_url(&url) {
+            Ok(())
+        } else {
+            Err(Error::Other(format!(
+                "the current page is outside the disabled-network boundary: {url}"
+            )))
+        }
+    }
+}
+
 fn local_page_url(url: &str) -> bool {
     let scheme = url.split_once(':').map(|(scheme, _)| scheme);
     matches!(scheme, Some("data" | "about"))
