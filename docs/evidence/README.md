@@ -48,8 +48,73 @@ docker: error during connect: ... open //./pipe/dockerDesktopLinuxEngine: Access
 
 `docker version` 在本机 30s 无响应，Docker Desktop 的 Linux 引擎处于不可用状态；WSL
 无发行版、无 Podman。因此**本机无法完成 OCI 运行时的真实容器内执行验证**，该验证在
-CI 的 `ubuntu-latest` 上才有条件进行。这不是通过，也不是跳过——它是未执行，且已如实
-标注。
+CI 的 `ubuntu-latest` 上才有条件进行。
+
+### 该验证已于 2026-10-07 在 Linux CI 上真实执行
+
+| 项 | 值 |
+| --- | --- |
+| 提交 | `923826a` |
+| run id | `37555456148` |
+| 结论 | `success`（ubuntu-latest 与 windows-latest 均成功） |
+
+`ubuntu-latest` 上 **全部步骤 success**，其中两项是本仓库历史上**第一次在 Linux 上
+真正执行**：
+
+```
+success  Install a browser for the real-runtime tests
+success  Run tests that need a real runtime
+```
+
+在此之前，ubuntu 每次都在 `Run all tests` 就失败，这两步一直是 `skipped` —— 也就是说
+`browser_cdp.rs` 的 9 项 `#[ignore]` 测试与容器内执行路径**从未在 Linux 上跑过**，
+只有本机桩证据。现在它们真的跑了。
+
+为什么长期卡住：CI 一次只暴露一个失败，而每个失败都需要一次推送才能看到。真正的
+成因是一类**夹具缺陷**（见下），逐个修必然绕圈子。这一轮改为先做全仓审计、再批量修复，
+把八处同源缺陷一次清掉，ubuntu 才第一次通过。
+
+**仍然成立**：桩不能证明 Docker 对隔离标志的实现是否正确，那属于运行时自身属性；
+本机也仍无可用容器运行时。上面这条记录证明的是"命令确实被送进了真实运行时"。
+
+## 夹具的临时目录必须规范化（一类 CI-only 失败）
+
+同一类缺陷在 **9 个文件**里各出现一次，值得单独记下来，因为它每次都以
+"本机全绿、CI 全红"的形式出现，且原因与被测代码毫无关系。
+
+`journal::reject_symlink_components`（`journal.rs:215`）会从待检路径一路向上走到
+文件系统根，**任何一层是符号链接就拒绝**；`artifact.rs` 同形。而
+`Sandbox::from_config` 会规范化 workspace，`resolve_executable` 又拿规范化后的路径做
+`starts_with` 比较。
+
+Linux 容器镜像里 `/tmp` 常常是符号链接。于是 `std::env::temp_dir()` 直接拼出来的
+夹具路径**在 CI 上必然被拒**，而在维护者本机必然通过 —— 本机 temp 目录是真目录。
+
+已在本机用真实目录符号链接复现（不是推断）：
+
+```
+raw   = ...\slink\pangu-raw-journal.jsonl
+raw   result = Err("journal path must not contain symlink components: ...\slink")
+
+fixed = \\?\...\sreal\pangu-probe-...\journal.jsonl
+fixed result = Ok("ok")
+```
+
+解法是一个共享实现 `pangu_core::testing::TempDir`（feature `test-support`），
+而不是再抄一份 —— 本仓库此前已把同一个 helper 抄进 `config.rs`、`test_support.rs`、
+`mcp_boundary.rs` 三处，而 `journal.rs`、`stream.rs` 等仍在用 raw 形式。
+
+## 跨平台测试不要断言平台特有的路径语义
+
+`a_verbatim_host_path_is_not_handed_to_the_runtime` 的第一版把 strip 逻辑放在
+`#[cfg(windows)]` 里，然后断言"verbatim 会被去掉"。它在 Linux 上必然失败，两个原因：
+
+- `#[cfg(windows)]` 块在 Linux 上根本不编译；
+- `Path::new(r"\\?\C:\work\ws")` 在 Unix 上是**一个含反斜杠的文件名**，不是盘符路径。
+
+改法不是给测试加 `cfg`，而是**消掉平台分支**：前缀处理本来就是文本规则，拆成
+`strip_verbatim(&str)` 后两个平台跑同一份逻辑，测试在本地即可覆盖 CI 行为。
+前面几轮反复栽在"Windows 走不到 Linux 的分支"，这次直接把分支去掉。
 
 ## §9.3 备份可读性 drill
 
