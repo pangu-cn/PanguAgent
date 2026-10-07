@@ -261,9 +261,25 @@ fn the_workspace_mount_reaches_the_runtime_argv() {
         probe_call.contains("--workdir=/workspace"),
         "the workdir must be the mount point: {probe_call}"
     );
+    // The mount source must identify the declared workspace, but **not** by its
+    // verbatim spelling: Windows canonicalization prefixes `\\?\`, and a
+    // container runtime parses the windows-side path itself, so it rejects that
+    // form. Compare the mountable rendering, and state the requirement that the
+    // verbatim marker is absent — otherwise this assertion would encode the bug
+    // it is meant to catch (it did, before the fix).
+    let mountable = workspace.display().to_string();
+    let mountable = mountable
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| mountable.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| mountable.clone());
     assert!(
-        probe_call.contains(&workspace.display().to_string()),
-        "the mount source must be the declared workspace: {probe_call}"
+        probe_call.contains(&mountable),
+        "the mount source must be the declared workspace ({mountable}): {probe_call}"
+    );
+    assert!(
+        !probe_call.contains(r"\\?\"),
+        "the mount source must not carry a verbatim prefix: {probe_call}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

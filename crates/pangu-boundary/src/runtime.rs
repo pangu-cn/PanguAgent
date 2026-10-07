@@ -313,6 +313,7 @@ impl RuntimeConfig {
     /// probe is invoked identically when it matters. Two separate argv builders
     /// would let a probe succeed under arguments the real path never uses.
     fn build_command(&self, kind: SandboxRuntime) -> (String, Vec<String>, Option<String>) {
+        let host_mount = host_mount_path(&self.workspace);
         match kind {
             SandboxRuntime::Local | SandboxRuntime::Auto => (String::new(), Vec::new(), None),
             SandboxRuntime::Firecracker => (
@@ -322,7 +323,7 @@ impl RuntimeConfig {
                     "--config-file".to_string(),
                     "/dev/stdin".to_string(),
                 ],
-                Some(self.workspace.display().to_string()),
+                Some(host_mount.clone()),
             ),
             SandboxRuntime::Gvisor => {
                 let mut args = vec![
@@ -331,7 +332,7 @@ impl RuntimeConfig {
                     // The workspace is the only host path visible inside; no
                     // other bind mount is offered, so the sandbox cannot read
                     // the rest of the host filesystem.
-                    format!("--bind={}:/workspace", self.workspace.display()),
+                    format!("--bind={host_mount}:/workspace"),
                     "--cwd=/workspace".to_string(),
                 ];
                 if !self.network {
@@ -351,7 +352,7 @@ impl RuntimeConfig {
                     // deliberately not `-t`: no TTY is needed, and allocating
                     // one would tie the sandbox to a terminal.
                     "-i".to_string(),
-                    format!("--volume={}:/workspace", self.workspace.display()),
+                    format!("--volume={host_mount}:/workspace"),
                     "--workdir=/workspace".to_string(),
                     // Drop every capability. A command needing one should have
                     // to ask, and that ask should be visible.
@@ -603,6 +604,38 @@ fn find_program(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// A host path rendered for a bind mount.
+///
+/// On Windows, `std::fs::canonicalize` returns a *verbatim* path with a `\\?\`
+/// prefix (and a UNC form for network shares). That spelling is meaningful to the
+/// Win32 API — it is what lets us address long paths and sidesteps the usual
+/// normalization — but it is not something a container runtime can mount:
+/// `docker run --volume=\\?\F:\ws:/workspace` is rejected, because the runtime
+/// parses the windows-side path itself and does not know the verbatim form.
+///
+/// Since the workspace is canonicalized on the way in (to make the sandbox's
+/// prefix checks sound), the verbatim form reaches this function every time on
+/// Windows. Strip it back to a normal drive path for the mount argument only.
+/// The *launcher's working directory* is a different matter: it is passed to a
+/// host process, which does accept the verbatim form, so it keeps whatever the
+/// caller canonicalized.
+///
+/// On Unix there is nothing to strip and this is the path unchanged.
+fn host_mount_path(workspace: &Path) -> String {
+    let text = workspace.display().to_string();
+    #[cfg(windows)]
+    {
+        // `\\?\C:\ws` -> `C:\ws`; `\\?\UNC\server\share` -> `\\server\share`.
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
 /// Run a probe command with a bounded wait, returning its combined output.
 fn run_probe(argv: &[String]) -> std::result::Result<String, String> {
     let (program, args) = argv.split_first().ok_or("empty probe command")?;
@@ -653,6 +686,43 @@ fn first_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verbatim path is not mountable, and canonicalization produces one on
+    /// Windows, so the mount argument must not carry it.
+    #[test]
+    fn a_verbatim_host_path_is_not_handed_to_the_runtime() {
+        // The exact shape Windows canonicalization produces.
+        let verbatim = Path::new(r"\\?\C:\work\ws");
+        assert_eq!(host_mount_path(verbatim), r"C:\work\ws");
+
+        // A UNC share keeps its backslashes but loses the verbatim marker.
+        let unc = Path::new(r"\\?\UNC\server\share\ws");
+        assert_eq!(host_mount_path(unc), r"\\server\share\ws");
+
+        // A plain path is untouched.
+        assert_eq!(host_mount_path(Path::new(r"C:\work\ws")), r"C:\work\ws");
+        assert_eq!(host_mount_path(Path::new("/work/ws")), "/work/ws");
+    }
+
+    /// The reachable form of the same bug: whatever the workspace spelling is,
+    /// the `--volume` argument must not contain `\\?\`.
+    #[test]
+    fn the_container_mount_argument_never_carries_a_verbatim_prefix() {
+        let mut config = config(SandboxRuntime::Oci);
+        config.workspace = PathBuf::from(r"\\?\C:\work\ws");
+        let (program, args, mount) = config.build_command(SandboxRuntime::Oci);
+        assert_eq!(program, "docker");
+        let volume = args
+            .iter()
+            .find(|a| a.starts_with("--volume="))
+            .expect("a volume argument");
+        assert!(
+            !volume.contains(r"\\?\"),
+            "a verbatim path cannot be mounted: {volume}"
+        );
+        assert!(volume.contains(r"C:\work\ws"), "{volume}");
+        assert_eq!(mount.as_deref(), Some("/workspace"));
+    }
 
     fn config(runtime: SandboxRuntime) -> RuntimeConfig {
         RuntimeConfig {
