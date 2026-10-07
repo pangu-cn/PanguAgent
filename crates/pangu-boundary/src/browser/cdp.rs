@@ -91,12 +91,7 @@ impl BrowserSession {
             }
             .refusal());
         }
-        std::fs::create_dir_all(&config.profile_dir).map_err(|error| {
-            Error::Other(format!(
-                "cannot create the browser profile directory {}: {error}",
-                config.profile_dir.display()
-            ))
-        })?;
+        create_private_profile_dir(&config.profile_dir)?;
 
         let args = config.args();
         let mut command = match runtime_launcher {
@@ -464,6 +459,35 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
             path.display()
         ))
     })
+}
+
+pub(crate) fn create_private_profile_dir(path: &std::path::Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| {
+        Error::Other(format!(
+            "cannot create the browser profile directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                Error::Other(format!(
+                    "cannot restrict the browser profile directory {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn profile_is_child_of(path: &std::path::Path, root: &std::path::Path) -> bool {
@@ -861,6 +885,27 @@ mod tests {
         assert!(sibling.exists());
         let _ = std::fs::remove_dir_all(sibling);
         let _ = std::fs::remove_dir_all(escaped);
+    }
+
+    #[test]
+    fn a_browser_profile_is_private_to_its_owner() {
+        let root = std::env::temp_dir()
+            .join("pangu-browser")
+            .join(format!("private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        create_private_profile_dir(&root).expect("private profile");
+        assert!(root.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&root)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "other users must not read browser cookies");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
