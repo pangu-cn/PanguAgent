@@ -258,6 +258,15 @@ pub fn required_selector(args: &Value) -> Result<String> {
 /// The truncation flag is stated in the output rather than kept internal: a
 /// caller that does not know the text was clipped would treat a partial page as
 /// the whole page.
+pub fn require_validated_browser_action(name: &str, browser_session: bool) -> Result<()> {
+    // Open is authorized by its checked host, and screenshot by its writable
+    // artifact path. Read, click, and type use the browser session itself.
+    if matches!(name, "browser_read" | "browser_click" | "browser_type") && !browser_session {
+        bail!("`{name}` was not authorized as a browser session; L3 did not validate it");
+    }
+    Ok(())
+}
+
 pub fn page_must_not_remain_open(error: &anyhow::Error) -> bool {
     let text = error.to_string();
     text.contains("landed outside the boundary") || text.contains("not an allowed http(s) page")
@@ -391,6 +400,18 @@ mod tests {
             .expect_err("a redirect to file: must be refused");
         assert!(error.to_string().contains("file"), "{error}");
         assert!(page_must_not_remain_open(&error));
+    }
+
+    #[test]
+    fn execution_refuses_a_browser_action_l3_did_not_authorize() {
+        let error = require_validated_browser_action("browser_click", false)
+            .expect_err("click needs the validated session");
+        assert!(error.to_string().contains("L3"), "{error}");
+        require_validated_browser_action("browser_click", true).expect("validated click");
+        require_validated_browser_action("browser_screenshot", false)
+            .expect("screenshot is authorized by its write path");
+        require_validated_browser_action("browser_open", false)
+            .expect("open is authorized by its checked host");
     }
 
     #[test]

@@ -1052,7 +1052,13 @@ impl ToolExecutor for Toolkit {
             "git_diff" => execute_command(action, self.runtime.as_deref()).await,
             "run_command" => execute_command(action, self.runtime.as_deref()).await,
             "verify" => execute_verify(action, self.runtime.as_deref()).await,
-            name if browser::is_browser_tool(name) => self.execute_browser(action),
+            name if browser::is_browser_tool(name) => {
+                browser::require_validated_browser_action(
+                    name,
+                    action.resources().browser_session,
+                )?;
+                self.execute_browser(action)
+            }
             "propose_memory" => {
                 let store = self
                     .memory
