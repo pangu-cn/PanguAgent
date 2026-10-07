@@ -230,12 +230,12 @@ pub fn resolve_config(
             "--load-extension",
             "--disable-extensions-except",
         ];
-        let normalized = argument.trim();
+        let normalized = argument.trim().to_ascii_lowercase();
         if forbidden.iter().any(|prefix| {
             normalized == *prefix
                 || normalized.starts_with(&format!("{prefix}="))
                 || normalized.starts_with(&format!("{prefix} "))
-        }) || (forbidden.contains(&normalized) && next.is_some())
+        }) || (forbidden.iter().any(|prefix| normalized == *prefix) && next.is_some())
         {
             bail!("[browser] args must not override the loopback debugger endpoint: {argument}");
         }
@@ -678,7 +678,7 @@ mod tests {
             None,
             std::path::PathBuf::from("/tmp/p"),
             false,
-            vec!["--user-data-dir".into(), "/tmp/other".into()],
+            vec!["--User-Data-Dir".into(), "/tmp/other".into()],
         )
         .expect_err("must refuse");
         assert!(

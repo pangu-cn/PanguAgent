@@ -396,6 +396,9 @@ impl Sandbox {
                 "passwd",
                 "auth",
                 "credential",
+                "session",
+                "cookie",
+                "signature",
             ]
             .iter()
             .any(|part| key.contains(part))
@@ -1050,6 +1053,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!query_error.contains("secret"));
+        assert!(sandbox
+            .check_url("https://example.com/?session=abc")
+            .is_err());
         assert!(sandbox.check_url("file:///etc/passwd").is_err());
         let mut local_config = config.clone();
         local_config.network.allow_localhost = true;
