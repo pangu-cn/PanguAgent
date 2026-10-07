@@ -570,13 +570,7 @@ impl Toolkit {
                     // The requested host was checked before navigation. A redirect
                     // can land somewhere else, so the page actually reached must
                     // pass the same egress check before its content is returned.
-                    browser::require_allowed_page_url(&snapshot.url, |host| {
-                        action
-                            .sandbox()
-                            .check_host(host)
-                            .map(|_| ())
-                            .map_err(|error| anyhow!(error))
-                    })?;
+                    require_current_page(action, &snapshot.url)?;
                     Ok(browser::output(
                         browser::render_snapshot(
                             &snapshot.url,
@@ -590,6 +584,7 @@ impl Toolkit {
                 "browser_read" => {
                     let session = handle.session()?;
                     let snapshot = session.snapshot()?;
+                    require_current_page(action, &snapshot.url)?;
                     Ok(browser::output(
                         browser::render_snapshot(
                             &snapshot.url,
@@ -616,6 +611,7 @@ impl Toolkit {
                     let selector = browser::required_selector(&args)?;
                     let session = handle.session()?;
                     session.click(&selector)?;
+                    require_current_page(action, &session.snapshot()?.url)?;
                     Ok(browser::output(
                         format!("clicked {selector}"),
                         Some(format!("clicked:{selector}")),
@@ -625,6 +621,7 @@ impl Toolkit {
                     let text = required_string(&args, "text")?;
                     let session = handle.session()?;
                     session.type_text(&text)?;
+                    require_current_page(action, &session.snapshot()?.url)?;
                     Ok(browser::output(
                         format!("typed {} characters", text.chars().count()),
                         Some(format!("typed:{}", text.chars().count())),
@@ -1507,6 +1504,16 @@ fn resolve_executable(program: &str, sandbox: &Sandbox) -> Result<PathBuf> {
         }
     }
     bail!("executable `{program}` was not found outside the workspace")
+}
+
+fn require_current_page(action: &VerifiedAction, url: &str) -> Result<()> {
+    browser::require_allowed_page_url(url, |host| {
+        action
+            .sandbox()
+            .check_host(host)
+            .map(|_| ())
+            .map_err(|error| anyhow!(error))
+    })
 }
 
 async fn execute_command(
