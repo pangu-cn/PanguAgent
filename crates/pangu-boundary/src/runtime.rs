@@ -604,6 +604,28 @@ fn find_program(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Strip a Windows verbatim prefix from a path's textual form.
+///
+/// Split out from [`host_mount_path`] so the rule can be tested on every
+/// platform: the transformation is about text, and a test that built a `Path`
+/// from a Windows literal would be checking Unix path semantics on Unix.
+fn strip_verbatim(text: &str) -> String {
+    // `\\?\UNC\server\share` -> `\\server\share`; the UNC form is what other
+    // Windows programs expect, so only the marker is removed.
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    // `\\?\C:\ws` -> `C:\ws`. Guard against a bare `\\?\` with nothing after it:
+    // returning an empty mount source would be worse than leaving it alone, and
+    // the caller would then mount nothing at all.
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    text.to_string()
+}
+
 /// A host path rendered for a bind mount.
 ///
 /// On Windows, `std::fs::canonicalize` returns a *verbatim* path with a `\\?\`
@@ -622,18 +644,7 @@ fn find_program(name: &str) -> Option<PathBuf> {
 ///
 /// On Unix there is nothing to strip and this is the path unchanged.
 fn host_mount_path(workspace: &Path) -> String {
-    let text = workspace.display().to_string();
-    #[cfg(windows)]
-    {
-        // `\\?\C:\ws` -> `C:\ws`; `\\?\UNC\server\share` -> `\\server\share`.
-        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}");
-        }
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
-            return rest.to_string();
-        }
-    }
-    text
+    strip_verbatim(&workspace.display().to_string())
 }
 
 /// Run a probe command with a bounded wait, returning its combined output.
@@ -689,19 +700,27 @@ mod tests {
 
     /// A verbatim path is not mountable, and canonicalization produces one on
     /// Windows, so the mount argument must not carry it.
+    ///
+    /// This drives the string transformation rather than constructing a `Path`
+    /// from a Windows literal, because on Unix `Path::new(r"\\?\C:\ws")` is a
+    /// single filename containing backslashes, not a drive path — an earlier
+    /// version of this test asserted Windows semantics on Linux and failed
+    /// there. The function's contract is about the *text* it produces, so this
+    /// checks that text on every platform.
     #[test]
     fn a_verbatim_host_path_is_not_handed_to_the_runtime() {
-        // The exact shape Windows canonicalization produces.
-        let verbatim = Path::new(r"\\?\C:\work\ws");
-        assert_eq!(host_mount_path(verbatim), r"C:\work\ws");
-
+        assert_eq!(strip_verbatim(r"\\?\C:\work\ws"), r"C:\work\ws");
         // A UNC share keeps its backslashes but loses the verbatim marker.
-        let unc = Path::new(r"\\?\UNC\server\share\ws");
-        assert_eq!(host_mount_path(unc), r"\\server\share\ws");
-
-        // A plain path is untouched.
-        assert_eq!(host_mount_path(Path::new(r"C:\work\ws")), r"C:\work\ws");
-        assert_eq!(host_mount_path(Path::new("/work/ws")), "/work/ws");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\server\share\ws"),
+            r"\\server\share\ws"
+        );
+        // A path that is already mountable is untouched, on either platform.
+        assert_eq!(strip_verbatim(r"C:\work\ws"), r"C:\work\ws");
+        assert_eq!(strip_verbatim("/work/ws"), "/work/ws");
+        // `\\?\` on its own is not a drive path; leave it rather than inventing
+        // an empty string.
+        assert_eq!(strip_verbatim(r"\\?\"), r"\\?\");
     }
 
     /// The reachable form of the same bug: whatever the workspace spelling is,
