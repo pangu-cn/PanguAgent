@@ -458,12 +458,14 @@ impl Toolkit {
                         ))
                         .write(artifact_dir.as_ref().join("screenshot.png")))
                 } else {
-                    Ok(
-                        ToolAssessment::new(Risk::ReadOnly).with_effect(EffectDescriptor::new(
-                            EffectScope::ProcessRead,
-                            Reversibility::NoEffect,
-                        )),
-                    )
+                    let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                        EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                    );
+                    // Reading the page uses the browser session the operator
+                    // enabled. ProcessRead requires a named resource; without
+                    // one, validate_effect rejects every browser_read.
+                    assessment.browser_session = true;
+                    Ok(assessment)
                 }
             }
             "external_mutation" => {

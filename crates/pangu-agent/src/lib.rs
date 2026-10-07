@@ -232,8 +232,10 @@ impl ToolAssessment {
                 }
             }
             EffectScope::ProcessRead => {
-                if self.argv.is_empty() {
-                    return Err(anyhow!("process-read assessment must declare an argv"));
+                if self.argv.is_empty() && !self.browser_session {
+                    return Err(anyhow!(
+                        "process-read assessment must declare an argv or browser session"
+                    ));
                 }
                 if !self.hosts.is_empty() || !self.write_paths.is_empty() {
                     return Err(anyhow!(

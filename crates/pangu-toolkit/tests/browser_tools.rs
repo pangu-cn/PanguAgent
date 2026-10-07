@@ -193,6 +193,19 @@ async fn a_click_and_a_type_produce_an_effect_the_agent_will_accept() {
         );
     }
 
+    let read = pangu_core::ToolCall::new("browser_read", serde_json::json!({}));
+    let read_assessment = toolkit
+        .assess(&read, &sandbox)
+        .await
+        .expect("browser_read must be assessable");
+    read_assessment
+        .validate_effect()
+        .expect("browser_read must name its browser session or L1 rejects every call");
+    assert!(
+        read_assessment.browser_session,
+        "browser_read observes the already-open browser session"
+    );
+
     let screenshot = pangu_core::ToolCall::new("browser_screenshot", serde_json::json!({}));
     let assessment = toolkit
         .assess(&screenshot, &sandbox)
