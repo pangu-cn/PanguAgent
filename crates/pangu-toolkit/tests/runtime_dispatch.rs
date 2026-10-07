@@ -109,7 +109,20 @@ fn temp_root(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!(
+    // Canonicalize the base before joining.
+    //
+    // On CI runners the platform temporary directory can sit behind a symlink
+    // (`/tmp` -> `/private/tmp` on macOS; some container images do the same on
+    // Linux). `resolve_executable` compares a *canonicalized* candidate against
+    // `sandbox.workspace`, so a workspace left un-canonicalized is compared as a
+    // different prefix and the program is rejected as "inside the workspace" —
+    // a refusal manufactured by the fixture rather than by the code.
+    //
+    // This repository already hit the same thing in
+    // `pangu-boundary/src/config.rs`'s `test_temp_root`; the lesson is applied
+    // here rather than rediscovered.
+    let base = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let path = base.join(format!(
         "pangu-f8-toolkit-{label}-{}-{nanos}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -409,12 +422,27 @@ async fn an_unusable_runtime_stops_the_command_before_it_reaches_the_runtime() {
 #[tokio::test]
 async fn without_a_declared_runtime_the_command_is_not_wrapped() {
     let root = temp_root("local");
+    // The stub must be *provably outside* the workspace, and
+    // `resolve_executable` compares canonicalized paths. If the two were reached
+    // through different spellings of the same symlinked tree, the check could
+    // reject a stub that is not actually inside — a refusal produced by the
+    // fixture, not by the code. So the stub is written first and then both sides
+    // are canonicalized for the comparison.
     let bin = root.join("bin");
     let record = root.join("argv.log");
     let workspace = root.join("ws");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let wrapper = "pangu-local-wrapper";
     write_stub_named(&bin, &record, "unused", wrapper);
+    let bin = std::fs::canonicalize(&bin).expect("canonical bin");
+    let workspace = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    assert!(
+        !bin.starts_with(&workspace),
+        "the fixture is wrong: the stub directory must sit outside the workspace \
+         (bin={}, workspace={})",
+        bin.display(),
+        workspace.display()
+    );
 
     let _path = PathGuard::prepend(&bin);
 
@@ -442,7 +470,18 @@ async fn without_a_declared_runtime_the_command_is_not_wrapped() {
     println!("local invocation recorded: {calls:?}");
     assert!(
         !calls.trim().is_empty(),
-        "the command should have run locally; events: {:#?}",
+        // The tool's own message is quoted first because it names the refusal
+        // reason; the event list alone is truncated by CI's annotation escaping,
+        // which is what made an earlier run of this test hard to diagnose.
+        "the command should have run locally, but nothing recorded it.\n\
+         tool said: {}\n\
+         all events: {:#?}",
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::ToolFinished)
+            .map(|event| event.message.clone())
+            .collect::<Vec<_>>()
+            .join(" | "),
         events
             .iter()
             .map(|e| (e.kind, e.message.clone()))
