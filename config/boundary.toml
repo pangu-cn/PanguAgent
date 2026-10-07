@@ -252,11 +252,11 @@ profile = "local"
 # 默认关闭：关闭时浏览器工具**根本不会被广告**，模型无法调用一个操作者没有
 # 开启的能力。开启后工具进入同一套 L1-L4 链，与其它工具逐位相同：
 #
-#   browser_open       NeedsHuman, ExternalRead   —— 会访问**主机**，声明其 host
-#   browser_read       ReadOnly,  NoEffect
-#   browser_screenshot ReadOnly,  NoEffect
-#   browser_click      Reversible, ExternalMutation
-#   browser_type       Reversible, ExternalMutation
+#   browser_open       NeedsHuman, ExternalRead
+#   browser_read       ReadOnly, ProcessRead
+#   browser_screenshot Reversible, Workspace
+#   browser_click      NeedsHuman, ExternalMutation / Irreversible
+#   browser_type       NeedsHuman, ExternalMutation / Irreversible
 #
 # 注意 click/type **不是**只读：点下去会发生什么由页面决定，把它当成观察会
 # 让一个改变状态的动作绕过人工闸门 —— 与"信任对方的 readOnlyHint"同类错误。
@@ -273,5 +273,8 @@ enabled = false
 network = false
 
 # 追加到内置参数之后的额外命令行参数（逐字传入）。
+# 不能覆盖调试地址、端口、套接字、用户数据目录、代理或扩展加载，
+# 也不能使用 --remote-allow-origins 或 --disable-web-security。
+# 等号、空格和拆成两个参数的写法都会被拒绝。
 # args = ["--lang=en-US"]
 

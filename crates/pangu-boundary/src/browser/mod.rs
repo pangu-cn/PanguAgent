@@ -91,12 +91,9 @@ impl BrowserConfig {
             // A fixed window size, so screenshots are comparable between runs
             // instead of depending on whatever size the default happened to be.
             "--window-size=1280,800".to_string(),
-            format!("--user-data-dir={}", self.profile_dir.display()),
             // No first-run UI, no default-browser prompts: these block startup.
             "--no-first-run".to_string(),
             "--no-default-browser-check".to_string(),
-            // The endpoint must be a real port so the session can connect.
-            "--remote-debugging-port=0".to_string(),
         ];
         if !self.network {
             // `--disable-features=NetworkService` is not used: it disables the
@@ -105,6 +102,11 @@ impl BrowserConfig {
             args.push("--disable-background-networking".to_string());
         }
         args.extend(self.extra_args.iter().cloned());
+        // Chromium lets a later switch override an earlier one. The profile and
+        // debugger endpoint therefore come last, after operator-supplied args.
+        args.push(format!("--user-data-dir={}", self.profile_dir.display()));
+        args.push("--remote-debugging-port=0".to_string());
+        args.push("--remote-debugging-address=127.0.0.1".to_string());
         args
     }
 }
@@ -272,6 +274,9 @@ mod tests {
         assert!(args.iter().any(|a| a == "--headless=new"));
         assert!(args.iter().any(|a| a == "--user-data-dir=/tmp/p"));
         assert!(args.iter().any(|a| a == "--remote-debugging-port=0"));
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--remote-debugging-address=127.0.0.1"));
     }
 
     #[test]
@@ -294,7 +299,11 @@ mod tests {
             extra_args: vec!["--lang=en-US".into()],
         };
         let args = config.args();
-        assert_eq!(args.last().map(String::as_str), Some("--lang=en-US"));
+        let extra = args.iter().position(|argument| argument == "--lang=en-US");
+        let profile = args
+            .iter()
+            .position(|argument| argument.starts_with("--user-data-dir="));
+        assert!(extra.is_some() && profile.is_some() && extra < profile);
     }
 
     #[test]

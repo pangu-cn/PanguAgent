@@ -69,6 +69,8 @@ pub struct BrowserSession {
     /// Whether this session's execution is isolated, recorded so the reported
     /// scope matches reality.
     isolates: bool,
+    /// Whether page navigation may leave `data:` and `about:` URLs.
+    network: bool,
 }
 
 impl BrowserSession {
@@ -122,14 +124,16 @@ impl BrowserSession {
         let tab = open_tab(&endpoint)?;
         let socket = connect_websocket(&tab)?;
 
-        Ok(Self {
+        let session = Self {
             child,
             profile_dir: config.profile_dir.clone(),
             socket,
             next_id: 1,
             pending: HashMap::new(),
             isolates: runtime_launcher.is_some(),
-        })
+            network: config.network,
+        };
+        Ok(session)
     }
 
     /// Whether the browser runs inside a declared sandbox runtime.
@@ -206,6 +210,11 @@ impl BrowserSession {
 
     /// Navigate the page, waiting for the load event.
     pub fn navigate(&mut self, url: &str) -> Result<()> {
+        if !self.network && !local_page_url(url) {
+            return Err(Error::Other(format!(
+                "navigation refused while network is disabled: {url}"
+            )));
+        }
         self.call("Page.enable", json!({}))?;
         let result = self.call("Page.navigate", json!({"url": url}))?;
         // Chromium reports a failed navigation inside a successful CDP result,
@@ -440,11 +449,22 @@ impl BrowserSession {
 /// reaches this path; compromising the socket first is not required.
 pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
     let root = std::env::temp_dir().join("pangu-browser");
-    let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
+    std::fs::create_dir_all(&root).map_err(|error| {
+        Error::Other(format!(
+            "cannot prepare the browser profile root {}: {error}",
+            root.display()
+        ))
+    })?;
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         Error::Other(format!(
             "cannot resolve browser profile {}: {error}",
             path.display()
+        ))
+    })?;
+    let canonical_root = std::fs::canonicalize(&root).map_err(|error| {
+        Error::Other(format!(
+            "cannot resolve the browser profile root {}: {error}",
+            root.display()
         ))
     })?;
     if !profile_is_child_of(&canonical, &canonical_root) {
@@ -462,19 +482,54 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
 }
 
 pub(crate) fn create_private_profile_dir(path: &std::path::Path) -> Result<()> {
+    let temp = std::env::temp_dir();
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if current.starts_with(&temp) && current != temp {
+            if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+                if metadata.file_type().is_symlink() {
+                    return Err(Error::Other(format!(
+                        "refusing to use a symlinked browser profile: {}",
+                        current.display()
+                    )));
+                }
+            }
+        }
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Other(format!(
+                "refusing to use a symlinked browser profile: {}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Error::Other(format!(
+                "cannot create the browser profile root {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
+    builder.recursive(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(path).map_err(|error| {
-        Error::Other(format!(
-            "cannot create the browser profile directory {}: {error}",
-            path.display()
-        ))
-    })?;
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(Error::Other(format!(
+                "cannot create the browser profile directory {}: {error}",
+                path.display()
+            )));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -506,6 +561,11 @@ fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
 
 /// The navigation failure carried inside an otherwise successful CDP result.
 ///
+fn local_page_url(url: &str) -> bool {
+    let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+    matches!(scheme, Some("data" | "about"))
+}
+
 /// `Page.navigate` returns `{"result":{"frameId":"...","errorText":"net::ERR_..."}}`
 /// when the URL cannot be loaded. An empty or whitespace-only value is not a
 /// failure: a successful result has no `errorText`.
@@ -547,8 +607,20 @@ fn wait_for_endpoint(profile_dir: &std::path::Path) -> Result<String> {
         if let Ok(contents) = std::fs::read_to_string(&marker) {
             let mut lines = contents.lines();
             if let Some(port) = lines.next().map(str::trim) {
-                if !port.is_empty() {
+                if port.chars().all(|character| character.is_ascii_digit())
+                    && port.parse::<u16>().ok().filter(|port| *port > 0).is_some()
+                {
                     let path = lines.next().unwrap_or("/devtools/browser").trim();
+                    if !path.starts_with("/devtools/")
+                        || path.contains("..")
+                        || path.chars().any(|character| {
+                            character.is_control() || matches!(character, '?' | '#' | '\\' | ' ')
+                        })
+                    {
+                        return Err(Error::Other(format!(
+                            "the browser published an unexpected debugger path: {path}"
+                        )));
+                    }
                     return Ok(format!("ws://127.0.0.1:{port}{path}"));
                 }
             }
@@ -575,13 +647,15 @@ fn open_tab(endpoint: &str) -> Result<String> {
             .or_else(|_| request_over_http(address, port, "GET", "/json/new?about:blank"))?;
         let parsed: Value = serde_json::from_str(&target)
             .map_err(|error| Error::Other(format!("could not read the new tab reply: {error}")))?;
-        return parsed
+        let url = parsed
             .get("webSocketDebuggerUrl")
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| {
                 Error::Other("the browser opened a tab but returned no debugger URL".into())
-            });
+            })?;
+        require_loopback_websocket(&url)?;
+        return Ok(url);
     }
     Err(Error::Other(format!(
         "the browser endpoint {endpoint} is not a WebSocket URL"
@@ -589,6 +663,26 @@ fn open_tab(endpoint: &str) -> Result<String> {
 }
 
 /// A bounded single-request HTTP call, used only for `/json/new`.
+fn require_loopback_websocket(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("ws://")
+        .ok_or_else(|| Error::Other(format!("unsupported CDP endpoint: {url}")))?;
+    let authority = rest
+        .split_once('/')
+        .map(|(authority, _)| authority)
+        .unwrap_or(rest);
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+        return Err(Error::Other(format!(
+            "refusing a CDP endpoint that is not loopback: {url}"
+        )));
+    }
+    Ok(())
+}
+
 fn request_over_http(address: &str, port: &str, method: &str, path: &str) -> Result<String> {
     let mut stream = TcpStream::connect(format!("{address}:{port}")).map_err(|error| {
         Error::Other(format!("cannot reach the browser's HTTP endpoint: {error}"))
@@ -691,6 +785,7 @@ fn request_over_http(address: &str, port: &str, method: &str, path: &str) -> Res
 
 /// Connect a WebSocket to a CDP endpoint URL.
 fn connect_websocket(url: &str) -> Result<WebSocket> {
+    require_loopback_websocket(url)?;
     let rest = url
         .strip_prefix("ws://")
         .ok_or_else(|| Error::Other(format!("unsupported CDP endpoint: {url}")))?;
@@ -847,6 +942,18 @@ mod tests {
 
     #[test]
     fn ending_a_session_removes_its_temporary_profile() {
+        let shared_root = std::env::temp_dir().join("pangu-browser");
+        let _ = std::fs::remove_dir_all(&shared_root);
+        let unrelated =
+            std::env::temp_dir().join(format!("pangu-unrelated-{}", std::process::id()));
+        std::fs::create_dir_all(&unrelated).expect("unrelated");
+        let missing_root = remove_profile_dir(&unrelated);
+        assert!(
+            missing_root.is_err(),
+            "a missing profile root must not make cleanup unrestricted"
+        );
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(unrelated);
         let root = std::env::temp_dir()
             .join("pangu-browser")
             .join(format!("profile-{}", std::process::id()));
@@ -889,9 +996,14 @@ mod tests {
 
     #[test]
     fn a_browser_profile_is_private_to_its_owner() {
-        let root = std::env::temp_dir()
-            .join("pangu-browser")
-            .join(format!("private-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "pangu-browser-private-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         create_private_profile_dir(&root).expect("private profile");
         assert!(root.is_dir());
@@ -906,6 +1018,46 @@ mod tests {
             assert_eq!(mode, 0o700, "other users must not read browser cookies");
         }
         let _ = std::fs::remove_dir_all(root);
+        #[cfg(unix)]
+        {
+            let link_root = std::env::temp_dir().join("pangu-browser");
+            std::fs::create_dir_all(&link_root).expect("link root");
+            let linked = link_root.join(format!("link-{}", std::process::id()));
+            let target =
+                std::env::temp_dir().join(format!("pangu-link-target-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&target);
+            std::fs::create_dir_all(&target).expect("link target");
+            let _ = std::fs::remove_file(&linked);
+            std::os::unix::fs::symlink(&target, &linked).expect("symlink");
+            let refused = create_private_profile_dir(&linked);
+            assert!(refused.is_err(), "a profile symlink must not be followed");
+            let _ = std::fs::remove_file(linked);
+            let _ = std::fs::remove_dir_all(target);
+            let parent_link = link_root.join(format!("parent-link-{}", std::process::id()));
+            let parent_target =
+                std::env::temp_dir().join(format!("pangu-parent-target-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&parent_target);
+            std::fs::create_dir_all(&parent_target).expect("parent target");
+            let _ = std::fs::remove_file(&parent_link);
+            std::os::unix::fs::symlink(&parent_target, &parent_link).expect("parent symlink");
+            let child = parent_link.join("session");
+            let refused_parent = create_private_profile_dir(&child);
+            assert!(
+                refused_parent.is_err(),
+                "a symlinked parent must not receive the profile"
+            );
+            assert!(!parent_target.join("session").exists());
+            let _ = std::fs::remove_file(parent_link);
+            let _ = std::fs::remove_dir_all(parent_target);
+        }
+    }
+
+    #[test]
+    fn a_non_loopback_debugger_url_is_refused() {
+        let error = require_loopback_websocket("ws://10.0.0.8:9222/devtools/page/1")
+            .expect_err("remote debugger");
+        assert!(error.to_string().contains("not loopback"), "{error}");
+        require_loopback_websocket("ws://127.0.0.1:9222/devtools/page/1").expect("loopback");
     }
 
     #[test]

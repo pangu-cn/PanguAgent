@@ -6,6 +6,9 @@ on:
 
 permissions:
   contents: read
+  # Saving a cache needs more than reading the repository. Restores work with
+  # read; writes fail closed without this scope.
+  actions: write
 
 jobs:
   verify:
@@ -24,6 +27,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # The registry and compiled dependencies are what make a clean runner slow.
+      # Workspace crates stay out of the cache, so a previous run cannot reuse a
+      # stale build of this repository. A failed job still saves the dependency
+      # cache: the failure is usually a test, not the third-party artifacts.
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Check formatting
         run: cargo fmt --all -- --check

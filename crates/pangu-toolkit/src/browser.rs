@@ -93,6 +93,26 @@ impl BrowserHandle {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("screenshot path has no parent"))?;
+        let mut current = std::path::PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+                if metadata.file_type().is_symlink() {
+                    bail!(
+                        "refusing to write a screenshot through a symlink: {}",
+                        current.display()
+                    );
+                }
+            }
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "refusing to write a screenshot through a symlink: {}",
+                    path.display()
+                );
+            }
+        }
         std::fs::create_dir_all(parent).map_err(|error| {
             anyhow!(
                 "cannot create the screenshot directory {}: {error}",
@@ -216,6 +236,41 @@ pub fn resolve_config(
             .refusal()
         })?,
     };
+    for (index, argument) in extra_args.iter().enumerate() {
+        let next = extra_args.get(index + 1).map(String::as_str);
+        let forbidden = [
+            "--remote-debugging-address",
+            "--remote-debugging-port",
+            "--remote-debugging-socket",
+            "--remote-allow-origins",
+            "--disable-web-security",
+            "--user-data-dir",
+            "--proxy-server",
+            "--proxy-bypass-list",
+            "--load-extension",
+            "--disable-extensions-except",
+            "--disk-cache-dir",
+            "--crash-dumps-dir",
+        ];
+        let normalized = argument.trim().to_ascii_lowercase();
+        let single_dash: Vec<String> = forbidden
+            .iter()
+            .map(|prefix| prefix.replacen("--", "-", 1))
+            .collect();
+        let prefixes: Vec<&str> = forbidden
+            .iter()
+            .copied()
+            .chain(single_dash.iter().map(String::as_str))
+            .collect();
+        if prefixes.iter().any(|prefix| {
+            normalized == *prefix
+                || normalized.starts_with(&format!("{prefix}="))
+                || normalized.starts_with(&format!("{prefix} "))
+        }) || (prefixes.iter().any(|prefix| normalized == *prefix) && next.is_some())
+        {
+            bail!("[browser] args must not override the loopback debugger endpoint: {argument}");
+        }
+    }
     Ok(BrowserConfig {
         executable: resolved,
         profile_dir,
@@ -645,6 +700,21 @@ mod tests {
         assert_eq!(
             required_selector(&json!({"selector": " #go "})).expect("valid"),
             "#go"
+        );
+    }
+
+    #[test]
+    fn debugger_endpoint_overrides_are_refused() {
+        let error = resolve_config(
+            None,
+            std::path::PathBuf::from("/tmp/p"),
+            false,
+            vec!["--Disk-Cache-Dir=/tmp/cache".into()],
+        )
+        .expect_err("must refuse");
+        assert!(
+            error.to_string().contains("must not override the loopback"),
+            "{error}"
         );
     }
 

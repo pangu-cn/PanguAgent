@@ -59,7 +59,7 @@ struct TempRoot(PathBuf);
 
 impl TempRoot {
     fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join("pangu-browser").join(format!(
             "pangu-cdp-{label}-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -176,6 +176,32 @@ fn navigation_and_snapshot_reflect_a_data_url() {
         snapshot.text
     );
     assert!(!snapshot.truncated);
+
+    drop(session);
+}
+
+/// `network = false` blocks an external URL while a data page still works.
+#[test]
+#[ignore = "launches a real browser; run with --ignored"]
+fn network_disabled_blocks_external_navigation() {
+    let root = temp_root("offline");
+    let mut offline = config(&root);
+    offline.network = false;
+    let mut session = BrowserSession::launch(&offline, None).expect("launch");
+
+    let blocked = session.navigate("https://example.com/");
+    assert!(
+        blocked.is_err(),
+        "an external URL must fail while network is disabled: {blocked:?}"
+    );
+
+    let page = "data:text/html,<title>offline</title><p>local page</p>";
+    session
+        .navigate(page)
+        .expect("a data page does not need the network");
+    let snapshot = session.snapshot().expect("snapshot");
+    assert_eq!(snapshot.title, "offline");
+    assert!(snapshot.text.contains("local page"), "{:?}", snapshot.text);
 
     drop(session);
 }

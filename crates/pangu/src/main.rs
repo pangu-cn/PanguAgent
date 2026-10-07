@@ -2206,10 +2206,23 @@ fn attach_browser(
     }
     // Cookies and cache must not enter the workspace snapshot. `.pangu` is
     // excluded from checkpoints, so a profile there would disappear on rollback.
+    let profile_root = std::env::temp_dir().join("pangu-browser");
     let profile = pangu_boundary::browser::profile_dir_under(
-        &std::env::temp_dir().join("pangu-browser"),
+        &profile_root,
         &format!("browser-{}", unix_nanos()),
     );
+    let mut profile_parts = profile.components();
+    let profile_is_child = profile_root
+        .components()
+        .all(|component| profile_parts.next() == Some(component))
+        && profile_parts.next().is_some();
+    if !profile_is_child {
+        anyhow::bail!(
+            "browser profile {} is not inside {}",
+            profile.display(),
+            profile_root.display()
+        );
+    }
     let browser_config = pangu_toolkit::browser::resolve_config(
         config.browser.executable.as_deref(),
         profile,
