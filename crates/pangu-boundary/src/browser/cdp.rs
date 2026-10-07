@@ -444,11 +444,18 @@ impl BrowserSession {
 /// it was never requested and can never be awaited. An ordinary `browser_open`
 /// reaches this path; compromising the socket first is not required.
 pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
-    let text = path.to_string_lossy();
-    if !text.contains("pangu-browser") {
+    let root = std::env::temp_dir().join("pangu-browser");
+    let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        Error::Other(format!(
+            "cannot resolve browser profile {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !canonical.starts_with(&canonical_root) {
         return Err(Error::Other(format!(
             "refusing to delete browser profile outside pangu-browser: {}",
-            path.display()
+            canonical.display()
         )));
     }
     std::fs::remove_dir_all(path).map_err(|error| {
@@ -813,7 +820,9 @@ mod tests {
         std::fs::create_dir_all(&root).expect("profile");
         std::fs::write(root.join("Cookies"), b"secret").expect("cookie");
         remove_profile_dir(&root).expect("the temporary profile must be removable");
-        let refused = remove_profile_dir(std::path::Path::new("/tmp/not-pangu"));
+        let escaped = std::env::temp_dir().join("..").join("pangu-outside");
+        std::fs::create_dir_all(&escaped).expect("outside");
+        let refused = remove_profile_dir(&escaped);
         assert!(
             refused.is_err(),
             "cleanup must not delete an unrelated directory"
@@ -822,6 +831,8 @@ mod tests {
             !root.exists(),
             "the temporary profile must not survive the session"
         );
+        assert!(escaped.exists(), "a parent escape must not be deleted");
+        let _ = std::fs::remove_dir_all(escaped);
     }
 
     #[test]
