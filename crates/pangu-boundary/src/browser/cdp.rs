@@ -452,7 +452,7 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
             path.display()
         ))
     })?;
-    if canonical == canonical_root || !canonical.starts_with(&canonical_root) {
+    if !profile_is_child_of(&canonical, &canonical_root) {
         return Err(Error::Other(format!(
             "refusing to delete browser profile outside pangu-browser: {}",
             canonical.display()
@@ -464,6 +464,16 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
             path.display()
         ))
     })
+}
+
+fn profile_is_child_of(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let mut path = path.components();
+    for component in root.components() {
+        if path.next() != Some(component) {
+            return false;
+        }
+    }
+    path.next().is_some()
 }
 
 fn retainable_reply_id(id: Option<u64>, next_id: u64) -> Option<u64> {
@@ -841,6 +851,15 @@ mod tests {
             "cleanup must not delete the shared profile root"
         );
         assert!(shared_root.join("other-session").exists());
+        let sibling = std::env::temp_dir().join("pangu-browser-evil");
+        std::fs::create_dir_all(&sibling).expect("sibling");
+        let refused_sibling = remove_profile_dir(&sibling);
+        assert!(
+            refused_sibling.is_err(),
+            "a similarly named sibling must not match the profile root"
+        );
+        assert!(sibling.exists());
+        let _ = std::fs::remove_dir_all(sibling);
         let _ = std::fs::remove_dir_all(escaped);
     }
 
