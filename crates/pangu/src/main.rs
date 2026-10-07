@@ -2217,6 +2217,12 @@ fn attach_browser(
     // Screenshots go inside the run's own storage so they are covered by the
     // same rules as every other artifact, and are cleaned up with the run.
     let artifacts = workspace.join(".pangu").join("artifacts").join("browser");
+    std::fs::create_dir_all(&artifacts).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot create the browser artifact directory {}: {error}",
+            artifacts.display()
+        )
+    })?;
     Ok(toolkit.with_browser(browser_config, artifacts))
 }
 

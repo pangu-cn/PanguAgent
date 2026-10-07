@@ -446,16 +446,17 @@ impl Toolkit {
                         .browser_artifact_dir
                         .as_ref()
                         .ok_or_else(|| anyhow!("browser_screenshot has no artifact directory"))?;
-                    // The directory itself is the declared write: the PNG name is
-                    // generated later, but the sandbox must check the directory
-                    // now. Omitting it made every screenshot fail L1 because a
-                    // reversible workspace effect with no write path is invalid.
+                    // The PNG name is chosen at execution time. Declaring the
+                    // directory makes the write checker look for its parent,
+                    // which does not exist on the first screenshot. A placeholder
+                    // file inside the configured directory checks that directory
+                    // against the writable roots instead.
                     Ok(ToolAssessment::new(Risk::Reversible)
                         .with_effect(EffectDescriptor::new(
                             EffectScope::Workspace,
                             Reversibility::Reversible,
                         ))
-                        .write(artifact_dir.as_ref().clone()))
+                        .write(artifact_dir.as_ref().join("screenshot.png")))
                 } else {
                     Ok(
                         ToolAssessment::new(Risk::ReadOnly).with_effect(EffectDescriptor::new(

@@ -204,9 +204,17 @@ async fn a_click_and_a_type_produce_an_effect_the_agent_will_accept() {
         .expect("the screenshot effect must pass the same rule as every other action");
     assert_eq!(
         assessment.write_paths,
-        vec![root.join("artifacts")],
-        "the screenshot must name the directory it writes, or the sandbox cannot check it"
+        vec![root.join("artifacts").join("screenshot.png")],
+        "the screenshot must name a file inside its artifact directory"
     );
+    std::fs::create_dir_all(&root).expect("workspace");
+    let resources = pangu_boundary::ResourceRequest {
+        write_paths: assessment.write_paths.clone(),
+        ..pangu_boundary::ResourceRequest::default()
+    };
+    sandbox
+        .validate_resources(&resources)
+        .expect("the declared screenshot path must pass the writable-root check");
     let effect = assessment
         .effect
         .expect("a screenshot must declare the file it writes");

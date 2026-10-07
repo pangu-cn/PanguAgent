@@ -235,15 +235,9 @@ impl Sandbox {
                 return ResolveOutcome::Error(Error::Config("write target has no parent".into()))
             }
         };
-        if has_symlink_component(parent) {
-            return ResolveOutcome::Error(Error::Config(format!(
-                "symlink path not allowed: {}",
-                target.display()
-            )));
-        }
-        let canonical_parent = match std::fs::canonicalize(parent) {
+        let canonical_parent = match canonical_existing_ancestor(parent) {
             Ok(path) => path,
-            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+            Err(error) => return ResolveOutcome::Error(error),
         };
         let candidate = canonical_parent.join(file_name);
         if has_symlink_component(&candidate) {
@@ -281,15 +275,9 @@ impl Sandbox {
                 return ResolveOutcome::Error(Error::Config("write target has no parent".into()))
             }
         };
-        if has_symlink_component(parent) {
-            return ResolveOutcome::Error(Error::Config(format!(
-                "symlink path not allowed: {}",
-                parent.display()
-            )));
-        }
-        let canonical_parent = match std::fs::canonicalize(parent) {
+        let canonical_parent = match canonical_existing_ancestor(parent) {
             Ok(path) => path,
-            Err(error) => return ResolveOutcome::Error(Error::Io(error)),
+            Err(error) => return ResolveOutcome::Error(error),
         };
         let candidate = canonical_parent.join(file_name);
         if has_symlink_component(&candidate) {
@@ -740,6 +728,50 @@ impl ResolveOutcome {
     }
 }
 
+/// Canonicalize the nearest existing ancestor and append the missing tail.
+///
+/// A first screenshot declares a file inside a directory that does not exist
+/// yet. Requiring that exact parent rejects the action before execution can
+/// create it. Existing components are still canonicalized, so a symlink in the
+/// path cannot redirect the write.
+fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::Config(format!(
+                    "symlink path not allowed: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {
+                let mut canonical = std::fs::canonicalize(&current)?;
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(Error::Config(format!(
+                        "cannot resolve path: {}",
+                        path.display()
+                    )));
+                };
+                missing.push(name.to_os_string());
+                if !current.pop() {
+                    return Err(Error::Config(format!(
+                        "cannot resolve path: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf> {
     let current = std::env::current_dir()?;
     absolute_path_from(&current, path)
@@ -1066,6 +1098,25 @@ mod tests {
             .validate_argv(&["cat".into(), "../outside".into()])
             .is_err());
         assert!(sandbox.validate_argv(&[]).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_missing_write_parent_is_checked_through_its_existing_ancestor() {
+        let root = test_workspace();
+        fs::create_dir_all(&root).unwrap();
+        let config = crate::config::BoundarySection {
+            workspace: root.clone(),
+            readable_roots: vec![root.clone()],
+            writable_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let sandbox = Sandbox::from_config(&config).unwrap();
+        let outcome = sandbox.resolve_write(Path::new("artifacts/screenshot.png"));
+        assert!(
+            outcome.is_allowed(),
+            "a first write must not require its parent to exist already: {outcome:?}"
+        );
         fs::remove_dir_all(root).ok();
     }
 
