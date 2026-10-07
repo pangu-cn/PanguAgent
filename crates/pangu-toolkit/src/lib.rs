@@ -554,7 +554,7 @@ impl Toolkit {
         let name = action.call().name.as_str();
         let args = action.call().args.clone();
 
-        slot.with(
+        let outcome = slot.with(
             config,
             self.runtime.as_deref(),
             artifact_dir.as_ref().clone(),
@@ -597,6 +597,7 @@ impl Toolkit {
                 }
                 "browser_screenshot" => {
                     let session = handle.session()?;
+                    require_current_page(action, &session.snapshot()?.url)?;
                     let png = session.screenshot()?;
                     let bytes = png.len();
                     let name = handle.save_screenshot(&png)?;
@@ -611,7 +612,6 @@ impl Toolkit {
                     let selector = browser::required_selector(&args)?;
                     let session = handle.session()?;
                     session.click(&selector)?;
-                    require_current_page(action, &session.snapshot()?.url)?;
                     Ok(browser::output(
                         format!("clicked {selector}"),
                         Some(format!("clicked:{selector}")),
@@ -621,7 +621,6 @@ impl Toolkit {
                     let text = required_string(&args, "text")?;
                     let session = handle.session()?;
                     session.type_text(&text)?;
-                    require_current_page(action, &session.snapshot()?.url)?;
                     Ok(browser::output(
                         format!("typed {} characters", text.chars().count()),
                         Some(format!("typed:{}", text.chars().count())),
@@ -629,7 +628,24 @@ impl Toolkit {
                 }
                 other => bail!("`{other}` has no browser handler"),
             },
-        )
+        );
+        if matches!(name, "browser_click" | "browser_type") {
+            match slot.with_open(|handle| {
+                let url = handle.session()?.snapshot()?.url;
+                require_current_page(action, &url).map(|()| url)
+            }) {
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("landed outside the boundary") => {
+                    // The mutation already reached the page. Keeping that page
+                    // open would let a later read observe a forbidden host.
+                    slot.close();
+                    return Err(error);
+                }
+                Err(error) if outcome.is_ok() => return Err(error),
+                Err(_) => {}
+            }
+        }
+        outcome
     }
 }
 

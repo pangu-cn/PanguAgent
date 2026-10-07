@@ -158,6 +158,21 @@ impl BrowserSlot {
         body(handle)
     }
 
+    /// Run `body` only when a session is already open.
+    ///
+    /// Unlike [`Self::with`], this never launches a browser. A post-action check
+    /// must observe the page that the action changed, not open a new blank one.
+    pub fn with_open<T>(&self, body: impl FnOnce(&mut BrowserHandle) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .handle
+            .lock()
+            .map_err(|_| anyhow!("the browser session lock was poisoned by an earlier panic"))?;
+        let handle = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("the browser session is not open"))?;
+        body(handle)
+    }
+
     /// Close the session, releasing the browser process and its profile.
     pub fn close(&self) {
         if let Ok(mut guard) = self.handle.lock() {
@@ -264,7 +279,8 @@ pub fn require_allowed_page_url(
     } else {
         format!("{host_name}:{port}")
     };
-    check_host(&host).map_err(|error| anyhow!("navigation landed outside the boundary: {error}"))
+    check_host(&host)
+        .map_err(|error| anyhow!("navigation landed outside the boundary on {host}: {error}"))
 }
 
 pub fn render_snapshot(url: &str, title: &str, text: &str, truncated: bool) -> String {
