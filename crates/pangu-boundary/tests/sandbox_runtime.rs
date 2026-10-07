@@ -240,7 +240,39 @@ fn the_sandbox_invocation_asks_for_isolation() {
     // A runtime that resolved as usable must expose the same launcher shape.
     if runtime.probe().is_usable() {
         let (launcher, leading) = runtime.launcher().expect("usable implies a launcher");
-        assert_eq!(launcher, "docker");
+        // The launcher is the *resolved* program, not the bare name: a real
+        // command runs with a sanitized `PATH`, so the name alone could resolve
+        // to nothing even though the probe succeeded under the parent's `PATH`.
+        // On this runner that means `/usr/bin/docker` rather than `docker`, which
+        // is the point — the two are the same file by construction.
+        //
+        // Compared by file name rather than by full path because the absolute
+        // path is the runner's business (`/usr/bin/docker` on Linux, a
+        // `\\.\pipe`-era path on Windows); what must hold is that the launcher is
+        // the program the argv above named.
+        let resolved = std::path::Path::new(launcher)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or(launcher);
+        let expected = program
+            .rsplit(std::path::MAIN_SEPARATOR)
+            .next()
+            .unwrap_or(&program);
+        // Windows resolves `docker` to `docker.exe`; compare on the stem so the
+        // assertion is about *which program*, not about the extension.
+        let stem = |name: &str| {
+            name.strip_suffix(".exe")
+                .or_else(|| name.strip_suffix(".cmd"))
+                .or_else(|| name.strip_suffix(".bat"))
+                .unwrap_or(name)
+                .to_string()
+        };
+        assert_eq!(
+            stem(resolved),
+            stem(expected),
+            "the launcher must be the program the argv named; got launcher={launcher:?} \
+             against program={program:?}"
+        );
         assert!(
             leading.contains(&"--cap-drop=ALL".to_string()),
             "the real path must ask for the same isolation as the probe: {leading:?}"
