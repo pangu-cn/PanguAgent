@@ -452,7 +452,7 @@ pub(crate) fn remove_profile_dir(path: &std::path::Path) -> Result<()> {
             path.display()
         ))
     })?;
-    if !canonical.starts_with(&canonical_root) {
+    if canonical == canonical_root || !canonical.starts_with(&canonical_root) {
         return Err(Error::Other(format!(
             "refusing to delete browser profile outside pangu-browser: {}",
             canonical.display()
@@ -833,6 +833,14 @@ mod tests {
             "the temporary profile must not survive the session"
         );
         assert!(escaped.exists(), "a parent escape must not be deleted");
+        let shared_root = std::env::temp_dir().join("pangu-browser");
+        std::fs::create_dir_all(shared_root.join("other-session")).expect("other session");
+        let refused_root = remove_profile_dir(&shared_root);
+        assert!(
+            refused_root.is_err(),
+            "cleanup must not delete the shared profile root"
+        );
+        assert!(shared_root.join("other-session").exists());
         let _ = std::fs::remove_dir_all(escaped);
     }
 
