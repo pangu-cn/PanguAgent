@@ -341,13 +341,17 @@ fn each_runtime_builds_its_own_invocation() {
     std::fs::create_dir_all(&workspace).expect("workspace");
 
     let oci = config(SandboxRuntime::Oci, workspace.clone(), "t");
-    let (program, args, mount) = oci.command_for(SandboxRuntime::Oci);
+    let (program, args, mount) = oci
+        .command_for(SandboxRuntime::Oci)
+        .expect("safe workspace");
     assert_eq!(program, "docker");
     assert_eq!(mount, Some("/workspace".to_string()));
     assert!(args.contains(&"run".to_string()), "{args:?}");
 
     let gvisor = config(SandboxRuntime::Gvisor, workspace, "t");
-    let (program, args, mount) = gvisor.command_for(SandboxRuntime::Gvisor);
+    let (program, args, mount) = gvisor
+        .command_for(SandboxRuntime::Gvisor)
+        .expect("safe workspace");
     assert_eq!(program, "runsc");
     assert_eq!(mount, Some("/workspace".to_string()));
     // gVisor takes its own flags; sending Docker flags to `runsc` would fail at

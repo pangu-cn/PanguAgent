@@ -244,7 +244,9 @@ fn the_sandbox_invocation_asks_for_isolation() {
     // runtime. Build it the same way the runtime does, via a usable local probe
     // of the module's own constructor path.
     let cfg = config(SandboxRuntime::Oci, root.clone());
-    let (program, args, mount) = cfg.command_for(SandboxRuntime::Oci);
+    let (program, args, mount) = cfg
+        .command_for(SandboxRuntime::Oci)
+        .expect("safe workspace");
     assert_eq!(program, "docker");
     assert!(args.contains(&"--network=none".to_string()), "{args:?}");
     assert!(args.contains(&"--cap-drop=ALL".to_string()), "{args:?}");

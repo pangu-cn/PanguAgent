@@ -281,7 +281,23 @@ impl RuntimeConfig {
         };
         let (launcher, workspace_mount) = match &probe {
             RuntimeProbe::Usable { .. } => {
-                let (program, args, mount) = self.build_command(kind);
+                let (program, args, mount) = match self.build_command(kind) {
+                    Ok(command) => command,
+                    Err(reason) => {
+                        return Runtime {
+                            kind,
+                            probe: RuntimeProbe::Unusable {
+                                reason,
+                                remedy: "use a workspace path whose mount argument cannot be \
+                                         reinterpreted"
+                                    .into(),
+                            },
+                            launcher: None,
+                            workspace_mount: None,
+                            workspace: self.workspace.clone(),
+                        };
+                    }
+                };
                 // Pin the absolute path of the launcher now, while the same
                 // `PATH` resolution the probe used is still in effect.
                 //
@@ -314,7 +330,10 @@ impl RuntimeConfig {
     /// Public because `doctor` reports it: an operator asking "what would you
     /// actually run?" should be able to see the exact argv, rather than trust
     /// that the intent was translated correctly.
-    pub fn command_for(&self, kind: SandboxRuntime) -> (String, Vec<String>, Option<String>) {
+    pub fn command_for(
+        &self,
+        kind: SandboxRuntime,
+    ) -> std::result::Result<(String, Vec<String>, Option<String>), String> {
         self.build_command(kind)
     }
 
@@ -323,10 +342,18 @@ impl RuntimeConfig {
     /// Used for both the probe and real commands, so a runtime that passes the
     /// probe is invoked identically when it matters. Two separate argv builders
     /// would let a probe succeed under arguments the real path never uses.
-    fn build_command(&self, kind: SandboxRuntime) -> (String, Vec<String>, Option<String>) {
-        let host_mount = safe_mount_source(&host_mount_path(&self.workspace))
-            .expect("an unsafe mount path is refused before a command is built");
-        match kind {
+    fn build_command(
+        &self,
+        kind: SandboxRuntime,
+    ) -> std::result::Result<(String, Vec<String>, Option<String>), String> {
+        let host_mount =
+            safe_mount_source(&host_mount_path(&self.workspace)).map_err(|reason| {
+                format!(
+                    "workspace `{}` cannot be mounted safely: {reason}",
+                    host_mount_path(&self.workspace)
+                )
+            })?;
+        Ok(match kind {
             SandboxRuntime::Local | SandboxRuntime::Auto => (String::new(), Vec::new(), None),
             SandboxRuntime::Firecracker => (
                 "firecracker".to_string(),
@@ -385,7 +412,7 @@ impl RuntimeConfig {
                 args.push(self.image.clone());
                 ("docker".to_string(), args, Some("/workspace".to_string()))
             }
-        }
+        })
     }
 
     /// Probe a runtime by actually running a command inside it.
@@ -411,7 +438,16 @@ impl RuntimeConfig {
             };
         };
 
-        let (_, base_args, _) = self.build_command(kind);
+        let (_, base_args, _) = match self.build_command(kind) {
+            Ok(command) => command,
+            Err(reason) => {
+                return RuntimeProbe::Unusable {
+                    reason,
+                    remedy: "use a workspace path whose mount argument cannot be reinterpreted"
+                        .into(),
+                };
+            }
+        };
         let mut argv = vec![found.display().to_string()];
         argv.extend(base_args);
         argv.extend(self.probe_command.iter().cloned());
@@ -772,6 +808,16 @@ mod tests {
     }
 
     #[test]
+    fn command_for_reports_an_unsafe_workspace_instead_of_panicking() {
+        let mut config = config(SandboxRuntime::Oci);
+        config.workspace = PathBuf::from(r"C:\work\unsafe,path");
+        let error = config
+            .command_for(SandboxRuntime::Oci)
+            .expect_err("doctor must receive an error, not abort");
+        assert!(error.contains("cannot be mounted safely"), "{error}");
+    }
+
+    #[test]
     fn an_unsafe_workspace_path_refuses_the_runtime_before_probing() {
         let mut config = config(SandboxRuntime::Oci);
         config.workspace = PathBuf::from(r"C:\work\unsafe,path");
@@ -805,7 +851,9 @@ mod tests {
     fn the_container_mount_argument_never_carries_a_verbatim_prefix() {
         let mut config = config(SandboxRuntime::Oci);
         config.workspace = PathBuf::from(r"\\?\C:\work\ws");
-        let (program, args, mount) = config.build_command(SandboxRuntime::Oci);
+        let (program, args, mount) = config
+            .build_command(SandboxRuntime::Oci)
+            .expect("safe workspace");
         assert_eq!(program, "docker");
         let volume = args
             .iter()
@@ -966,7 +1014,9 @@ mod tests {
     /// the three boundaries it was chosen for.
     #[test]
     fn the_oci_argv_asks_for_real_isolation() {
-        let (program, args, mount) = config(SandboxRuntime::Oci).command_for(SandboxRuntime::Oci);
+        let (program, args, mount) = config(SandboxRuntime::Oci)
+            .command_for(SandboxRuntime::Oci)
+            .expect("safe workspace");
         assert_eq!(program, "docker");
         assert!(args.contains(&"--network=none".to_string()), "{args:?}");
         assert!(args.contains(&"--cap-drop=ALL".to_string()), "{args:?}");
@@ -990,7 +1040,9 @@ mod tests {
     fn network_is_opt_in_and_defaults_off() {
         let mut with_net = config(SandboxRuntime::Oci);
         with_net.network = true;
-        let (_, args, _) = with_net.command_for(SandboxRuntime::Oci);
+        let (_, args, _) = with_net
+            .command_for(SandboxRuntime::Oci)
+            .expect("safe workspace");
         assert!(
             !args.contains(&"--network=none".to_string()),
             "declaring network access must remove the restriction: {args:?}"
@@ -999,22 +1051,27 @@ mod tests {
 
     #[test]
     fn resource_caps_are_passed_when_asked_for() {
-        let (_, args, _) = config(SandboxRuntime::Oci).command_for(SandboxRuntime::Oci);
+        let (_, args, _) = config(SandboxRuntime::Oci)
+            .command_for(SandboxRuntime::Oci)
+            .expect("safe workspace");
         assert!(args.contains(&"--memory=512m".to_string()), "{args:?}");
         assert!(args.contains(&"--cpus=1".to_string()), "{args:?}");
 
         let mut uncapped = config(SandboxRuntime::Oci);
         uncapped.memory_mib = 0;
         uncapped.cpus = 0;
-        let (_, args, _) = uncapped.command_for(SandboxRuntime::Oci);
+        let (_, args, _) = uncapped
+            .command_for(SandboxRuntime::Oci)
+            .expect("safe workspace");
         assert!(!args.iter().any(|a| a.starts_with("--memory")), "{args:?}");
         assert!(!args.iter().any(|a| a.starts_with("--cpus")), "{args:?}");
     }
 
     #[test]
     fn the_gvisor_argv_mounts_only_the_workspace() {
-        let (program, args, mount) =
-            config(SandboxRuntime::Gvisor).command_for(SandboxRuntime::Gvisor);
+        let (program, args, mount) = config(SandboxRuntime::Gvisor)
+            .command_for(SandboxRuntime::Gvisor)
+            .expect("safe workspace");
         assert_eq!(program, "runsc");
         assert!(args.contains(&"--platform=systrap".to_string()), "{args:?}");
         assert!(args.contains(&"--network=none".to_string()), "{args:?}");
