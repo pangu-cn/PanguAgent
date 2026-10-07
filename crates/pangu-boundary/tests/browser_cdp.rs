@@ -202,8 +202,7 @@ fn network_disabled_blocks_external_navigation() {
     let snapshot = session.snapshot().expect("snapshot");
     assert_eq!(snapshot.title, "offline");
     assert!(snapshot.text.contains("local page"), "{:?}", snapshot.text);
-    let embedded =
-        "data:text/html,<meta http-equiv='refresh' content='0;url=https://example.com/'>";
+    let embedded = "data:text/html,<p>https://example.com/ is only text</p><img src='//example.com/pixel.png'>";
     session.navigate(embedded).expect("embedded navigation");
     let refused = session.snapshot();
     assert!(
