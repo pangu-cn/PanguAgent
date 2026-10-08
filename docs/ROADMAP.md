@@ -700,6 +700,12 @@ W-43~W-47 是 F7 的风险摘要；完整激活后具体控制以 [`ADR-0001`](a
 
 任何级别都不能跳过 Policy、Sandbox、Approval 和 VerifiedAction。
 
+## 5f. 文本工具调用与评测边界
+
+`model.raw_tool_calls=true` 时，模型可以在普通文本中使用一个 `action` 代码块表达工具调用。代码块必须是 JSON，并包含 `name` 与 object 参数。解析结果只是候选调用，必须继续通过 schema、Policy、Sandbox 和 Approval。默认关闭，因此默认 digest 不变。
+
+DeepPlanning 与 SWE-bench-verified 只作为外部回归题库候选。Pangu 不内置题库，不把外部分数写入产品宣传；现有 `pangu eval run` 仍只记录本仓库声明的 issue。
+
 ## 5e. 扩展曝光五级
 
 | 级别 | 含义 | 权限 |

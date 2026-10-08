@@ -379,6 +379,38 @@ impl VerifiedAction {
     }
 }
 
+fn parse_text_actions(content: &str) -> Result<Vec<pangu_core::ToolCall>> {
+    let mut calls = Vec::new();
+    for (index, block) in content.split("```action").skip(1).enumerate() {
+        let body = block.split("```").next().unwrap_or("").trim();
+        if body.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(body)?;
+        let name = value
+            .get("name")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        let args = value
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if name.trim().is_empty() || !args.is_object() {
+            return Err(anyhow!(
+                "text action block must contain a name and object arguments"
+            ));
+        }
+        let call = pangu_core::ToolCall {
+            id: format!("text-action-{index}"),
+            name: name.to_string(),
+            args,
+        };
+        call.validate().map_err(|error| anyhow!(error))?;
+        calls.push(call);
+    }
+    Ok(calls)
+}
+
 pub struct Agent {
     contract: GoalContract,
     policy: Arc<Policy>,
@@ -1907,6 +1939,10 @@ impl Agent {
                             return Err(anyhow!(
                                 "provider returned too many tool calls in one response"
                             ));
+                        }
+                        let mut calls = calls;
+                        if calls.is_empty() && self.contract.model_raw_tool_calls {
+                            calls = parse_text_actions(&content)?;
                         }
                         tool_calls.extend(calls);
                         history.push(Message::assistant_calls(content, history_calls));

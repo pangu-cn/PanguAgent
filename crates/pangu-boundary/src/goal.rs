@@ -131,6 +131,10 @@ pub struct GoalContract {
     /// construction; the model cannot change it.
     #[serde(default)]
     pub plan_first: bool,
+    /// Opt-in text action parsing. Parsed calls are not authorized; they enter
+    /// the same validation and L1-L4 path as native tool calls.
+    #[serde(default)]
+    pub model_raw_tool_calls: bool,
     /// B5: the declared fallback chain, frozen at contract construction.
     /// Empty = single-provider run (no fallback). Prices here drive the
     /// per-segment cost accounting after a switch.
@@ -229,6 +233,7 @@ impl GoalContract {
             require_evidence: true,
             min_successful_tool_calls: 1,
             plan_first: false,
+            model_raw_tool_calls: false,
             fallbacks: Vec::new(),
             execution: ExecutionSection::default(),
             price: None,
@@ -357,6 +362,7 @@ impl GoalContract {
             require_evidence: config.goal.require_evidence,
             min_successful_tool_calls: config.goal.min_successful_tool_calls,
             plan_first: config.goal.plan_first,
+            model_raw_tool_calls: config.model.raw_tool_calls,
             fallbacks: config
                 .resolve_fallbacks()?
                 .into_iter()
@@ -561,6 +567,11 @@ impl GoalContract {
         });
         // F4: only a plan-first run carries the phase discipline; a default
         // single-phase run must keep its historical digest.
+        if self.model_raw_tool_calls {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("model_raw_tool_calls".into(), serde_json::json!(true));
+            }
+        }
         if self.plan_first {
             if let Some(object) = value.as_object_mut() {
                 object.insert("plan_first".into(), serde_json::json!(true));
