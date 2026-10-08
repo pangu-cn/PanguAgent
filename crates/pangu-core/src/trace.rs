@@ -91,7 +91,9 @@ impl Severity {
             | EventKind::RollbackSkippedAlreadyApplied
             | EventKind::FailedPathRecorded
             | EventKind::MemoryProposed
-            | EventKind::TaskDelegated => Severity::Notice,
+            | EventKind::TaskDelegated
+            | EventKind::TaskRejected
+            | EventKind::AutomationDuplicate => Severity::Notice,
             _ => Severity::Normal,
         }
     }
