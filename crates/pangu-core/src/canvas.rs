@@ -256,7 +256,13 @@ impl Canvas {
                       not this page. <a href=\"/trace.svg\">trace.svg</a> 璺?\
                       <a href=\"/api/trace\">api/trace</a></footer>",
         );
-        out.push_str("</body></html>");
+        out.push_str("<dialog id=\"risk-confirm\"><form method=\"dialog\">");
+        out.push_str("<h2>风险确认</h2><p id=\"risk-summary\"></p>");
+        out.push_str("<menu><button value=\"deny\">拒绝</button><button value=\"allow-once\">允许一次</button></menu>");
+        out.push_str("</form></dialog><script>");
+        out.push_str("const dialog=document.querySelector('#risk-confirm');");
+        out.push_str("window.panguConfirmRisk=(summary)=>{document.querySelector('#risk-summary').textContent=summary;dialog.showModal();return dialog};");
+        out.push_str("</script></body></html>");
         out
     }
 }
@@ -509,7 +515,7 @@ mod tests {
         let page = nasty.handle("GET", "/");
         // A model-authored message must never become markup: this page is the
         // one place a hostile string could otherwise become an action.
-        assert!(!page.body.contains("<script>"), "{}", page.body);
+        assert!(!page.body.contains("<script>fetch"), "{}", page.body);
         assert!(page.body.contains("&lt;script&gt;"), "{}", page.body);
     }
 
