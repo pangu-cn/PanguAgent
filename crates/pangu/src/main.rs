@@ -69,6 +69,10 @@ enum Commands {
         goal: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Start a new run from a recorded checkpoint. The checkpoint stays
+        /// read-only; pending actions are not replayed.
+        #[arg(long = "from-checkpoint")]
+        from_checkpoint: Option<String>,
     },
     Rollback {
         #[arg(long = "checkpoint-id", visible_alias = "target-checkpoint")]
@@ -512,9 +516,11 @@ async fn main() -> Result<()> {
                 json,
             },
         ),
-        Some(Commands::Run { goal, dry_run }) => {
-            run_command(&args, goal, dry_run || args.dry_run).await
-        }
+        Some(Commands::Run {
+            goal,
+            dry_run,
+            from_checkpoint,
+        }) => run_command(&args, goal, dry_run || args.dry_run, from_checkpoint).await,
         Some(Commands::Rollback {
             checkpoint_id,
             source_node,
@@ -626,7 +632,7 @@ async fn main() -> Result<()> {
                     input.trim().to_string()
                 }
             };
-            run_command(&args, goal, args.dry_run).await
+            run_command(&args, goal, args.dry_run, None).await
         }
     }
 }
@@ -1989,7 +1995,12 @@ fn config_command(file: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
+async fn run_command(
+    args: &Cli,
+    goal: String,
+    dry_run: bool,
+    from_checkpoint: Option<String>,
+) -> Result<()> {
     if goal.trim().is_empty() {
         bail!("goal must not be empty");
     }
@@ -2012,6 +2023,11 @@ async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
         ..Default::default()
     };
     config = config.apply(&overrides)?;
+    if let Some(checkpoint_id) = &from_checkpoint {
+        println!(
+            "from checkpoint {checkpoint_id}: old journal and checkpoint remain read-only; pending actions are not replayed"
+        );
+    }
     if dry_run {
         println!(
             "dry run: no provider request or tool execution\n\n{}",

@@ -12,6 +12,8 @@ pub const MAX_JOURNAL_EVENT_LINE_BYTES: usize = 1024 * 1024;
 
 pub struct Journal {
     path: PathBuf,
+    thread_id: String,
+    checkpoint_id: Option<String>,
     state: Mutex<State>,
 }
 
@@ -116,6 +118,12 @@ impl Journal {
         };
         Ok(Self {
             path: path.to_path_buf(),
+            thread_id: path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("journal")
+                .to_string(),
+            checkpoint_id: None,
             state: Mutex::new(State {
                 seq,
                 prev_sha,
@@ -124,6 +132,10 @@ impl Journal {
                 bytes,
             }),
         })
+    }
+
+    pub fn identity(&self) -> (String, Option<String>) {
+        (self.thread_id.clone(), self.checkpoint_id.clone())
     }
 
     pub fn path(&self) -> &Path {
