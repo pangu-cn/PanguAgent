@@ -28,6 +28,7 @@ pub mod memory;
 pub mod memory_layers;
 pub mod messages;
 pub mod modules;
+pub mod negative;
 pub mod replay;
 pub mod repomap;
 pub mod session;

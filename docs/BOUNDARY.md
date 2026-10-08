@@ -292,6 +292,10 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 27. **I-Sandbox-Declared-Means-Enforced**：仅当 `[execution] runtime` 非 `local` 时生效。声明的运行时必须**先探测通过**（在沙箱内真正跑通一条命令）才允许任何命令执行；探测失败即拒绝，**不存在**任何退回宿主机执行的路径——否则审计里记录的运行时与实际执行不符，记录即为假。探测报告的是观察到的行为，不是"隔离攻不破"的断言。`auto` 按 firecracker > gvisor > oci 的内核边界强度择优；显式选择不得静默降级为更弱的运行时。`runtime = "local"`（默认）不进入本不变量，行为与 digest 完全不变。
 28. **I-Browser-Absent-Until-Enabled**：仅当 `[browser] enabled` 时生效。未启用时浏览器工具**不出现在任何工具表中**，模型无法调用一个操作者未开启的能力；`assess` 亦拒绝调用，使拒绝是结构性的而非只靠执行器。启用后每个浏览器动作进入与其它工具逐位相同的 L1–L4 链：`browser_open` 会访问主机，必须声明其 host 并受 egress 允许表约束；**`browser_click`/`browser_type` 是 `NeedsHuman` + `ExternalMutation`/`Irreversible`，并声明已打开的浏览器会话；`browser_screenshot` 必须声明其 artifact 目录作为写入路径。它们都不是只读**——点下去会发生什么由页面决定，将其归类为观察会让改变状态的动作绕过人工闸门。这里的 `Irreversible` 不是保守取值：状态改动落在本程序不控制的服务器上，它无法撤销自己观察不到的变更。该组合还必须满足 `validate_for_risk` 的约束（ExternalMutation 必须 Irreversible 且 risk ≥ Destructive），否则工具会在每次调用时被 L1 拒绝——曾经如此，见 `docs/CAPABILITIES.md` 的说明。只支持 `http`/`https`，`file:` 被拒绝。导航前检查请求主机。所有浏览器动作在返回前都用同一个出口规则检查当前 URL。无论拒绝来自打开、读取、截图、点击还是输入，只要页面落到未允许主机或 `file:`，浏览器会话都会关闭，避免后续动作继续观察该页面。`enabled = false`（默认）时不进入本不变量，行为与 digest 完全不变。
 
+## 4b. 明确拒绝的反模式
+
+以下行为即使外部 Agent 默认提供，也不进入 Pangu：无确认写长期记忆、自动安装技能、进程内扩展读取凭据、`--yolo` 或默认 auto-approve、自动 commit 与 `--no-verify`、runtime 不可用后退回宿主机、非沙箱 `python_executor`、把 benchmark score 当验收、长期密钥进入前端，以及默认 telemetry。现有替代分别是记忆候选队列、签名 skill、capability 与隔离加载、L4、显式 verify、F8 fail-closed、短时 token 和本地事件。
+
 ## 5. 非目标
 
 - 不做通用聊天、角色扮演或“什么都问一句”的助手壳。
