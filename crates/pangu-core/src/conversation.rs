@@ -91,6 +91,26 @@ impl ConversationSnapshot {
         Ok(crate::hex_sha256(&String::from_utf8_lossy(&encoded)))
     }
 
+    pub fn cloned_for(
+        &self,
+        snapshot_id: impl Into<String>,
+        run_id: impl Into<String>,
+    ) -> Result<Self> {
+        let snapshot_id = snapshot_id.into();
+        if snapshot_id == self.snapshot_id {
+            return Err(Error::Config(
+                "a cloned conversation needs a new snapshot id".into(),
+            ));
+        }
+        let mut cloned = self.clone();
+        cloned.snapshot_id = snapshot_id;
+        cloned.run_id = run_id.into();
+        cloned.session_node_id = None;
+        cloned.created_at = crate::now_rfc3339();
+        cloned.validate()?;
+        Ok(cloned)
+    }
+
     pub fn with_session_node(mut self, session_node_id: impl Into<String>) -> Self {
         self.session_node_id = Some(session_node_id.into());
         self
@@ -366,6 +386,16 @@ pub fn encode_linewise(snapshot: &ConversationSnapshot) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_keeps_digest_but_not_identity() {
+        let snapshot =
+            ConversationSnapshot::new("old", "run", vec![Message::user("hello")]).unwrap();
+        let cloned = snapshot.cloned_for("new", "next").unwrap();
+        assert_eq!(cloned.history_digest, snapshot.history_digest);
+        assert_ne!(cloned.snapshot_id, snapshot.snapshot_id);
+        assert!(snapshot.cloned_for("old", "next").is_err());
+    }
 
     fn sample() -> Vec<Message> {
         vec![

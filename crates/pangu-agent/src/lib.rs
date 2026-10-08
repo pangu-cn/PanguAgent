@@ -1781,22 +1781,28 @@ impl Agent {
                     pangu_core::DegradeMode::Omitted => (full, summary, omitted + 1),
                 },
             );
-            self.emit(self.event(
+            let mut assembled_event = self.event(
                 EventKind::ContextAssembled,
                 turn,
                 format!(
-                    "messages={} tokens~{} forced_over_budget={} slices: {} full, {} summary, \
+                    "messages={} tokens~{} forced_over_budget={} prefix_stable={} slices: {} full, {} summary, \
                      {} omitted, {} seam(s)",
                     assembled.messages.len(),
                     assembly.estimated_tokens,
                     assembly.forced_over_budget,
+                    turn == 1,
                     modes.0,
                     modes.1,
                     modes.2,
                     assembled.seams.len()
                 ),
-            ))
-            .await?;
+            );
+            assembled_event.payload = Some(serde_json::json!({
+                "prefix_stable": turn == 1,
+                "messages": assembled.messages.len(),
+                "estimated_tokens": assembly.estimated_tokens
+            }));
+            self.emit(assembled_event).await?;
             if assembly.forced_over_budget {
                 // The honest tail of the chain: even every forced slice at its
                 // summary form does not fit. Terminate — but for a *budget*

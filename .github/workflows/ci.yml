@@ -37,6 +37,16 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Warn on oversized source files
+        shell: bash
+        run: |
+          find crates -name '*.rs' -type f | while IFS= read -r file; do
+            lines=$(wc -l < "$file")
+            if [ "$lines" -gt 1500 ]; then
+              echo "::warning title=code health::$file has $lines lines; split it before adding features"
+            fi
+          done
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
