@@ -79,6 +79,13 @@ impl ConversationRuntime {
     ///
     /// The digest is verified on the way out, so a snapshot edited since it was
     /// written is refused rather than fed to a model as if it were intact.
+    pub fn clone_snapshot(&self, snapshot_id: &str, run_id: &str) -> Result<ConversationSnapshot> {
+        let source = self.load(snapshot_id)?;
+        let cloned = source.cloned_for(self.next_snapshot_id(run_id), run_id)?;
+        self.store.save_conversation(&cloned)?;
+        Ok(cloned)
+    }
+
     pub fn load(&self, snapshot_id: &str) -> Result<ConversationSnapshot> {
         self.store.load_conversation(snapshot_id)
     }

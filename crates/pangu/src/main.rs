@@ -375,6 +375,14 @@ enum ArtifactCommands {
 enum ConversationCommands {
     /// List stored conversations, oldest first.
     List,
+    /// Copy one stored conversation into a new snapshot. This copies dialogue only,
+    /// never the workspace, approvals, or checkpoint state.
+    Clone {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "cloned-conversation")]
+        run_id: String,
+    },
     /// Show one conversation's metadata without its full text.
     Show {
         /// Snapshot id. Defaults to the most recent.
@@ -506,6 +514,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Conversation { action }) => match action {
             ConversationCommands::List => conversation_list(&args),
+            ConversationCommands::Clone { id, run_id } => conversation_clone(&args, &id, &run_id),
             ConversationCommands::Show { id, json } => conversation_show(&args, id, json),
             ConversationCommands::Export {
                 id,
@@ -1089,6 +1098,15 @@ fn conversation_list(args: &Cli) -> Result<()> {
             }
         );
     }
+    Ok(())
+}
+
+fn conversation_clone(args: &Cli, id: &str, run_id: &str) -> Result<()> {
+    let Some(runtime) = conversation_store(args)? else {
+        bail!("conversation persistence is disabled");
+    };
+    let cloned = runtime.clone_snapshot(id, run_id)?;
+    println!("{}", cloned.snapshot_id);
     Ok(())
 }
 

@@ -25,7 +25,6 @@ use pangu_core::{short_hash, MemoryStore, SkillRegistry, ToolCall, ToolSpec};
 use sha2::{Digest, Sha256};
 
 const MAX_SEARCH_RESULTS: usize = 200;
-const MAX_SEARCH_ENTRIES: usize = 10_000;
 const MAX_LIST_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Default)]
@@ -1696,86 +1695,40 @@ async fn execute_list(action: &VerifiedAction) -> Result<ToolOutput> {
 }
 
 async fn execute_search(action: &VerifiedAction) -> Result<ToolOutput> {
+    execute_cited_search(action).await
+}
+
+async fn execute_cited_search(action: &VerifiedAction) -> Result<ToolOutput> {
     let root = action
         .resources()
         .read_paths
         .first()
         .ok_or_else(|| anyhow!("verified search root missing"))?;
     let query = required_string(&action.call().args, "query")?;
+    let mut files = Vec::new();
+    collect_files(action.sandbox(), root, &mut files, 0).await?;
     let mut matches = Vec::new();
-    let mut visited = 0usize;
-    search_tree(
-        action.sandbox(),
-        root,
-        &query,
-        &mut matches,
-        &mut visited,
-        0,
-    )
-    .await?;
-    if matches.iter().map(String::len).sum::<usize>() > action.sandbox().max_tool_output_bytes {
-        bail!("search results exceed configured output limit");
-    }
-    Ok(ToolOutput::evidenced(
-        matches.join("\n"),
-        format!("search:{}", root.display()),
-    ))
-}
-
-fn search_tree<'a>(
-    sandbox: &'a Sandbox,
-    root: &'a Path,
-    query: &'a str,
-    matches: &'a mut Vec<String>,
-    visited: &'a mut usize,
-    depth: usize,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        if depth > 32 || matches.len() >= MAX_SEARCH_RESULTS {
-            return Ok(());
+    for file in files {
+        let path = PathBuf::from(file);
+        if !action.sandbox().resolve_read(&path).is_allowed() {
+            continue;
         }
-        let mut entries = tokio::fs::read_dir(root)
-            .await
-            .with_context(|| format!("search {}", root.display()))?;
-        while let Some(entry) = entries.next_entry().await? {
-            if matches.len() >= MAX_SEARCH_RESULTS {
-                break;
-            }
-            *visited = (*visited).saturating_add(1);
-            if *visited > MAX_SEARCH_ENTRIES {
-                bail!("search traversal exceeds configured entry limit");
-            }
-            let path = entry.path();
-            if !sandbox.resolve_read(&path).is_allowed() {
-                continue;
-            }
-            let metadata = tokio::fs::symlink_metadata(&path).await?;
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            if metadata.is_dir() {
-                search_tree(sandbox, &path, query, matches, visited, depth + 1).await?;
-            } else if metadata.is_file() {
-                let Ok(content) = read_bounded(&path, sandbox.max_tool_output_bytes).await else {
-                    continue;
-                };
-                for (line_number, line) in content.lines().enumerate() {
-                    if line.contains(query) {
-                        matches.push(format!(
-                            "{}:{}:{}",
-                            path.display(),
-                            line_number + 1,
-                            line.trim()
-                        ));
-                        if matches.len() >= MAX_SEARCH_RESULTS {
-                            break;
-                        }
-                    }
+        let Ok(content) = read_bounded(&path, action.sandbox().max_tool_output_bytes).await else {
+            continue;
+        };
+        for (number, line) in content.lines().enumerate() {
+            if line.contains(&query) {
+                matches.push(format!("{}:{}:{}", path.display(), number + 1, line.trim()));
+                if matches.len() >= MAX_SEARCH_RESULTS {
+                    break;
                 }
             }
         }
-        Ok(())
-    })
+    }
+    Ok(ToolOutput::evidenced(
+        matches.join("\n"),
+        format!("search:{}", short_hash(&query)),
+    ))
 }
 
 async fn execute_walk(action: &VerifiedAction) -> Result<ToolOutput> {
