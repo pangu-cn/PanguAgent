@@ -120,6 +120,9 @@ enum Commands {
         #[command(subcommand)]
         action: SessionCommands,
     },
+    /// Read one JSON command from stdin and write one derived JSON response.
+    /// This channel cannot execute tools.
+    Rpc,
     /// Inspect a stable event stream. Read-only, and never an authorization.
     Events {
         #[command(subcommand)]
@@ -424,6 +427,12 @@ enum SessionCommands {
     },
     /// Copy the recorded dialogue into a new snapshot. This command does not
     /// copy the workspace, approvals, or checkpoint state.
+    Clone {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "cloned-conversation")]
+        run_id: String,
+    },
     Fork {
         #[arg(long)]
         id: String,
@@ -536,8 +545,9 @@ async fn main() -> Result<()> {
             } => conversation_export(&args, id, out, strict, json),
         },
         Some(Commands::Session { action }) => match action {
-            SessionCommands::Fork { id, run_id } => {
-                println!("session fork copies dialogue only; it does not copy the workspace");
+            SessionCommands::Fork { id, run_id } => session_fork(&args, &id, &run_id),
+            SessionCommands::Clone { id, run_id } => {
+                println!("session clone copies dialogue only; it does not copy the workspace");
                 conversation_clone(&args, &id, &run_id)
             }
             SessionCommands::Tree { json } => session_tree(&args, json),
@@ -551,6 +561,7 @@ async fn main() -> Result<()> {
             print_url,
             no_token,
         }) => canvas_serve(&args, journal, port, print_url, no_token).await,
+        Some(Commands::Rpc) => rpc_once(),
         Some(Commands::Events { action }) => match action {
             EventsCommands::Read {
                 path,
@@ -2646,6 +2657,62 @@ fn session_contract(args: &Cli) -> Result<GoalContract> {
         );
     }
     Ok(GoalContract::from_config("session maintenance", &config)?)
+}
+
+fn session_fork(args: &Cli, id: &str, run_id: &str) -> Result<()> {
+    println!("session fork copies dialogue only; it does not copy the workspace");
+    let Some(runtime) = conversation_store(args)? else {
+        bail!("conversation persistence is disabled");
+    };
+    let source = runtime.load(id).map_err(|error| anyhow!(error))?;
+    let cloned = runtime
+        .clone_snapshot(id, run_id)
+        .map_err(|error| anyhow!(error))?;
+    let event = pangu_core::Event::new_v2(
+        pangu_core::EventKind::SessionForked,
+        0,
+        format!(
+            "parent={} child={} workspace_copied=false",
+            source.snapshot_id, cloned.snapshot_id
+        ),
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "pangu-session-fork/1",
+            "derived": true,
+            "authoritative": false,
+            "parent_digest": source.history_digest,
+            "child": cloned.snapshot_id,
+            "workspace_copied": false,
+            "event": event.kind.as_str()
+        })
+    );
+    Ok(())
+}
+
+fn rpc_once() -> Result<()> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let value: serde_json::Value = serde_json::from_str(&input)?;
+    let command = value
+        .get("command")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    if command != "capabilities" {
+        bail!("rpc command is not available");
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "pangu-rpc/1",
+            "derived": true,
+            "authoritative": false,
+            "capabilities": ["session.tree", "conversation.search"],
+            "execution": false
+        })
+    );
+    Ok(())
 }
 
 fn session_tree(args: &Cli, json: bool) -> Result<()> {

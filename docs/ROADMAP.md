@@ -700,6 +700,18 @@ W-43~W-47 是 F7 的风险摘要；完整激活后具体控制以 [`ADR-0001`](a
 
 任何级别都不能跳过 Policy、Sandbox、Approval 和 VerifiedAction。
 
+## 5e. 扩展曝光五级
+
+| 级别 | 含义 | 权限 |
+| --- | --- | --- |
+| direct | 可直接出现在工具列表 | 仍需 L1–L4 |
+| model-only | 仅模型可见 | 仍需 L1–L4 |
+| codemode | 仅代码模式可见 | 仍需 L1–L4 |
+| deferred | 默认不广告，显式请求后可见 | 仍需 L1–L4 |
+| hidden | 不广告 | 没有执行路径 |
+
+exposure 只控制广告，不降低风险，也不等于授权。
+
 ## 5d. 定时任务与 Gateway 边界
 
 未来 cron 的每个任务必须是独立 `GoalContract`，拥有独立 workspace、预算、审批、过期时间和取消路径。Gateway 只接收意图并创建合同，不能执行工具。profile 绑定测试必须证明一个 profile 的合同不能读取另一个 profile 的 workspace。Hermes 的多 profile 泄漏不能通过引入全局状态在 Pangu 中复现。
