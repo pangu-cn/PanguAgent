@@ -213,27 +213,27 @@ fn the_documented_rollback_refusal_is_still_where_the_section_says_it_is() {
 fn the_documented_external_effect_block_is_still_where_the_section_says_it_is() {
     let section = section_9_2_1();
     assert!(
-        section.contains("artifact.rs:1469"),
+        section.contains("artifact.rs:1506"),
         "§9.2.1 must keep citing the external-effect block by line"
     );
 
     let artifact = read("crates/pangu-core/src/artifact.rs");
     let block_line = artifact
         .lines()
-        .nth(1468)
+        .nth(1505)
         .expect("artifact.rs must still have line 1469");
     // The citation points at the refusal branch; the message may sit on the line
     // itself or the one after it, because `?`-style error construction wraps.
     let around = artifact
         .lines()
-        .skip(1464)
+        .skip(1501)
         .take(12)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
         around.contains("irreversible external effect")
             || block_line.contains("irreversible external effect"),
-        "crates/pangu-core/src/artifact.rs:1469 must remain the external-effect \
+        "crates/pangu-core/src/artifact.rs:1506 must remain the external-effect \
          refusal, but the area reads:\n{around}"
     );
 }
