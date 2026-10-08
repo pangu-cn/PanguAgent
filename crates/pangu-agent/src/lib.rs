@@ -388,6 +388,7 @@ pub struct Agent {
     /// fallback.
     fallbacks: Vec<Arc<dyn Provider>>,
     tools: Arc<dyn ToolExecutor>,
+    initial_tool_digest: String,
     approval: Arc<dyn ApprovalHandler>,
     event_sink: Arc<dyn EventSink>,
     checkpoint: Option<Arc<checkpoint::CheckpointRuntime>>,
@@ -534,6 +535,14 @@ impl Agent {
             sandbox,
             provider,
             fallbacks: fallback_iter.collect(),
+            initial_tool_digest: pangu_core::hex_sha256(
+                &tools
+                    .specs()
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             tools,
             approval,
             delegation: None,
@@ -1781,8 +1790,19 @@ impl Agent {
                     pangu_core::DegradeMode::Omitted => (full, summary, omitted + 1),
                 },
             );
-            let prefix_stable =
-                turn == 1 && !assembly.forced_over_budget && assembled.seams.is_empty();
+            let current_tool_digest = pangu_core::hex_sha256(
+                &self
+                    .tools
+                    .specs()
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            let prefix_stable = turn == 1
+                && !assembly.forced_over_budget
+                && assembled.seams.is_empty()
+                && current_tool_digest == self.initial_tool_digest;
             let mut assembled_event = self.event(
                 EventKind::ContextAssembled,
                 turn,

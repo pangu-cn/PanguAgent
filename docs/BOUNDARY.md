@@ -35,6 +35,10 @@ GoalContract (L1)
 
 ## 3. 边界（Boundaries）
 
+### 上下文前缀稳定性
+
+一次 run 的 system 指令、工具声明和初始会话前缀视为缓存敏感。组装器不得为了临时召回、记忆或工具集变化而改写已经发出的首轮前缀。此类变化推迟到下一次 run。`ContextAssembled.payload.prefix_stable` 是派生字段：首轮且无 seam、无降级、工具集未变为 true；缺失表示未知，不得解释为 false。
+
 ### L1 — GoalContract（一次 run 的不可变意图）
 
 Agent 启动时从已校验的 `Config` 构造并冻结 `GoalContract`：目标文本、canonical workspace、readable/writable roots、forbidden globs、预算、审批模式、网络/环境 allow-list、工具和子进程限制、F3 验证命令与扩展只读白名单、F4 plan/act 阶段纪律、evidence 要求，以及与 Policy 规则集绑定的 digest。模型不能修改这些字段；本版本没有 `update_plan` 或动态放宽边界的工具。

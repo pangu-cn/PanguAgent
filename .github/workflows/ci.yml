@@ -40,6 +40,7 @@ jobs:
       - name: Warn on code health thresholds
         shell: bash
         run: |
+          python scripts/code_health/check.py
           python - <<'PY'
           from pathlib import Path
           redline = {"crates/pangu-boundary/src/sandbox.rs", "crates/pangu-agent/src/lib.rs"}

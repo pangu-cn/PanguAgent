@@ -693,12 +693,16 @@ W-43~W-47 是 F7 的风险摘要；完整激活后具体控制以 [`ADR-0001`](a
 
 | 级别 | 来源 | 生效条件 |
 | --- | --- | --- |
-| 1 | 内置 core | 新工具必须有 ADR，并进入 manifest |
+| 1 | 内置 core | 新工具必须有 ADR，并进入 manifest 与 contract digest |
 | 2 | 配置声明 | 只能引用已登记工具，不能直接执行 |
 | 3 | skill 包 | 沿用 skill registry；不能自行安装 |
 | 4 | E1 插件 | 未来能力；当前没有加载器，不能生效 |
 
 任何级别都不能跳过 Policy、Sandbox、Approval 和 VerifiedAction。
+
+## 5d. 定时任务与 Gateway 边界
+
+未来 cron 的每个任务必须是独立 `GoalContract`，拥有独立 workspace、预算、审批、过期时间和取消路径。Gateway 只接收意图并创建合同，不能执行工具。profile 绑定测试必须证明一个 profile 的合同不能读取另一个 profile 的 workspace。Hermes 的多 profile 泄漏不能通过引入全局状态在 Pangu 中复现。
 
 ## 6. 每个新特性的准入模板
 

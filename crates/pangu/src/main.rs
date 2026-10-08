@@ -383,6 +383,9 @@ enum ConversationCommands {
         #[arg(long, default_value = "cloned-conversation")]
         run_id: String,
     },
+    /// Search redacted conversation text. The query result is derived and
+    /// never includes the raw stored snapshot.
+    Search { query: String },
     /// Show one conversation's metadata without its full text.
     Show {
         /// Snapshot id. Defaults to the most recent.
@@ -523,6 +526,7 @@ async fn main() -> Result<()> {
         Some(Commands::Conversation { action }) => match action {
             ConversationCommands::List => conversation_list(&args),
             ConversationCommands::Clone { id, run_id } => conversation_clone(&args, &id, &run_id),
+            ConversationCommands::Search { query } => conversation_search(&args, &query),
             ConversationCommands::Show { id, json } => conversation_show(&args, id, json),
             ConversationCommands::Export {
                 id,
@@ -1157,6 +1161,21 @@ authoritative: false",
                 "compacted from {} (dropped {}, kept {})",
                 record.compacted_from_digest, record.dropped_messages, record.kept_messages
             );
+        }
+    }
+    Ok(())
+}
+
+fn conversation_search(args: &Cli, query: &str) -> Result<()> {
+    let Some(store) = conversation_store(args)? else {
+        bail!("conversation persistence is disabled");
+    };
+    let query = pangu_core::redact_text(query);
+    for id in store.list().map_err(|error| anyhow!(error))? {
+        let snapshot = store.load(&id).map_err(|error| anyhow!(error))?;
+        let text = pangu_core::redact_text(&format!("{:?}", snapshot.messages));
+        if text.contains(&query) {
+            println!("{id}\tderived=true\tauthoritative=false");
         }
     }
     Ok(())
