@@ -65,6 +65,8 @@ pub enum EventKind {
     AutomationAccepted,
     /// C3: a duplicate idempotency key was rejected.
     AutomationDuplicate,
+    /// D2: a manager rejected a child result. Provisional and non-executing.
+    TaskRejected,
 }
 
 impl EventKind {
@@ -108,6 +110,7 @@ impl EventKind {
             Self::SessionForked => "session_forked",
             Self::AutomationAccepted => "automation_accepted",
             Self::AutomationDuplicate => "automation_duplicate",
+            Self::TaskRejected => "task_rejected",
         }
     }
 

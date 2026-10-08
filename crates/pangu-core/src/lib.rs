@@ -11,6 +11,7 @@ pub mod canvas;
 pub mod checkpoint;
 pub mod control;
 pub mod conversation;
+pub mod dag;
 pub mod deliverable;
 pub mod diff;
 pub mod error;

@@ -115,6 +115,7 @@ pub enum StreamKind {
     SessionForked,
     AutomationAccepted,
     AutomationDuplicate,
+    TaskRejected,
 }
 
 impl StreamKind {
@@ -177,6 +178,7 @@ impl StreamKind {
             Self::SessionForked,
             Self::AutomationAccepted,
             Self::AutomationDuplicate,
+            Self::TaskRejected,
         ]
     }
 
@@ -219,6 +221,7 @@ impl StreamKind {
             EventKind::SessionForked => Self::SessionForked,
             EventKind::AutomationAccepted => Self::AutomationAccepted,
             EventKind::AutomationDuplicate => Self::AutomationDuplicate,
+            EventKind::TaskRejected => Self::TaskRejected,
         })
     }
 }
@@ -806,6 +809,7 @@ mod tests {
                 StreamKind::SessionForked => EventKind::SessionForked,
                 StreamKind::AutomationAccepted => EventKind::AutomationAccepted,
                 StreamKind::AutomationDuplicate => EventKind::AutomationDuplicate,
+                StreamKind::TaskRejected => EventKind::TaskRejected,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -859,6 +863,7 @@ mod tests {
                     StreamKind::SessionForked => EventKind::SessionForked,
                     StreamKind::AutomationAccepted => EventKind::AutomationAccepted,
                     StreamKind::AutomationDuplicate => EventKind::AutomationDuplicate,
+                    StreamKind::TaskRejected => EventKind::TaskRejected,
                 },
                 0,
                 "hello",

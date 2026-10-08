@@ -310,6 +310,7 @@ impl ConsoleSink {
             EventKind::TaskDelegated => "⇒ sub  ",
             EventKind::AutomationAccepted => "⏱ auto ",
             EventKind::AutomationDuplicate => "⏱ dup ",
+            EventKind::TaskRejected => "× task ",
         };
         let mut output = format!("{tag} ");
         if let Some(tool) = &event.tool {

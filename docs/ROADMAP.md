@@ -700,6 +700,10 @@ W-43~W-47 是 F7 的风险摘要；完整激活后具体控制以 [`ADR-0001`](a
 
 任何级别都不能跳过 Policy、Sandbox、Approval 和 VerifiedAction。
 
+## 5i. 多 Agent 收编
+
+DAG 节点必须有独立预算和 idempotency key。manager 只能返回 `TaskDelegated` 或 `TaskRejected`，`can_execute_tools()` 固定为 false。`NamedAction` 只保存工具名单，不执行；每个工具调用仍逐项过 L1–L4。自动搜索出的 workflow 必须重新过准入，不能自动获得执行权。
+
 ## 5h. 控制面与执行面
 
 控制面只接受 `ControlIntent` 和短时 `SessionToken`。它不能调用工具。重复 idempotency key 与过期意图 fail-closed。token 最长 900 秒，且只匹配一个 scope。长期密钥不得进入 UI。`AutomationAccepted` 与 `AutomationDuplicate` 是 provisional 事件，不表示动作已执行。
