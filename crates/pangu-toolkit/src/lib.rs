@@ -311,6 +311,28 @@ impl Toolkit {
                 timeout_ms: None,
             },
             Capability {
+                name: "sqlite_query".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "sqlite_schema".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
                 name: "git_query".into(),
                 version: "1".into(),
                 risk: Risk::ReadOnly,
@@ -879,6 +901,26 @@ impl ToolExecutor for Toolkit {
                 }),
             ),
             ToolSpec::new(
+                "sqlite_query",
+                "Run one read-only SELECT or EXPLAIN against a local SQLite file. Writes and attached databases are rejected.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "sql"],
+                    "properties": {"path": {"type": "string"}, "sql": {"type": "string", "minLength": 1}}
+                }),
+            ),
+            ToolSpec::new(
+                "sqlite_schema",
+                "List tables in a local SQLite file without executing model SQL.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
                 "git_query",
                 "Run one read-only git query: diff, status, log, or show. It cannot change the repository or contact a remote.",
                 json!({
@@ -1289,6 +1331,27 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "sqlite_query" | "sqlite_schema" => {
+                let keys: &[&str] = if call.name == "sqlite_query" {
+                    &["path", "sql"]
+                } else {
+                    &["path"]
+                };
+                ensure_allowed_keys(&call.args, keys)?;
+                let path = required_path(&call.args, "path")?;
+                if call.name == "sqlite_query" {
+                    let sql = required_string(&call.args, "sql")?;
+                    validate_readonly_sql(&sql)?;
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!("{} {}", call.name, path.display());
+                Ok(assessment)
+            }
             "git_query" => {
                 ensure_allowed_keys(&call.args, &["command", "path"])?;
                 let command = required_string(&call.args, "command")?;
@@ -1366,6 +1429,8 @@ impl ToolExecutor for Toolkit {
             "read_feed" => execute_feed(action).await,
             "save_snapshot" => execute_snapshot(action).await,
             "http_fetch" => execute_http(action).await,
+            "sqlite_query" => execute_sqlite_query(action).await,
+            "sqlite_schema" => execute_sqlite_schema(action).await,
             "git_query" | "git_diff" => execute_command(action, self.runtime.as_deref()).await,
             "run_command" => execute_command(action, self.runtime.as_deref()).await,
             "verify" => execute_verify(action, self.runtime.as_deref()).await,
@@ -1824,6 +1889,112 @@ fn collect_tree<'a>(
         }
         Ok(())
     })
+}
+
+fn validate_readonly_sql(sql: &str) -> Result<()> {
+    let trimmed = sql.trim();
+    if trimmed.len() > 4_096
+        || trimmed.contains(';')
+        || trimmed.contains("--")
+        || trimmed.contains("/*")
+    {
+        bail!("SQL must be one read-only statement");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let mut words = lower.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    if !matches!(first, "select" | "explain" | "with") {
+        bail!("SQL write statements are rejected");
+    }
+    for word in words {
+        if matches!(
+            word,
+            "insert"
+                | "update"
+                | "delete"
+                | "drop"
+                | "alter"
+                | "attach"
+                | "detach"
+                | "pragma"
+                | "vacuum"
+                | "reindex"
+                | "create"
+                | "replace"
+        ) {
+            bail!("SQL write statements are rejected");
+        }
+    }
+    Ok(())
+}
+
+async fn execute_sqlite_query(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified database missing"))?;
+    let sql = required_string(&action.call().args, "sql")?;
+    validate_readonly_sql(&sql)?;
+    let output = run_sqlite(path, &[&sql])?;
+    Ok(ToolOutput::evidenced(
+        output,
+        format!("sqlite:{}", short_hash(&sql)),
+    ))
+}
+
+async fn execute_sqlite_schema(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified database missing"))?;
+    let output = run_sqlite(
+        path,
+        &["SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"],
+    )?;
+    Ok(ToolOutput::evidenced(
+        output,
+        format!("schema:{}", path.display()),
+    ))
+}
+
+fn run_sqlite(path: &Path, args: &[&str]) -> Result<String> {
+    let program = resolve_sqlite_program()?;
+    let mut command = std::process::Command::new(program);
+    command
+        .arg("-readonly")
+        .arg(path)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null());
+    let output = command.output().context("sqlite3 is not available")?;
+    if !output.status.success() {
+        bail!("sqlite query failed");
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.len() > 64 * 1024 {
+        bail!("sqlite output exceeds configured limit");
+    }
+    Ok(text)
+}
+
+fn resolve_sqlite_program() -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not available"))?;
+    let names = if cfg!(windows) {
+        vec!["sqlite3.exe", "sqlite3"]
+    } else {
+        vec!["sqlite3"]
+    };
+    for directory in std::env::split_paths(&path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!("sqlite3 is not available")
 }
 
 fn required_paths(args: &Value, key: &str) -> Result<Vec<PathBuf>> {

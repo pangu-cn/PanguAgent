@@ -202,6 +202,10 @@ RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
 
 外部 GitHub、GitLab 和 Postman MCP 持有凭据，也能创建 PR、合并代码或发送 API 请求。这里不接入这些服务。`git_query` 只允许 `diff`、`status`、`log` 和 `show`，参数继续经过现有只读 argv 白名单。`push`、`commit`、`reset`、PR 和远程 API 调试都没有工具入口；测试执行仍由操作者预先配置的 `verify` 承担，而且每次都需要人工批准。
 
+## 3e. 只读 SQLite
+
+外部数据库 MCP 持有连接凭据，也可能执行写入。这里不接入 PostgreSQL 或 MySQL 服务。`sqlite_query` 只接受一条 `SELECT`、`EXPLAIN` 或 `WITH` 语句，拒绝分号、注释和 `INSERT`、`UPDATE`、`DELETE`、`DROP`、`ALTER`、`ATTACH`、`PRAGMA` 等写入词。数据库文件必须先通过 L3 可读路径校验，查询使用 `sqlite3 -readonly`。`sqlite_schema` 不执行模型提供的 SQL，只列出表名。没有数据导出或慢查询优化工具。
+
 ## 4. MCP 协议支持
 
 分两部分实现：

@@ -54,7 +54,7 @@ Contract 与 Sandbox 的有效字段及 readable/writable roots 的有效顺序�
 
 ### L3 — Sandbox（资源硬限制）
 
-- **路径**：相对路径以 workspace 为基准；读路径必须存在并落在 `readable_roots`（workspace 必须包含在其中），写路径必须落在 workspace 内的 `writable_roots`。canonical path、symlink component、`..`、NUL、UNC 和越界路径均拒绝。禁止 glob 对绝对和 relative 路径都生效。
+- **路径**：相对路径以 workspace 为基准。`sqlite_query` 与 `sqlite_schema` 的数据库文件必须落在可读根内；查询只接受一条不含注释的只读语句，写入词在执行前拒绝。读路径必须存在并落在 `readable_roots`（workspace 必须包含在其中），写路径必须落在 workspace 内的 `writable_roots`。canonical path、symlink component、`..`、NUL、UNC 和越界路径均拒绝。禁止 glob 对绝对和 relative 路径都生效。
 - **进程**：不经过 shell；argv 总长度、可执行程序、flag 和路径参数受限；child stdin 关闭、环境按 allow-list 清洗、超时 kill、stdout/stderr 有界读取。工具不提供通用 shell：`run_command`/`git_diff`/`git_query` 只允许只读命令 allow-list；`git_query` 仅接受 `diff`、`status`、`log`、`show`。`verify` 只运行 `[verify] command` 在启动时冻结进 contract 的**整条命令**——其程序名必须在同一只读白名单（内置或 `extra_readonly_commands`）上，模型不能增改参数，每次调用都需 L4 人工批准。`extra_readonly_commands` 是操作者对被声明程序副作用的断言，不放宽路径/flag/host 检查，也不构成 Pangu 对其外部副作用的追踪。
 - **网络**：仅 HTTP/HTTPS；主机必须在显式 allow-list。`search_index` 与 `save_snapshot` 不发起网络请求；`read_feed` 只读取一个已通过 `check_url` 的 RSS/Atom 地址。默认拒绝 localhost、私网、链路本地、组播和 `169.254.169.254` metadata；禁止 URL credentials、fragment、零端口、敏感 query 参数和重定向。审批 preview 移除 query/fragment，并以 path 的 SHA-256 摘要代替直接展示路径。
 - **凭据**：含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD`、`PASSWD`、`AUTH` 或 `CREDENTIAL` 的环境键不能进入 child env；事件字段、payload、错误和 provider 错误在边界处脱敏。

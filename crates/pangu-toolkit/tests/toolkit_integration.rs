@@ -440,6 +440,32 @@ async fn git_query_rejects_repository_changes() {
 }
 
 #[tokio::test]
+async fn sqlite_query_rejects_writes_before_execution() {
+    let root = temp_root("sqlite");
+    std::fs::write(root.join("db.sqlite"), "not-opened").expect("seed");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new(
+                "sqlite_query",
+                json!({"path": "db.sqlite", "sql": "DROP TABLE notes"}),
+            )]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Failed);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("write statements"), "{rendered}");
+    assert_eq!(
+        std::fs::read(root.join("db.sqlite")).expect("db"),
+        b"not-opened"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn output_limit_failure_cannot_create_evidence() {
     let root = temp_root("output-limit");
     std::fs::write(root.join("large.txt"), "x".repeat(512)).expect("seed large file");
