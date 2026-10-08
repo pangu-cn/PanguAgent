@@ -2887,10 +2887,8 @@ impl Agent {
                         evidence.push(item);
                     }
                 }
-                let content = truncate_middle(
-                    &redact_text(&output.content),
-                    self.sandbox.max_tool_output_bytes,
-                );
+                let content = redact_text(&output.content);
+                let preview = truncate_middle(&content, 240);
                 let output_bytes = output.content.len();
                 let output_digest = pangu_core::hex_sha256(&output.content);
                 let finished_event = self
@@ -2909,6 +2907,10 @@ impl Agent {
                         .payload(serde_json::json!({
                             "ok": true,
                             "evidence": bounded_evidence,
+                            "output_complete": true,
+                            "collapsed": true,
+                            "preview": preview,
+                            "output": content,
                             "output_bytes": output_bytes,
                             "output_sha256": output_digest,
                         })),
