@@ -59,7 +59,67 @@
 
 不做什么：不在本 ADR 中直接拆分这些文件，也不因当前超限阻断发布。
 
-## 3. 准入分析
+## 3. 逐项准入
+
+每项都回答 ROADMAP §6 的十五问。结论先说：没有一项允许模型自行扩权，也没有一项需要改写不可恢复的旧记录。
+
+### P0-1
+
+- ID：P0-1；用户价值是减少无意义的上下文前缀漂移。借鉴对象是 Hermes 的缓存纪律，不是其运行时。
+- 不做 prompt-cache 命中承诺，不新增 capability。可读数据只有本次组装报告；无写入、无网络、无子 Agent、无记忆。
+- 可无人值守，因为它不执行动作。无本地服务、无新模型依赖。组装失败时不填布尔值，而是保留“未知”。
+- 父预算不变，无审批。事件只追加派生 payload。失败重试不会回写旧事件。威胁是把“未知”误读成 false；测试必须禁止。兼容方式是字段可选。验收是首轮 true、变化后 false。无新第三方依赖。
+
+### P0-2
+
+- ID：P0-2；用户价值是让新增工具先被分类再进入代码。借鉴对象是 Hermes 的 footprint ladder。
+- 不做自动安装或动态加载。无 capability、无数据读写、无网络、无子 Agent、无记忆。
+- 它是文档门，不可无人值守执行。无本地服务、无模型和预算。失败时未登记来源保持不可加载。
+- 无审批状态可继承。Journal 不变。恢复方式是删除文档补丁。威胁是把“配置声明”误写成“配置即执行”；文本必须明确否定。验收是四级表和批准人完整。无新依赖。
+
+### P0-3
+
+- ID：P0-3；用户价值是尽早看见复杂度增长。借鉴对象是 Hermes 的 code health。
+- 不因历史债务阻断 CI。无 runtime capability。只读仓库源码，无用户数据、网络、子 Agent 和记忆。
+- CI 可重复运行，但不改产品状态。无本地服务和模型。脚本自身失败时报告脚本失败，不修改源码。
+- 无预算、审批或 Journal。恢复方式是移除 CI step。威胁是脚本误扫用户工作区；输入路径必须限定 `crates/`。验收是 warning 且退出码 0。无新依赖。
+
+### P0-4
+
+- ID：P0-4；用户价值是从旧对话分叉试验，同时不误恢复工作区。借鉴对象是 Pi 的会话树。
+- 不复制 workspace、approval、checkpoint 或 effect ledger。无模型 capability。读取源 snapshot，写入新 snapshot。
+- 无网络、无子 Agent、无记忆写入。由操作者运行，不是模型的无人值守能力。无本地服务、模型和额外预算。
+- 新 run 的副作用重新审批。事件追加 `SessionForked`。ID 冲突直接失败，源记录不变。威胁是继承旧批准；新记录不得携带 approval。验收是源 digest 与 workspace 摘要都不变。无新依赖。
+
+### P0-5
+
+- ID：P0-5；用户价值是测试不必创建磁盘存储。借鉴对象是 Pi 的 in-memory session manager。
+- 不替代生产 Journal。测试读写限于进程内存，无网络、子 Agent、记忆和本地端口。
+- 可在测试中无人运行，但 drop 后必须丢失。无模型与预算。恢复方式不适用，因为它故意不可持久化。
+- 无审批和正式 Journal。威胁是测试替身被接到 CLI；类型或模块边界必须阻止。验收是保存可读、drop 不可恢复。无新依赖。
+
+### P0-6
+
+- ID：P0-6；用户价值是降低只读工具样板代码。借鉴对象是 Qwen 的注册装饰器。
+- 不生成执行器，不生成写入工具。宏只产生声明，不读写运行数据，无网络、子 Agent 和记忆。
+- 编译期完成，无服务、模型和预算。错误声明在编译或宏测试中失败。运行时仍要经过原 L1–L4。
+- 无审批继承。Journal 不变。恢复方式是删除宏。威胁是宏被扩展到写入；测试锁定没有写入生成入口。验收是 ReadOnly/NoEffect 声明。无新依赖。
+
+### P0-7
+
+- ID：P0-7；用户价值是减少重复解析 provider 已经给出的结构化工具调用。借鉴对象是 Qwen 的 raw API 模式。
+- 不从自然语言猜工具，不跳过 L1–L4。无新 capability。可读数据是 provider 响应；无本地写入、无新网络面、无子 Agent 和记忆。
+- 默认关闭，因此不是新的无人值守能力。无本地服务。依赖仍是现有 OpenAI-compatible provider，无新模型供应渠道。
+- 非法 id、name、arguments 或超限 JSON fail-closed，不执行。预算、审批和撤销沿用目标工具。配置 opt-in 进入 digest。威胁是把解析成功当成授权；调用必须进入既有 VerifiedAction 构造。验收是默认行为不变、非法调用无 evidence。无新依赖。
+
+### P0-8
+
+- ID：P0-8；用户价值是给两个边界核心文件单独设更早的拆分警告。借鉴对象与 P0-3 相同。
+- 不直接重构，不改变 Sandbox 行为。只读指定源文件，无网络、子 Agent、记忆、服务和模型。
+- CI 告警可重复。脚本失败不改文件。无预算、审批和 Journal。恢复方式是移除红线名单。
+- 威胁是把告警误当成安全证明；输出必须写明它只衡量代码形状。验收是 1500 与 2000 两条阈值同时生效。无新依赖。
+
+## 3a. 汇总
 
 以下每项都按 ROADMAP §6 的十五问压缩记录。所有“模型能否自行扩权”的答案都是“否”；所有写入都有源记录或可重建来源。
 
@@ -99,7 +159,7 @@ P0-7 一旦设为 true，就属于 opt-in 配置并进入配置 digest。false �
 
 - `prefix_stable` 是 `ContextAssembled.payload` 的新增可选字段，派生且非权威。旧事件没有该字段时，读取方必须报告“未知”，不能解释成 false。
 - `SessionForked` 是 provisional kind。它记录 parent snapshot digest、new snapshot id 和 `workspace_copied=false`，不记录完整对话文本。
-- Journal 只追加。不迁移、不重写、不改旧 hash。未知 kind 继续按现有前向兼容规则保留或拒绝，具体解码位置 [待核实：需读事件解码代码确认]。
+- Journal 只追加。不迁移、不重写、不改旧 hash。`EventKind` 当前是封闭枚举，未知 kind 不能被现有解码器当作已识别事件；新增 `SessionForked` 后，旧二进制仍只是“缺少该 kind”，旧文件内容不变。
 - `raw_tool_calls` 缺省为 false。旧配置文件无需迁移。
 - clone 使用现有 conversation schema 和新 snapshot id。源 snapshot、源 session node 和源 workspace 均保持不变。
 
@@ -113,7 +173,7 @@ P0-7 一旦设为 true，就属于 opt-in 配置并进入配置 digest。false �
 | P0-4 | `crates/pangu/src/main.rs`、`crates/pangu-agent/src/conversation.rs`、`crates/pangu-core/src/events.rs` | clone 已有；fork/event 待加 |
 | P0-5 | `crates/pangu-core/src/events.rs`、`crates/pangu-core/src/artifact.rs` | `MemSink` 已有；内存 Artifact 待加 |
 | P0-6 | `crates/pangu-toolkit/src/lib.rs` 及对应测试 | 宏待加 |
-| P0-7 | `crates/pangu-boundary/src/config.rs`、`crates/pangu-provider/src/lib.rs` | 响应解析位置 [待核实：需读 provider 分支确认] |
+| P0-7 | `crates/pangu-boundary/src/config.rs`、`crates/pangu-provider/src/lib.rs` 的 `parse_response` | 已核实现有校验；开关待加 |
 | P0-8 | `scripts/code_health/` 与 P0-3 共用 | 红线名单待加 |
 
 当前超过 1500 行的已测文件包括 `pangu-agent/src/lib.rs`、`pangu-core/src/artifact.rs`、`pangu/src/main.rs`、`pangu-boundary/src/config.rs`、`pangu-toolkit/src/lib.rs`。这是本次测量结果，不是永久行号；脚本每次运行都重新计算。
@@ -173,8 +233,9 @@ P0-4 另需一个 CLI e2e：命令输出必须含“不复制工作区”。P0-7
 | 6 | 只读工具宏 | toolkit API | 一个提交 |
 | 7 | `raw_tool_calls` opt-in | provider 与 L1–L4 | 独立提交 |
 
-## 附录 B：未核实项
+## 附录 B：核实边界
 
-- provider 当前在哪个函数把 `tool_calls` 转成 `ToolCall`，实施 P0-7 前需读取 `pangu-provider`。
-- 旧事件解码器对未知 kind 的具体行为，实施 `SessionForked` 前需读取 `pangu-core` 的事件解码路径。
+- `parse_response` 已核实：它读取 provider message 的 `tool_calls`，校验 function、name、id、JSON object 和参数大小。P0-7 只增加开关，不替换这些校验。
+- `EventKind` 已核实为封闭枚举。新增 kind 是源码兼容性改动，但不是旧 Journal 重写。
 - `sandbox.rs` 的当前行数会随代码变化，不能写死为本 ADR 的验收数字；以脚本实测为准。
+- `MemArtifactStore` 的最终 trait 形状 [待核实：实现时需对照 `ArtifactStore` 的公开方法]，不能为了测试替身复制全部磁盘语义。
