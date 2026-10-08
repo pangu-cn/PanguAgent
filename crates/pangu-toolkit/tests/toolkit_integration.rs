@@ -230,9 +230,10 @@ async fn local_search_index_does_not_contact_a_provider() {
     let root = temp_root("search-index");
     std::fs::write(
         root.join("index.jsonl"),
-        "{\"title\":\"Boundary\",\"text\":\"sandbox token=secret\"}\n{\"title\":\"Other\",\"text\":\"unrelated\"}\n",
+        "{\"title\":\"Boundary\",\"source\":\"source.txt\",\"quote\":\"sandbox rule\"}\n{\"title\":\"Other\",\"source\":\"missing.txt\",\"quote\":\"unrelated\"}\n",
     )
     .expect("index");
+    std::fs::write(root.join("source.txt"), "sandbox rule token=secret").expect("source");
     let (agent, _sink) = build_agent(
         &root,
         vec![
@@ -247,7 +248,8 @@ async fn local_search_index_does_not_contact_a_provider() {
     let outcome = agent.run().await.expect("agent run");
     assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
     let rendered = format!("{:?}", outcome.messages);
-    assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    assert!(rendered.contains("source.txt: sandbox rule"), "{rendered}");
+    assert!(!rendered.contains("missing.txt"), "{rendered}");
     assert!(!rendered.contains("token=secret"), "{rendered}");
     std::fs::remove_dir_all(root).expect("cleanup");
 }

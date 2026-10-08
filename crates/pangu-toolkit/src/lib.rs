@@ -2115,13 +2115,24 @@ async fn execute_search_index(action: &VerifiedAction) -> Result<ToolOutput> {
             continue;
         };
         let title = value.get("title").and_then(Value::as_str).unwrap_or("");
-        let text = value.get("text").and_then(Value::as_str).unwrap_or("");
-        if title.to_ascii_lowercase().contains(&query) || text.to_ascii_lowercase().contains(&query)
+        let source = value.get("source").and_then(Value::as_str).unwrap_or("");
+        let quote = value.get("quote").and_then(Value::as_str).unwrap_or("");
+        if source.is_empty()
+            || quote.is_empty()
+            || !title.to_ascii_lowercase().contains(&query)
+                && !quote.to_ascii_lowercase().contains(&query)
         {
-            matches.push(format!(
-                "{title}: {}",
-                text.chars().take(240).collect::<String>()
-            ));
+            continue;
+        }
+        let source_path = path.parent().unwrap_or(Path::new(".")).join(source);
+        if action.sandbox().resolve_read(&source_path).is_allowed() {
+            if let Ok(source_text) =
+                read_bounded(&source_path, action.sandbox().max_tool_output_bytes).await
+            {
+                if source_text.contains(quote) {
+                    matches.push(format!("{source}: {quote}"));
+                }
+            }
         }
         if matches.len() >= MAX_SEARCH_RESULTS {
             break;

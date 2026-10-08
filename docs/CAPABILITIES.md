@@ -192,7 +192,7 @@ RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
 
 | 工具 | 网络 | 边界 |
 |------|------|------|
-| `search_index` | 不访问网络 | 搜索工作区内的 JSONL 本地索引；查询和结果都走现有脱敏 |
+| `search_index` | 不访问网络 | 搜索工作区内的 JSONL 本地索引；每条结果必须回读 `source` 并找到原文 `quote`，无法核对的条目被丢弃 |
 | `read_feed` | 仅白名单 URL | 读取一个 RSS/Atom 地址的标题和链接，复用 `http_fetch` 的 URL 与主机检查 |
 | `save_snapshot` | 不访问网络 | 保存调用方提供的已获取文本；写入前再次脱敏并受写入上限约束 |
 
