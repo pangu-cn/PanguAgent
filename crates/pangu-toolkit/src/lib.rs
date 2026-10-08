@@ -27,6 +27,35 @@ use sha2::{Digest, Sha256};
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_LIST_ENTRIES: usize = 10_000;
 
+#[macro_export]
+macro_rules! simple_readonly_tool {
+    ($name:ident, $title:literal, $description:literal) => {
+        pub fn $name() -> (pangu_core::ToolSpec, pangu_agent::Capability) {
+            (
+                pangu_core::ToolSpec::new(
+                    $title,
+                    $description,
+                    serde_json::json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
+                ),
+                pangu_agent::Capability {
+                    name: $title.into(),
+                    version: "1".into(),
+                    risk: pangu_boundary::Risk::ReadOnly,
+                    effect: pangu_agent::EffectDescriptor::new(
+                        pangu_agent::EffectScope::Workspace,
+                        pangu_agent::Reversibility::NoEffect,
+                    ),
+                    reads: vec!["workspace".into()],
+                    writes: Vec::new(),
+                    hosts: Vec::new(),
+                    processes: Vec::new(),
+                    timeout_ms: None,
+                },
+            )
+        }
+    };
+}
+
 #[derive(Clone, Default)]
 pub struct Toolkit {
     /// F3: the operator-configured verification command. Empty = the verify

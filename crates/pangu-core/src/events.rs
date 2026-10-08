@@ -58,6 +58,9 @@ pub enum EventKind {
     RollbackFailed,
     FailedPathRecorded,
     ContextAssembled,
+    /// A1: a conversation was copied into a new snapshot. Provisional: the
+    /// event records dialogue lineage only and never copies a workspace.
+    SessionForked,
 }
 
 impl EventKind {
@@ -98,6 +101,7 @@ impl EventKind {
             Self::RollbackFailed => "rollback_failed",
             Self::FailedPathRecorded => "failed_path_recorded",
             Self::ContextAssembled => "context_assembled",
+            Self::SessionForked => "session_forked",
         }
     }
 

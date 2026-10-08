@@ -37,6 +37,20 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Warn on code health thresholds
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          redline = {"crates/pangu-boundary/src/sandbox.rs", "crates/pangu-agent/src/lib.rs"}
+          for path in Path("crates").rglob("*.rs"):
+              count = sum(1 for _ in path.open(encoding="utf-8", errors="replace"))
+              key = path.as_posix()
+              limit = 1500 if key in redline else 2000
+              if count > limit:
+                  print(f"::warning title=code health::{key} has {count} lines; threshold is {limit}")
+          PY
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

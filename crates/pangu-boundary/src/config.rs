@@ -543,6 +543,10 @@ pub struct ModelSection {
     pub input_usd_per_mtok: Option<f64>,
     pub output_usd_per_mtok: Option<f64>,
     pub request_timeout_secs: Option<u64>,
+    /// Opt-in only. Provider-native tool calls still pass schema checks and
+    /// the full Policy -> Sandbox -> Approval chain.
+    #[serde(default)]
+    pub raw_tool_calls: bool,
 }
 
 /// B5: one declared fallback candidate. Field semantics mirror the primary

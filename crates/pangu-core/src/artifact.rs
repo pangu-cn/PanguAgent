@@ -18,6 +18,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, Default)]
+pub struct MemArtifactStore {
+    conversations: Mutex<BTreeMap<String, crate::ConversationSnapshot>>,
+}
+
+impl MemArtifactStore {
+    pub fn save_conversation(
+        &self,
+        conversation: &crate::ConversationSnapshot,
+    ) -> crate::Result<()> {
+        conversation.validate()?;
+        let mut conversations = self.conversations.lock().expect("memory artifact lock");
+        if conversations.contains_key(&conversation.snapshot_id) {
+            return Err(crate::Error::Config(format!(
+                "conversation snapshot already exists and is immutable: {}",
+                conversation.snapshot_id
+            )));
+        }
+        conversations.insert(conversation.snapshot_id.clone(), conversation.clone());
+        Ok(())
+    }
+
+    pub fn load_conversation(
+        &self,
+        snapshot_id: &str,
+    ) -> crate::Result<crate::ConversationSnapshot> {
+        self.conversations
+            .lock()
+            .expect("memory artifact lock")
+            .get(snapshot_id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::Error::Config(format!("conversation snapshot not found: {snapshot_id}"))
+            })
+    }
+}
+
 use crate::checkpoint::{
     ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
     FailedPathRecord, FailedPathStatus, SessionNode, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_FILES,
@@ -3012,6 +3049,26 @@ mod tests {
             .is_err());
         fs::remove_file(store.root().join(".rollback-operation.lock")).unwrap();
         fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn memory_artifact_store_rejects_duplicate_snapshots() {
+        let snapshot = crate::ConversationSnapshot::new(
+            "snapshot-1",
+            "run-1",
+            vec![crate::Message::user("hello")],
+        )
+        .unwrap();
+        let store = MemArtifactStore::default();
+        store.save_conversation(&snapshot).unwrap();
+        assert!(store.save_conversation(&snapshot).is_err());
+        assert_eq!(
+            store
+                .load_conversation("snapshot-1")
+                .unwrap()
+                .history_digest,
+            snapshot.history_digest
+        );
     }
 
     #[test]

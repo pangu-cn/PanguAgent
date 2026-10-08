@@ -52,9 +52,9 @@ pub mod util;
 pub mod testing;
 
 pub use artifact::{
-    ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
-    RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,
-    FAILED_PATH_LEDGER_FILE, ROLLBACK_OPERATION_SCHEMA_VERSION,
+    ArtifactStore, EffectRecord, MemArtifactStore, RestoreDisposition, RestoreResult,
+    RollbackOperation, RollbackOperationStatus, SnapshotLimits, SnapshotRequest,
+    ARTIFACT_STORE_SCHEMA_VERSION, FAILED_PATH_LEDGER_FILE, ROLLBACK_OPERATION_SCHEMA_VERSION,
 };
 pub use assemble::{
     assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,

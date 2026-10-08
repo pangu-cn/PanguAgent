@@ -290,6 +290,7 @@ impl ConsoleSink {
             EventKind::RollbackFailed => "  × ",
             EventKind::FailedPathRecorded => "  ! ",
             EventKind::ContextAssembled => "◧ ctx ",
+            EventKind::SessionForked => "⑂ fork ",
             EventKind::PhaseChanged => "⇄ phase",
             EventKind::ProviderSwitched => "⇄ prov ",
             EventKind::MemoryProposed => "✎ mem ",

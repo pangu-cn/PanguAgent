@@ -111,6 +111,8 @@ pub enum StreamKind {
     DeliverableRecorded,
     /// D1: a bounded subtask was delegated to a restricted sub-agent.
     TaskDelegated,
+    /// A1: provisional dialogue fork. It is not a workspace rollback.
+    SessionForked,
 }
 
 impl StreamKind {
@@ -170,6 +172,7 @@ impl StreamKind {
             Self::MemoryProposed,
             Self::DeliverableRecorded,
             Self::TaskDelegated,
+            Self::SessionForked,
         ]
     }
 
@@ -209,6 +212,7 @@ impl StreamKind {
             EventKind::MemoryProposed => Self::MemoryProposed,
             EventKind::DeliverableRecorded => Self::DeliverableRecorded,
             EventKind::TaskDelegated => Self::TaskDelegated,
+            EventKind::SessionForked => Self::SessionForked,
         })
     }
 }
@@ -793,6 +797,7 @@ mod tests {
                 StreamKind::MemoryProposed => EventKind::MemoryProposed,
                 StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
                 StreamKind::TaskDelegated => EventKind::TaskDelegated,
+                StreamKind::SessionForked => EventKind::SessionForked,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -843,6 +848,7 @@ mod tests {
                     StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
                     StreamKind::MemoryProposed => EventKind::MemoryProposed,
                     StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
+                    StreamKind::SessionForked => EventKind::SessionForked,
                 },
                 0,
                 "hello",

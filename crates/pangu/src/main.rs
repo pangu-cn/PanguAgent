@@ -419,6 +419,14 @@ enum SessionCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Copy the recorded dialogue into a new snapshot. This command does not
+    /// copy the workspace, approvals, or checkpoint state.
+    Fork {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "forked-conversation")]
+        run_id: String,
+    },
     /// Reconstruct the conversation recorded at one node, without restoring the
     /// workspace. For that, use `pangu rollback`.
     Replay {
@@ -524,6 +532,10 @@ async fn main() -> Result<()> {
             } => conversation_export(&args, id, out, strict, json),
         },
         Some(Commands::Session { action }) => match action {
+            SessionCommands::Fork { id, run_id } => {
+                println!("session fork copies dialogue only; it does not copy the workspace");
+                conversation_clone(&args, &id, &run_id)
+            }
             SessionCommands::Tree { json } => session_tree(&args, json),
             SessionCommands::Replay { node, full, json } => {
                 session_replay(&args, &node, full, json)
