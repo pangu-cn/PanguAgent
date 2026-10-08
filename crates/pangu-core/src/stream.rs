@@ -113,6 +113,8 @@ pub enum StreamKind {
     TaskDelegated,
     /// A1: provisional dialogue fork. It is not a workspace rollback.
     SessionForked,
+    AutomationAccepted,
+    AutomationDuplicate,
 }
 
 impl StreamKind {
@@ -173,6 +175,8 @@ impl StreamKind {
             Self::DeliverableRecorded,
             Self::TaskDelegated,
             Self::SessionForked,
+            Self::AutomationAccepted,
+            Self::AutomationDuplicate,
         ]
     }
 
@@ -213,6 +217,8 @@ impl StreamKind {
             EventKind::DeliverableRecorded => Self::DeliverableRecorded,
             EventKind::TaskDelegated => Self::TaskDelegated,
             EventKind::SessionForked => Self::SessionForked,
+            EventKind::AutomationAccepted => Self::AutomationAccepted,
+            EventKind::AutomationDuplicate => Self::AutomationDuplicate,
         })
     }
 }
@@ -798,6 +804,8 @@ mod tests {
                 StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
                 StreamKind::TaskDelegated => EventKind::TaskDelegated,
                 StreamKind::SessionForked => EventKind::SessionForked,
+                StreamKind::AutomationAccepted => EventKind::AutomationAccepted,
+                StreamKind::AutomationDuplicate => EventKind::AutomationDuplicate,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -849,6 +857,8 @@ mod tests {
                     StreamKind::MemoryProposed => EventKind::MemoryProposed,
                     StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
                     StreamKind::SessionForked => EventKind::SessionForked,
+                    StreamKind::AutomationAccepted => EventKind::AutomationAccepted,
+                    StreamKind::AutomationDuplicate => EventKind::AutomationDuplicate,
                 },
                 0,
                 "hello",

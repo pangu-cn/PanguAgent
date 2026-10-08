@@ -700,6 +700,10 @@ W-43~W-47 是 F7 的风险摘要；完整激活后具体控制以 [`ADR-0001`](a
 
 任何级别都不能跳过 Policy、Sandbox、Approval 和 VerifiedAction。
 
+## 5h. 控制面与执行面
+
+控制面只接受 `ControlIntent` 和短时 `SessionToken`。它不能调用工具。重复 idempotency key 与过期意图 fail-closed。token 最长 900 秒，且只匹配一个 scope。长期密钥不得进入 UI。`AutomationAccepted` 与 `AutomationDuplicate` 是 provisional 事件，不表示动作已执行。
+
 ## 5g. LangGraph 式回放边界
 
 `pangu run --from-checkpoint ID` 开启一个新 run，并声明旧 checkpoint 与 Journal 只读。它不恢复 workspace，也不重放 `ToolStarted` 后尚未完成的动作。exact-once 恢复仍属于 F7 激活门，当前没有 operator 证据，不能声称已完成。

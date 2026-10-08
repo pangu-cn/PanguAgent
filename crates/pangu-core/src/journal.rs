@@ -308,6 +308,8 @@ impl ConsoleSink {
             EventKind::MemoryProposed => "✎ mem ",
             EventKind::DeliverableRecorded => "◇ del  ",
             EventKind::TaskDelegated => "⇒ sub  ",
+            EventKind::AutomationAccepted => "⏱ auto ",
+            EventKind::AutomationDuplicate => "⏱ dup ",
         };
         let mut output = format!("{tag} ");
         if let Some(tool) = &event.tool {

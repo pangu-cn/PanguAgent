@@ -9,6 +9,7 @@ pub mod assemble;
 pub mod audit;
 pub mod canvas;
 pub mod checkpoint;
+pub mod control;
 pub mod conversation;
 pub mod deliverable;
 pub mod diff;
