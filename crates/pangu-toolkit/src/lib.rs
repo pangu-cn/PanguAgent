@@ -22,6 +22,7 @@ use pangu_agent::{
 };
 use pangu_boundary::{Risk, Sandbox};
 use pangu_core::{short_hash, MemoryStore, SkillRegistry, ToolCall, ToolSpec};
+use sha2::{Digest, Sha256};
 
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -305,6 +306,17 @@ impl Toolkit {
                 risk: Risk::ReadOnly,
                 effect: EffectDescriptor::new(EffectScope::Session, Reversibility::NoEffect),
                 reads: empty(),
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "csv_summary".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
                 writes: empty(),
                 hosts: empty(),
                 processes: empty(),
@@ -901,6 +913,16 @@ impl ToolExecutor for Toolkit {
                 }),
             ),
             ToolSpec::new(
+                "csv_summary",
+                "Summarize one UTF-8 CSV file inside the readable boundary and return its SHA-256.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
                 "sqlite_query",
                 "Run one read-only SELECT or EXPLAIN against a local SQLite file. Writes and attached databases are rejected.",
                 json!({
@@ -1331,6 +1353,18 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "csv_summary" => {
+                ensure_allowed_keys(&call.args, &["path"])?;
+                let path = required_path(&call.args, "path")?;
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!("csv {}", path.display());
+                Ok(assessment)
+            }
             "sqlite_query" | "sqlite_schema" => {
                 let keys: &[&str] = if call.name == "sqlite_query" {
                     &["path", "sql"]
@@ -1429,6 +1463,7 @@ impl ToolExecutor for Toolkit {
             "read_feed" => execute_feed(action).await,
             "save_snapshot" => execute_snapshot(action).await,
             "http_fetch" => execute_http(action).await,
+            "csv_summary" => execute_csv_summary(action).await,
             "sqlite_query" => execute_sqlite_query(action).await,
             "sqlite_schema" => execute_sqlite_schema(action).await,
             "git_query" | "git_diff" => execute_command(action, self.runtime.as_deref()).await,
@@ -1889,6 +1924,30 @@ fn collect_tree<'a>(
         }
         Ok(())
     })
+}
+
+async fn execute_csv_summary(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified CSV missing"))?;
+    let content = read_bounded(path, action.sandbox().max_tool_output_bytes).await?;
+    let mut rows = 0usize;
+    let mut columns = 0usize;
+    for line in content.lines().filter(|line| !line.is_empty()) {
+        rows += 1;
+        columns = columns.max(line.split(',').count());
+    }
+    let digest = Sha256::digest(content.as_bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(ToolOutput::evidenced(
+        format!("rows={rows}\ncolumns={columns}\nsha256={digest}"),
+        format!("csv:{digest}"),
+    ))
 }
 
 fn validate_readonly_sql(sql: &str) -> Result<()> {

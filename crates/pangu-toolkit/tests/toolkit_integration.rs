@@ -468,6 +468,30 @@ async fn sqlite_query_rejects_writes_before_execution() {
 }
 
 #[tokio::test]
+async fn csv_summary_counts_rows_and_reports_digest() {
+    let root = temp_root("csv");
+    std::fs::write(root.join("data.csv"), "name,value\nalpha,1\nbeta,2\n").expect("csv");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new(
+                "csv_summary",
+                json!({"path": "data.csv"}),
+            )]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("rows=3"), "{rendered}");
+    assert!(rendered.contains("columns=2"), "{rendered}");
+    assert!(rendered.contains("sha256="), "{rendered}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn output_limit_failure_cannot_create_evidence() {
     let root = temp_root("output-limit");
     std::fs::write(root.join("large.txt"), "x".repeat(512)).expect("seed large file");

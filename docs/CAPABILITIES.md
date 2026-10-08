@@ -206,6 +206,10 @@ RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
 
 外部数据库 MCP 持有连接凭据，也可能执行写入。这里不接入 PostgreSQL 或 MySQL 服务。`sqlite_query` 只接受一条 `SELECT`、`EXPLAIN` 或 `WITH` 语句，拒绝分号、注释和 `INSERT`、`UPDATE`、`DELETE`、`DROP`、`ALTER`、`ATTACH`、`PRAGMA` 等写入词。数据库文件必须先通过 L3 可读路径校验，查询使用 `sqlite3 -readonly`。`sqlite_schema` 不执行模型提供的 SQL，只列出表名。没有数据导出或慢查询优化工具。
 
+## 3f. CSV 摘要
+
+外部 PDF、Excel 和 Word MCP 会解析复杂二进制格式，解析器本身也可能执行内容。这里不接入这些服务器。`csv_summary` 只读取一个已通过 L3 校验的 UTF-8 CSV，返回行数、最大列数和原文 SHA-256。它不计算公式，也不修改文件。PDF、Excel 和 Word 的解析尚未实现。
+
 ## 4. MCP 协议支持
 
 分两部分实现：
