@@ -202,6 +202,13 @@ fn network_disabled_blocks_external_navigation() {
     let snapshot = session.snapshot().expect("snapshot");
     assert_eq!(snapshot.title, "offline");
     assert!(snapshot.text.contains("local page"), "{:?}", snapshot.text);
+    let embedded = "data:text/html,<p>https://example.com/ is only text</p><style>body{background:url(https://example.com/pixel.png)}</style>";
+    session.navigate(embedded).expect("embedded navigation");
+    let refused = session.snapshot();
+    assert!(
+        refused.is_err(),
+        "an embedded external resource must be refused: {refused:?}"
+    );
 
     drop(session);
 }

@@ -173,6 +173,43 @@ RAN docker run --rm -i "--volume=<ws>:/workspace" "--workdir=/workspace" \
 后者需要一次明确的设计（生命周期、状态存放位置、崩溃后的处理），不是给现有结构
 加一个字段。
 
+## 3b. 内置批量文件系统工具
+
+外部 filesystem MCP 能提供批量遍历、分片读取和批量替换，但它的进程不在 Pangu 的路径校验和审计链里。这里没有接入外部服务器，而是把这些能力重写为原生工具：
+
+| 工具 | 风险 | 边界 |
+|------|------|------|
+| `walk_files` | `ReadOnly` | 从已验证目录递归列出普通文件，跳过符号链接 |
+| `dir_tree` | `ReadOnly` | 展示已验证目录结构，跳过符号链接 |
+| `read_slice` | `ReadOnly` | 按字节偏移读取一个有界片段，不把大文件整份载入 |
+| `replace_in_files` | `Reversible` | 只替换显式列出且逐个通过写入校验的文件 |
+
+这四项与 `read_file`、`write_file` 互补，不扩大可读或可写根。批量替换没有通配符，也不支持正则，避免一次调用隐式扩大写入面。多格式转换尚未实现；在转换后的字节边界、编码失败和审计摘要有明确规则前，不把它描述成已支持。
+
+## 3c. 受控检索
+
+外部搜索 MCP 可以把查询发给第三方，也可以抓取任意站点。这里不接入 Tavily、Firecrawl 或 Serper，而是提供三个边界不同的原生工具：
+
+| 工具 | 网络 | 边界 |
+|------|------|------|
+| `search_index` | 不访问网络 | 搜索工作区内的 JSONL 本地索引；每条结果必须回读 `source` 并找到原文 `quote`，无法核对的条目被丢弃 |
+| `read_feed` | 仅白名单 URL | 读取一个 RSS/Atom 地址的标题和链接，复用 `http_fetch` 的 URL 与主机检查 |
+| `save_snapshot` | 不访问网络 | 保存调用方提供的已获取文本；写入前再次脱敏并受写入上限约束 |
+
+没有“搜索整个互联网”的工具。任意站点抓取必须先由操作者把主机写入 allow-list，再使用 `http_fetch` 或 `read_feed`。
+
+## 3d. 只读 Git 查询
+
+外部 GitHub、GitLab 和 Postman MCP 持有凭据，也能创建 PR、合并代码或发送 API 请求。这里不接入这些服务。`git_query` 只允许 `diff`、`status`、`log` 和 `show`，参数继续经过现有只读 argv 白名单。`push`、`commit`、`reset`、PR 和远程 API 调试都没有工具入口；测试执行仍由操作者预先配置的 `verify` 承担，而且每次都需要人工批准。
+
+## 3e. 只读 SQLite
+
+外部数据库 MCP 持有连接凭据，也可能执行写入。这里不接入 PostgreSQL 或 MySQL 服务。`sqlite_query` 只接受一条 `SELECT`、`EXPLAIN` 或 `WITH` 语句，拒绝分号、注释和 `INSERT`、`UPDATE`、`DELETE`、`DROP`、`ALTER`、`ATTACH`、`PRAGMA` 等写入词。数据库文件必须先通过 L3 可读路径校验，查询使用 `sqlite3 -readonly`。`sqlite_schema` 不执行模型提供的 SQL，只列出表名。没有数据导出或慢查询优化工具。
+
+## 3f. CSV 摘要
+
+外部 PDF、Excel 和 Word MCP 会解析复杂二进制格式，解析器本身也可能执行内容。这里不接入这些服务器。`csv_summary` 只读取一个已通过 L3 校验的 UTF-8 CSV，返回行数、最大列数和原文 SHA-256。它不计算公式，也不修改文件。PDF、Excel 和 Word 的解析尚未实现。
+
 ## 4. MCP 协议支持
 
 分两部分实现：

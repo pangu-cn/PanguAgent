@@ -180,6 +180,81 @@ async fn workspace_tools_execute_through_the_verified_action_chain() {
 }
 
 #[tokio::test]
+async fn filesystem_batch_tools_stay_inside_verified_paths() {
+    let root = temp_root("filesystem-batch");
+    std::fs::create_dir(root.join("nested")).expect("nested");
+    std::fs::write(root.join("nested/a.txt"), "alpha NEEDLE tail").expect("seed a");
+    std::fs::write(root.join("nested/b.txt"), "beta only").expect("seed b");
+
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![
+                ToolCall::new("walk_files", json!({"path": "."})),
+                ToolCall::new("dir_tree", json!({"path": "."})),
+                ToolCall::new(
+                    "read_slice",
+                    json!({"path": "nested/a.txt", "offset": 6, "length": 6}),
+                ),
+                ToolCall::new(
+                    "replace_in_files",
+                    json!({
+                        "paths": ["nested/a.txt", "nested/b.txt"],
+                        "find": "NEEDLE",
+                        "replace": "THREAD"
+                    }),
+                ),
+            ]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/a.txt")).expect("replaced"),
+        "alpha THREAD tail"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/b.txt")).expect("untouched"),
+        "beta only"
+    );
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("NEEDLE"), "{rendered}");
+    assert!(rendered.contains("nested"), "{rendered}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn local_search_index_does_not_contact_a_provider() {
+    let root = temp_root("search-index");
+    std::fs::write(
+        root.join("index.jsonl"),
+        "{\"title\":\"Boundary\",\"source\":\"source.txt\",\"quote\":\"sandbox rule\"}\n{\"title\":\"Other\",\"source\":\"missing.txt\",\"quote\":\"unrelated\"}\n",
+    )
+    .expect("index");
+    std::fs::write(root.join("source.txt"), "sandbox rule token=secret").expect("source");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new(
+                "search_index",
+                json!({"path": "index.jsonl", "query": "boundary"}),
+            )]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("source.txt: sandbox rule"), "{rendered}");
+    assert!(!rendered.contains("missing.txt"), "{rendered}");
+    assert!(!rendered.contains("token=secret"), "{rendered}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn traversal_and_forbidden_paths_are_blocked_before_tool_execution() {
     let root = temp_root("blocked-paths");
     let outside = root.with_extension("outside.txt");
@@ -345,6 +420,74 @@ async fn git_diff_reports_the_workspace_diff_through_the_verified_action_chain()
         .expect("tool message");
     assert!(tool_text.contains("-before"), "tool output: {tool_text}");
     assert!(tool_text.contains("+after"), "tool output: {tool_text}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn git_query_rejects_repository_changes() {
+    let root = temp_root("git-query");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new("git_query", json!({"command": "push"}))]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Failed);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("not read-only"), "{rendered}");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn sqlite_query_rejects_writes_before_execution() {
+    let root = temp_root("sqlite");
+    std::fs::write(root.join("db.sqlite"), "not-opened").expect("seed");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new(
+                "sqlite_query",
+                json!({"path": "db.sqlite", "sql": "DROP TABLE notes"}),
+            )]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Failed);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("write statements"), "{rendered}");
+    assert_eq!(
+        std::fs::read(root.join("db.sqlite")).expect("db"),
+        b"not-opened"
+    );
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn csv_summary_counts_rows_and_reports_digest() {
+    let root = temp_root("csv");
+    std::fs::write(root.join("data.csv"), "name,value\nalpha,1\nbeta,2\n").expect("csv");
+    let (agent, _sink) = build_agent(
+        &root,
+        vec![
+            response(vec![ToolCall::new(
+                "csv_summary",
+                json!({"path": "data.csv"}),
+            )]),
+            finish_response(),
+        ],
+        None,
+    );
+    let outcome = agent.run().await.expect("agent run");
+    assert_eq!(outcome.status, pangu_boundary::GoalStatus::Complete);
+    let rendered = format!("{:?}", outcome.messages);
+    assert!(rendered.contains("rows=3"), "{rendered}");
+    assert!(rendered.contains("columns=2"), "{rendered}");
+    assert!(rendered.contains("sha256="), "{rendered}");
     std::fs::remove_dir_all(root).expect("cleanup");
 }
 

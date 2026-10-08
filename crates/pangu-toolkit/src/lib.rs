@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 use pangu_agent::{
     Capability, CapabilityManifest, EffectDescriptor, EffectScope, Reversibility, ToolAssessment,
@@ -22,6 +22,7 @@ use pangu_agent::{
 };
 use pangu_boundary::{Risk, Sandbox};
 use pangu_core::{short_hash, MemoryStore, SkillRegistry, ToolCall, ToolSpec};
+use sha2::{Digest, Sha256};
 
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -201,11 +202,88 @@ impl Toolkit {
                 timeout_ms: None,
             },
             Capability {
+                name: "walk_files".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "dir_tree".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "read_slice".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "replace_in_files".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: vec!["workspace".into()],
+                writes: vec!["workspace".into()],
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
                 name: "write_file".into(),
                 version: "1".into(),
                 risk: Risk::Reversible,
                 effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
                 reads: vec!["workspace".into()],
+                writes: vec!["workspace".into()],
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "search_index".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "read_feed".into(),
+                version: "1".into(),
+                risk: Risk::NeedsHuman,
+                effect: EffectDescriptor::new(EffectScope::ExternalRead, Reversibility::NoEffect),
+                reads: empty(),
+                writes: empty(),
+                hosts: vec!["allowlisted".into()],
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "save_snapshot".into(),
+                version: "1".into(),
+                risk: Risk::Reversible,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                reads: empty(),
                 writes: vec!["workspace".into()],
                 hosts: empty(),
                 processes: empty(),
@@ -231,6 +309,50 @@ impl Toolkit {
                 writes: empty(),
                 hosts: empty(),
                 processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "csv_summary".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "sqlite_query".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "sqlite_schema".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::Workspace, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: empty(),
+                hosts: empty(),
+                processes: empty(),
+                timeout_ms: None,
+            },
+            Capability {
+                name: "git_query".into(),
+                version: "1".into(),
+                risk: Risk::ReadOnly,
+                effect: EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                reads: vec!["workspace".into()],
+                writes: Vec::new(),
+                hosts: Vec::new(),
+                processes: vec!["git".into()],
                 timeout_ms: None,
             },
             Capability {
@@ -683,6 +805,54 @@ impl ToolExecutor for Toolkit {
                 }),
             ),
             ToolSpec::new(
+                "walk_files",
+                "List regular files below a readable directory. Symbolic links are skipped.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
+                "dir_tree",
+                "Show the structure of a readable directory. Symbolic links are skipped.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
+                "read_slice",
+                "Read one bounded byte range from a readable UTF-8 file.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "offset", "length"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "integer", "minimum": 0},
+                        "length": {"type": "integer", "minimum": 1}
+                    }
+                }),
+            ),
+            ToolSpec::new(
+                "replace_in_files",
+                "Replace one literal string in explicitly named writable files.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["paths", "find", "replace"],
+                    "properties": {
+                        "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "find": {"type": "string", "minLength": 1},
+                        "replace": {"type": "string"}
+                    }
+                }),
+            ),
+            ToolSpec::new(
                 "write_file",
                 "Create or replace a UTF-8 file inside a writable root.",
                 json!({
@@ -690,6 +860,36 @@ impl ToolExecutor for Toolkit {
                     "additionalProperties": false,
                     "required": ["path", "content"],
                     "properties": {"path": {"type": "string"}, "content": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
+                "search_index",
+                "Search a local JSONL index. It does not contact a search provider.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "query"],
+                    "properties": {"path": {"type": "string"}, "query": {"type": "string", "minLength": 1}}
+                }),
+            ),
+            ToolSpec::new(
+                "read_feed",
+                "Read titles and links from one allow-listed RSS or Atom feed.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["url"],
+                    "properties": {"url": {"type": "string", "format": "uri"}}
+                }),
+            ),
+            ToolSpec::new(
+                "save_snapshot",
+                "Save previously fetched text as a bounded UTF-8 snapshot. It does not fetch.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["content", "path"],
+                    "properties": {"content": {"type": "string"}, "path": {"type": "string"}}
                 }),
             ),
             ToolSpec::new(
@@ -710,6 +910,49 @@ impl ToolExecutor for Toolkit {
                     "additionalProperties": false,
                     "required": ["status"],
                     "properties": {"status": {"type": "string", "enum": ["complete", "failed", "needs_input", "aborted"]}}
+                }),
+            ),
+            ToolSpec::new(
+                "csv_summary",
+                "Summarize one UTF-8 CSV file inside the readable boundary and return its SHA-256.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
+                "sqlite_query",
+                "Run one read-only SELECT or EXPLAIN against a local SQLite file. Writes and attached databases are rejected.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "sql"],
+                    "properties": {"path": {"type": "string"}, "sql": {"type": "string", "minLength": 1}}
+                }),
+            ),
+            ToolSpec::new(
+                "sqlite_schema",
+                "List tables in a local SQLite file without executing model SQL.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            ToolSpec::new(
+                "git_query",
+                "Run one read-only git query: diff, status, log, or show. It cannot change the repository or contact a remote.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command"],
+                    "properties": {
+                        "command": {"type": "string", "enum": ["diff", "status", "log", "show"]},
+                        "path": {"type": "string"}
+                    }
                 }),
             ),
             ToolSpec::new(
@@ -851,6 +1094,65 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "walk_files" | "dir_tree" => {
+                ensure_allowed_keys(&call.args, &["path"])?;
+                let path = required_path(&call.args, "path")?;
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!("{} {}", call.name, path.display());
+                Ok(assessment)
+            }
+            "read_slice" => {
+                ensure_allowed_keys(&call.args, &["path", "offset", "length"])?;
+                let path = required_path(&call.args, "path")?;
+                let offset = required_u64(&call.args, "offset")?;
+                let length = required_u64(&call.args, "length")?;
+                if length == 0 || length > sandbox.max_tool_output_bytes as u64 {
+                    bail!("slice length exceeds configured output limit");
+                }
+                if offset.saturating_add(length) > 1024 * 1024 * 1024 {
+                    bail!("slice range is too large");
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview =
+                    format!("slice {} offset={offset} length={length}", path.display());
+                Ok(assessment)
+            }
+            "replace_in_files" => {
+                ensure_allowed_keys(&call.args, &["paths", "find", "replace"])?;
+                let paths = required_paths(&call.args, "paths")?;
+                let find = required_string(&call.args, "find")?;
+                let replacement = required_string(&call.args, "replace")?;
+                if paths.is_empty()
+                    || find.is_empty()
+                    || find.len() > 4_096
+                    || replacement.len() > sandbox.max_write_bytes
+                {
+                    bail!("replacement text exceeds configured limits");
+                }
+                let mut assessment = ToolAssessment::new(Risk::Reversible).with_effect(
+                    EffectDescriptor::new(EffectScope::Workspace, Reversibility::Reversible),
+                );
+                for path in paths {
+                    assessment = assessment.read(path.clone()).write(path);
+                }
+                assessment.preview = format!(
+                    "replace {} files find_sha256={} replace_sha256={}",
+                    assessment.write_paths.len(),
+                    short_hash(&find),
+                    short_hash(&replacement)
+                );
+                Ok(assessment)
+            }
             "write_file" => {
                 ensure_allowed_keys(&call.args, &["path", "content"])?;
                 let path = required_path(&call.args, "path")?;
@@ -870,6 +1172,60 @@ impl ToolExecutor for Toolkit {
                     content.len(),
                     short_hash(&content)
                 );
+                Ok(assessment)
+            }
+            "search_index" => {
+                ensure_allowed_keys(&call.args, &["path", "query"])?;
+                let path = required_path(&call.args, "path")?;
+                let query = required_string(&call.args, "query")?;
+                if query.len() > 512 {
+                    bail!("search query is too long");
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!(
+                    "search index {} query_sha256={}",
+                    path.display(),
+                    short_hash(&query)
+                );
+                Ok(assessment)
+            }
+            "save_snapshot" => {
+                ensure_allowed_keys(&call.args, &["content", "path"])?;
+                let content = required_string(&call.args, "content")?;
+                if content.len() > sandbox.max_write_bytes {
+                    bail!("snapshot content exceeds configured limit");
+                }
+                let path = required_path(&call.args, "path")?;
+                let mut assessment = ToolAssessment::new(Risk::Reversible)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::Reversible,
+                    ))
+                    .write(path.clone());
+                assessment.preview = format!(
+                    "snapshot {} bytes={} sha256={}",
+                    path.display(),
+                    content.len(),
+                    short_hash(&content)
+                );
+                Ok(assessment)
+            }
+            "read_feed" => {
+                ensure_allowed_keys(&call.args, &["url"])?;
+                let url = required_string(&call.args, "url")?;
+                let host = checked_http_host(sandbox, &url)?;
+                let mut assessment = ToolAssessment::new(Risk::NeedsHuman)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::ExternalRead,
+                        Reversibility::NoEffect,
+                    ))
+                    .host(host);
+                assessment.preview = format!("read_feed {}", url_preview(&url));
                 Ok(assessment)
             }
             "http_fetch" => {
@@ -997,6 +1353,62 @@ impl ToolExecutor for Toolkit {
                 );
                 Ok(assessment)
             }
+            "csv_summary" => {
+                ensure_allowed_keys(&call.args, &["path"])?;
+                let path = required_path(&call.args, "path")?;
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!("csv {}", path.display());
+                Ok(assessment)
+            }
+            "sqlite_query" | "sqlite_schema" => {
+                let keys: &[&str] = if call.name == "sqlite_query" {
+                    &["path", "sql"]
+                } else {
+                    &["path"]
+                };
+                ensure_allowed_keys(&call.args, keys)?;
+                let path = required_path(&call.args, "path")?;
+                if call.name == "sqlite_query" {
+                    let sql = required_string(&call.args, "sql")?;
+                    validate_readonly_sql(&sql)?;
+                }
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly)
+                    .with_effect(EffectDescriptor::new(
+                        EffectScope::Workspace,
+                        Reversibility::NoEffect,
+                    ))
+                    .read(path.clone());
+                assessment.preview = format!("{} {}", call.name, path.display());
+                Ok(assessment)
+            }
+            "git_query" => {
+                ensure_allowed_keys(&call.args, &["command", "path"])?;
+                let command = required_string(&call.args, "command")?;
+                if !matches!(command.as_str(), "diff" | "status" | "log" | "show") {
+                    bail!("git query is not read-only");
+                }
+                let mut argv = vec!["git".to_string(), command.clone()];
+                let mut assessment = ToolAssessment::new(Risk::ReadOnly).with_effect(
+                    EffectDescriptor::new(EffectScope::ProcessRead, Reversibility::NoEffect),
+                );
+                if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                    if path.is_empty() || path.contains("..") || Path::new(path).has_root() {
+                        bail!("path must be a relative in-workspace path");
+                    }
+                    argv.push("--".to_string());
+                    argv.push(path.to_string());
+                    assessment = assessment.read(PathBuf::from(path));
+                }
+                sandbox.validate_argv(&argv)?;
+                assessment.argv = argv;
+                assessment.preview = format!("git {command}");
+                Ok(assessment)
+            }
             "git_diff" => {
                 ensure_allowed_keys(&call.args, &["staged", "path"])?;
                 let staged = call
@@ -1042,9 +1454,19 @@ impl ToolExecutor for Toolkit {
             "read_file" => execute_read(action).await,
             "list_dir" => execute_list(action).await,
             "search" => execute_search(action).await,
+            "walk_files" => execute_walk(action).await,
+            "dir_tree" => execute_tree(action).await,
+            "read_slice" => execute_slice(action).await,
+            "replace_in_files" => execute_replace(action).await,
             "write_file" => execute_write(action).await,
+            "search_index" => execute_search_index(action).await,
+            "read_feed" => execute_feed(action).await,
+            "save_snapshot" => execute_snapshot(action).await,
             "http_fetch" => execute_http(action).await,
-            "git_diff" => execute_command(action, self.runtime.as_deref()).await,
+            "csv_summary" => execute_csv_summary(action).await,
+            "sqlite_query" => execute_sqlite_query(action).await,
+            "sqlite_schema" => execute_sqlite_schema(action).await,
+            "git_query" | "git_diff" => execute_command(action, self.runtime.as_deref()).await,
             "run_command" => execute_command(action, self.runtime.as_deref()).await,
             "verify" => execute_verify(action, self.runtime.as_deref()).await,
             name if browser::is_browser_tool(name) => {
@@ -1356,6 +1778,304 @@ fn search_tree<'a>(
     })
 }
 
+async fn execute_walk(action: &VerifiedAction) -> Result<ToolOutput> {
+    let root = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified walk root missing"))?;
+    let mut files = Vec::new();
+    collect_files(action.sandbox(), root, &mut files, 0).await?;
+    Ok(ToolOutput::evidenced(
+        files.join("\n"),
+        format!("walk:{}", root.display()),
+    ))
+}
+
+async fn execute_tree(action: &VerifiedAction) -> Result<ToolOutput> {
+    let root = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified tree root missing"))?;
+    let mut lines = Vec::new();
+    collect_tree(action.sandbox(), root, &mut lines, 0).await?;
+    Ok(ToolOutput::evidenced(
+        lines.join("\n"),
+        format!("tree:{}", root.display()),
+    ))
+}
+
+async fn execute_slice(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified slice path missing"))?;
+    let offset = required_u64(&action.call().args, "offset")?;
+    let length = required_u64(&action.call().args, "length")?;
+    if length == 0 || length > action.sandbox().max_tool_output_bytes as u64 {
+        bail!("slice length exceeds configured output limit");
+    }
+    let length = length as usize;
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("slice target must be a regular file");
+    }
+    if offset > metadata.len() {
+        bail!("slice offset is past the end of the file");
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut bytes = vec![0; length];
+    let read = file.read(&mut bytes).await?;
+    bytes.truncate(read);
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    Ok(ToolOutput::evidenced(
+        text,
+        format!("slice:{}:{offset}:{read}", path.display()),
+    ))
+}
+
+async fn execute_replace(action: &VerifiedAction) -> Result<ToolOutput> {
+    let find = required_string(&action.call().args, "find")?;
+    let replacement = required_string(&action.call().args, "replace")?;
+    if find.is_empty() || replacement.len() > action.sandbox().max_write_bytes {
+        bail!("replacement text exceeds configured limits");
+    }
+    let mut changed = 0usize;
+    for path in &action.resources().write_paths {
+        let metadata = tokio::fs::symlink_metadata(path).await?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("replacement target must be a regular file");
+        }
+        let content = read_bounded(path, action.sandbox().max_tool_output_bytes).await?;
+        if !content.contains(&find) {
+            continue;
+        }
+        let next = content.replace(&find, &replacement);
+        if next.len() > action.sandbox().max_write_bytes {
+            bail!("replacement exceeds configured write limit");
+        }
+        tokio::fs::write(path, next).await?;
+        changed += 1;
+    }
+    Ok(ToolOutput::evidenced(
+        format!("replaced {changed} files"),
+        format!("replace:{changed}"),
+    ))
+}
+
+fn collect_files<'a>(
+    sandbox: &'a Sandbox,
+    root: &'a Path,
+    files: &'a mut Vec<String>,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > 32 || files.len() >= MAX_LIST_ENTRIES {
+            return Ok(());
+        }
+        let mut entries = tokio::fs::read_dir(root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !sandbox.resolve_read(&path).is_allowed() {
+                continue;
+            }
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                collect_files(sandbox, &path, files, depth + 1).await?;
+            } else if metadata.is_file() {
+                files.push(path.display().to_string());
+            }
+        }
+        Ok(())
+    })
+}
+
+fn collect_tree<'a>(
+    sandbox: &'a Sandbox,
+    root: &'a Path,
+    lines: &'a mut Vec<String>,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > 32 || lines.len() >= MAX_LIST_ENTRIES {
+            return Ok(());
+        }
+        let mut entries = tokio::fs::read_dir(root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !sandbox.resolve_read(&path).is_allowed() {
+                continue;
+            }
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            let prefix = "  ".repeat(depth);
+            lines.push(format!("{prefix}{}", entry.file_name().to_string_lossy()));
+            if metadata.is_dir() {
+                collect_tree(sandbox, &path, lines, depth + 1).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn execute_csv_summary(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified CSV missing"))?;
+    let content = read_bounded(path, action.sandbox().max_tool_output_bytes).await?;
+    let mut rows = 0usize;
+    let mut columns = 0usize;
+    for line in content.lines().filter(|line| !line.is_empty()) {
+        rows += 1;
+        columns = columns.max(line.split(',').count());
+    }
+    let digest = Sha256::digest(content.as_bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(ToolOutput::evidenced(
+        format!("rows={rows}\ncolumns={columns}\nsha256={digest}"),
+        format!("csv:{digest}"),
+    ))
+}
+
+fn validate_readonly_sql(sql: &str) -> Result<()> {
+    let trimmed = sql.trim();
+    if trimmed.len() > 4_096
+        || trimmed.contains(';')
+        || trimmed.contains("--")
+        || trimmed.contains("/*")
+    {
+        bail!("SQL must be one read-only statement");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let mut words = lower.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    if !matches!(first, "select" | "explain" | "with") {
+        bail!("SQL write statements are rejected");
+    }
+    for word in words {
+        if matches!(
+            word,
+            "insert"
+                | "update"
+                | "delete"
+                | "drop"
+                | "alter"
+                | "attach"
+                | "detach"
+                | "pragma"
+                | "vacuum"
+                | "reindex"
+                | "create"
+                | "replace"
+        ) {
+            bail!("SQL write statements are rejected");
+        }
+    }
+    Ok(())
+}
+
+async fn execute_sqlite_query(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified database missing"))?;
+    let sql = required_string(&action.call().args, "sql")?;
+    validate_readonly_sql(&sql)?;
+    let output = run_sqlite(path, &[&sql])?;
+    Ok(ToolOutput::evidenced(
+        output,
+        format!("sqlite:{}", short_hash(&sql)),
+    ))
+}
+
+async fn execute_sqlite_schema(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified database missing"))?;
+    let output = run_sqlite(
+        path,
+        &["SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"],
+    )?;
+    Ok(ToolOutput::evidenced(
+        output,
+        format!("schema:{}", path.display()),
+    ))
+}
+
+fn run_sqlite(path: &Path, args: &[&str]) -> Result<String> {
+    let program = resolve_sqlite_program()?;
+    let mut command = std::process::Command::new(program);
+    command
+        .arg("-readonly")
+        .arg(path)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null());
+    let output = command.output().context("sqlite3 is not available")?;
+    if !output.status.success() {
+        bail!("sqlite query failed");
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.len() > 64 * 1024 {
+        bail!("sqlite output exceeds configured limit");
+    }
+    Ok(text)
+}
+
+fn resolve_sqlite_program() -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not available"))?;
+    let names = if cfg!(windows) {
+        vec!["sqlite3.exe", "sqlite3"]
+    } else {
+        vec!["sqlite3"]
+    };
+    for directory in std::env::split_paths(&path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!("sqlite3 is not available")
+}
+
+fn required_paths(args: &Value, key: &str) -> Result<Vec<PathBuf>> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("`{key}` must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("`{key}` must contain strings"))
+        })
+        .collect()
+}
+
+fn required_u64(args: &Value, key: &str) -> Result<u64> {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("`{key}` must be an unsigned integer"))
+}
+
 async fn execute_write(action: &VerifiedAction) -> Result<ToolOutput> {
     let path = action
         .resources()
@@ -1438,6 +2158,137 @@ where
         bail!("command output exceeds configured limit");
     }
     Ok(output)
+}
+
+async fn execute_search_index(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .read_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified index missing"))?;
+    let query = required_string(&action.call().args, "query")?.to_ascii_lowercase();
+    let content = read_bounded(path, action.sandbox().max_tool_output_bytes).await?;
+    let mut matches = Vec::new();
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+        let source = value.get("source").and_then(Value::as_str).unwrap_or("");
+        let quote = value.get("quote").and_then(Value::as_str).unwrap_or("");
+        if source.is_empty()
+            || quote.is_empty()
+            || !title.to_ascii_lowercase().contains(&query)
+                && !quote.to_ascii_lowercase().contains(&query)
+        {
+            continue;
+        }
+        let source_path = path.parent().unwrap_or(Path::new(".")).join(source);
+        if action.sandbox().resolve_read(&source_path).is_allowed() {
+            if let Ok(source_text) =
+                read_bounded(&source_path, action.sandbox().max_tool_output_bytes).await
+            {
+                if source_text.contains(quote) {
+                    matches.push(format!("{source}: {quote}"));
+                }
+            }
+        }
+        if matches.len() >= MAX_SEARCH_RESULTS {
+            break;
+        }
+    }
+    Ok(ToolOutput::evidenced(
+        matches.join("\n"),
+        format!("index:{}", short_hash(&query)),
+    ))
+}
+
+async fn execute_feed(action: &VerifiedAction) -> Result<ToolOutput> {
+    let body = fetch_checked_text(action).await?;
+    let mut entries = Vec::new();
+    for marker in ["<title>", "<link>"] {
+        for value in xml_values(&body, marker) {
+            entries.push(format!(
+                "{}{}",
+                marker.trim_start_matches('<').trim_end_matches('>'),
+                value
+            ));
+            if entries.len() >= MAX_SEARCH_RESULTS {
+                break;
+            }
+        }
+    }
+    Ok(ToolOutput::evidenced(
+        entries.join("\n"),
+        format!(
+            "feed:{}",
+            action
+                .resources()
+                .hosts
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        ),
+    ))
+}
+
+async fn execute_snapshot(action: &VerifiedAction) -> Result<ToolOutput> {
+    let path = action
+        .resources()
+        .write_paths
+        .first()
+        .ok_or_else(|| anyhow!("verified snapshot path missing"))?;
+    let body = pangu_core::redact_text(&required_string(&action.call().args, "content")?);
+    if body.len() > action.sandbox().max_write_bytes {
+        bail!("snapshot content exceeds configured limit");
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("snapshot path has no parent"))?;
+    if !parent.is_dir() {
+        bail!("snapshot parent directory does not exist");
+    }
+    tokio::fs::write(path, body.as_bytes()).await?;
+    Ok(ToolOutput::evidenced(
+        format!("saved {} bytes", body.len()),
+        format!("snapshot:{}", path.display()),
+    ))
+}
+
+fn xml_values(input: &str, marker: &str) -> Vec<String> {
+    let end = marker.replace('<', "</");
+    input
+        .match_indices(marker)
+        .filter_map(|(start, _)| {
+            let from = start + marker.len();
+            let to = input[from..].find(&end)? + from;
+            Some(input[from..to].trim().chars().take(240).collect())
+        })
+        .take(MAX_SEARCH_RESULTS)
+        .collect()
+}
+
+fn checked_http_host(sandbox: &Sandbox, raw_url: &str) -> Result<String> {
+    if raw_url.len() > 2_048 {
+        bail!("URL is too long");
+    }
+    let checked = sandbox.check_url(raw_url).map_err(|error| anyhow!(error))?;
+    let parsed = url::Url::parse(&checked).map_err(|_| anyhow!("invalid URL"))?;
+    let host_name = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("URL has no host"))?
+        .to_ascii_lowercase();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    Ok(if host_name.contains(':') {
+        format!("[{host_name}]:{port}")
+    } else {
+        format!("{host_name}:{port}")
+    })
+}
+
+async fn fetch_checked_text(action: &VerifiedAction) -> Result<String> {
+    let output = execute_http(action).await?;
+    Ok(pangu_core::redact_text(&output.content))
 }
 
 async fn execute_http(action: &VerifiedAction) -> Result<ToolOutput> {
