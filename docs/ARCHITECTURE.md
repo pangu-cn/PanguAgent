@@ -194,6 +194,8 @@ rollback 始终把动作作为 destructive capability 送入 L2/L3/L4；CLI 使�
 
 B4 的 provider 注册表（`pangu-boundary::registry`）是静态配置数据：内置预设（openai/deepseek/ollama）携带 endpoint、key 变量、每模型能力声明与带 as-of 日期的价格表。`Config::resolve_provider()` 以纯函数方式解析（显式配置 > 具名预设 > 内置默认），不 mutate 配置，digest 语义不变；注册表价格仅在 `model.provider` 显式命名时生效。能力探测是 `pangu_provider::probe_models`：操作者显式发起的单次有界 `GET /models`，与 `chat` 同等客户端纪律（无代理、无重定向、有界响应），非 2xx 只报状态码。
 
+桌面端（`pangu-desktop`）的自定义 Provider 编辑器以上述注册表为下拉来源：选择预设只填充默认值（endpoint、key 变量、首个支持工具调用的模型），字段随后仍可手工编辑。API key 字段每行一个**环境变量名**（文件沿用历史 `api_key_env` 键，单行旧文件原样加载）；运行时 `OpenAiCompatibleProvider::from_envs` 解析全部名称（未设置或非法即整体失败，不留下半个 keyring），随后 `chat` 按声明顺序轮询已解析的 key（`with_keys`，上限 `MAX_API_KEYS = 16`，同名与同值去重）。key 本身不进入任何文件、事件或日志——ADR-0013 §4 与 BOUNDARY §4b 的"界面只存环境变量名"不变。选中 profile 后，run 在内存中把它的 provider/model/base_url/首个 key 变量名覆盖到 config 的 `[model]`（provider 名不在注册表时按自定义端点处理，不写 `model.provider`），价格、能力与 contract digest 仍由 `resolve_provider`/`GoalContract` 决定。
+
 ## Checkpoint/rollback 实现细节
 
 ### Artifact store

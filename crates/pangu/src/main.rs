@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod canvas_server;
+mod client_server;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -136,6 +137,12 @@ enum Commands {
     /// loopback. It has no route that runs, approves or writes anything, so a
     /// page rendered from model output can never sit next to a control that
     /// authorizes it.
+    /// Local executable client. It accepts one goal and renders risk confirmation
+    /// as a modal dialog.
+    Client {
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+    },
     Canvas {
         /// Journal to view. Defaults to the workspace journal.
         #[arg(long)]
@@ -561,6 +568,10 @@ async fn main() -> Result<()> {
                 session_replay(&args, &node, full, json)
             }
         },
+        Some(Commands::Client { port }) => {
+            client_server::serve(port).await?;
+            Ok(())
+        }
         Some(Commands::Canvas {
             journal,
             port,

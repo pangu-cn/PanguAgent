@@ -1,0 +1,16 @@
+[package]
+name = "pangu-web"
+description = "Pangu 的 Linux 浏览器执行端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pangu-web"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true

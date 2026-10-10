@@ -1,0 +1,29 @@
+[package]
+name = "pangu-desktop"
+description = "Pangu 的 Windows 与 macOS 桌面执行端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pangu-desktop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+eframe = "0.31"
+egui = "0.31"
+pangu-agent = { path = "../pangu-agent" }
+pangu-boundary = { path = "../pangu-boundary" }
+pangu-core = { path = "../pangu-core" }
+pangu-provider = { path = "../pangu-provider" }
+pangu-toolkit = { path = "../pangu-toolkit" }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }

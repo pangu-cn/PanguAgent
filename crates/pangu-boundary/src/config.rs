@@ -777,6 +777,12 @@ impl Config {
         Self::from_toml(EMBEDDED)
     }
 
+    pub fn from_json(source: &str) -> Result<Self> {
+        let config: Self = serde_json::from_str(source).map_err(|error| Error::Config(format!("invalid config: {error}")))?;
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn from_toml(source: &str) -> Result<Self> {
         let config: Self = toml::from_str(source)
             .map_err(|error| Error::Config(format!("invalid config: {error}")))?;
