@@ -1071,6 +1071,92 @@ impl ArtifactStore {
         Ok(directory.join(format!("{}.json", safe_id(key)?)))
     }
 
+    /// Append model-authored notes to one run's note file (ADR-0014 D2).
+    ///
+    /// Append-only by construction: the file is opened in append mode and
+    /// never rewritten, so an existing note can never be laundered into a
+    /// different one. Structural validation happens here; binding the notes to
+    /// a live history is [`crate::notes::verify`]'s job on load.
+    pub fn append_notes(&self, key: &str, notes: &[crate::notes::ModelNote]) -> Result<()> {
+        let _operation_guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| Error::Other("artifact operation lock is poisoned".into()))?;
+        let _process_lock = StoreProcessLock::acquire(&self.root)?;
+        if notes.is_empty() {
+            return Ok(());
+        }
+        let path = self.notes_path(key)?;
+        let mut encoded = Vec::new();
+        for note in notes {
+            if !note.unverified {
+                return Err(Error::Config(
+                    "refusing to store a note that is not marked unverified".into(),
+                ));
+            }
+            let line = serde_json::to_vec(note)?;
+            if line.contains(&b'\n') {
+                // One note per line is the file's integrity: a note containing
+                // a newline could forge a second record on load.
+                return Err(Error::Config(
+                    "note line contains a newline; refusing to store".into(),
+                ));
+            }
+            encoded.extend_from_slice(&line);
+            encoded.push(b'\n');
+        }
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        // The append itself is the only write; a partial line would be
+        // refused on load rather than half-trusted.
+        file.write_all(&encoded)?;
+        Ok(())
+    }
+
+    /// Load one run's notes. Structural validation only; the caller binds
+    /// them to the live history with [`crate::notes::verify`].
+    pub fn load_notes(&self, key: &str) -> Result<crate::notes::ConversationNotes> {
+        validate_id("note key", key)?;
+        let path = self.notes_path(key)?;
+        if !path_exists_without_symlink(&path)? {
+            return Ok(crate::notes::ConversationNotes::new());
+        }
+        let bytes = read_regular_file_bounded(&path, crate::MAX_CONVERSATION_BYTES as u64)?;
+        let text = String::from_utf8(bytes).map_err(|_| Error::Config("note file is not UTF-8".into()))?;
+        let mut notes = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let note: crate::notes::ModelNote = serde_json::from_str(line)
+                .map_err(|error| Error::Config(format!("note line {index} is not a note: {error}")))?;
+            notes.push(note);
+        }
+        if notes.len() > crate::MAX_MODEL_NOTES {
+            return Err(Error::Config(
+                "note file exceeds the note count bound".into(),
+            ));
+        }
+        Ok(crate::notes::ConversationNotes {
+            schema_version: crate::NOTE_SCHEMA_VERSION,
+            notes,
+        })
+    }
+
+    pub fn has_notes(&self, key: &str) -> Result<bool> {
+        validate_id("note key", key)?;
+        path_exists_without_symlink(&self.notes_path(key)?)
+    }
+
+    fn notes_path(&self, key: &str) -> Result<PathBuf> {
+        let directory = self.root.join("notes");
+        if !path_exists_without_symlink(&directory)? {
+            fs::create_dir(&directory)?;
+        }
+        reject_symlink_components(&directory)?;
+        Ok(directory.join(format!("{}.jsonl", safe_id(key)?)))
+    }
+
     pub fn compute_workspace_digest(&self, request: &SnapshotRequest) -> Result<String> {
         request.validate()?;
         let snapshot = collect_snapshot(request)?;
@@ -3069,6 +3155,77 @@ mod tests {
                 .history_digest,
             snapshot.history_digest
         );
+    }
+
+    fn note(turn: usize, summary: &str) -> crate::notes::ModelNote {
+        let messages = vec![
+            crate::Message::system("boundary"),
+            crate::Message::user("goal"),
+            crate::Message::assistant("work"),
+        ];
+        crate::note_from_args(
+            turn,
+            &serde_json::json!({
+                "spans": [{"start_message": 0, "end_message": 1}],
+                "summary": summary,
+            }),
+            &messages,
+        )
+        .expect("note")
+    }
+
+    #[test]
+    fn model_notes_are_append_only_and_survive_reload_in_order() {
+        // ADR-0014 D2: the file only grows, and an existing note can never be
+        // laundered into a different one by a later write.
+        let workspace = root("model-notes");
+        let store_root = workspace.join(".pangu/conversations");
+        let store = ArtifactStore::open(&store_root).unwrap();
+        assert!(!store.has_notes("run-1").unwrap());
+        store
+            .append_notes("run-1", &[note(1, "first"), note(2, "second")])
+            .unwrap();
+        let after_first = store.load_notes("run-1").unwrap();
+        assert_eq!(after_first.notes.len(), 2);
+        store.append_notes("run-1", &[note(3, "third")]).unwrap();
+        let after_second = store.load_notes("run-1").unwrap();
+        assert_eq!(after_second.notes.len(), 3);
+        assert_eq!(
+            after_second
+                .notes
+                .iter()
+                .map(|n| n.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"],
+            "append keeps declaration order"
+        );
+        // The earlier notes were not rewritten.
+        assert_eq!(after_second.notes[..2], after_first.notes[..2]);
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn a_note_not_marked_unverified_is_refused_on_store() {
+        let workspace = root("model-note-unverified");
+        let store_root = workspace.join(".pangu/conversations");
+        let store = ArtifactStore::open(&store_root).unwrap();
+        let mut forged = note(1, "forged");
+        forged.unverified = false;
+        let error = store.append_notes("run-1", &[forged]).unwrap_err();
+        assert!(error.to_string().contains("unverified"), "got: {error}");
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn a_tampered_note_file_fails_the_load_loudly() {
+        let workspace = root("model-note-tamper");
+        let store_root = workspace.join(".pangu/conversations");
+        let store = ArtifactStore::open(&store_root).unwrap();
+        store.append_notes("run-1", &[note(1, "real")]).unwrap();
+        let path = store_root.join("notes/run-1.jsonl");
+        fs::write(&path, "this is not a note\n").unwrap();
+        assert!(store.load_notes("run-1").is_err(), "garbage must not load");
+        fs::remove_dir_all(workspace).ok();
     }
 
     #[test]

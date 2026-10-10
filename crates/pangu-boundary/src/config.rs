@@ -301,6 +301,11 @@ pub struct ConversationSection {
     /// Save after every turn, not just at terminal states. Costs a write per
     /// turn and buys recovery from a crash mid-run.
     pub save_every_turn: bool,
+    /// ADR-0014: allow the model to append context notes through the
+    /// `note_context` control call. Off by default: a stored note is
+    /// untrusted data (span-bound, UNTRUSTED-annotated on injection), and a
+    /// disabled run keeps its historical digest. Requires `enabled`.
+    pub model_notes: bool,
 }
 
 impl Default for ConversationSection {
@@ -309,6 +314,7 @@ impl Default for ConversationSection {
             enabled: false,
             artifact_root: PathBuf::from(".pangu/conversations"),
             save_every_turn: true,
+            model_notes: false,
         }
     }
 }
@@ -1247,6 +1253,14 @@ impl Config {
         }
         // C5: validate the execution declaration.
         self.execution.validate()?;
+        // ADR-0014: model notes live in the conversation store, so declaring
+        // them without persistence would promise a feature that never runs.
+        // Fail at config time rather than silently ignoring the flag.
+        if self.conversation.model_notes && !self.conversation.enabled {
+            return Err(Error::Config(
+                "conversation.model_notes requires conversation.enabled".into(),
+            ));
+        }
         // F3: extra programs join the read-only argv allow-list, so each
         // entry must be a bare program name. Declaring one does not weaken
         // path, flag, or host checks.
@@ -2052,6 +2066,55 @@ mod tests {
         );
         assert!(loaded.conversation.save_every_turn);
         assert!(loaded.conversation.artifact_root.is_relative());
+        assert!(
+            !loaded.conversation.model_notes,
+            "model notes are opt-in (ADR-0014); an absent section cannot enable them"
+        );
+    }
+
+    /// ADR-0014: notes live in the conversation store, so enabling them
+    /// without persistence is a config error, not a silently ignored flag.
+    #[test]
+    fn model_notes_require_conversation_persistence() {
+        let mut config = Config::embedded().unwrap();
+        config.conversation.enabled = false;
+        config.conversation.model_notes = true;
+        let error = config.validate().expect_err("notes without a store");
+        assert!(
+            error
+                .to_string()
+                .contains("conversation.model_notes requires conversation.enabled"),
+            "got: {error}"
+        );
+        config.conversation.enabled = true;
+        config.validate().expect("notes with a store are fine");
+    }
+
+    /// The conditional-digest rule: a notes-enabled run's contract digest
+    /// differs from the same run without notes, and a disabled run keeps the
+    /// digest it always had.
+    #[test]
+    fn model_notes_change_the_digest_only_when_enabled() {
+        let mut off = Config::embedded().unwrap();
+        off.conversation.enabled = true;
+        off.conversation.model_notes = false;
+        let mut on = off.clone();
+        on.conversation.model_notes = true;
+        let off_digest = crate::goal::GoalContract::from_config("goal", &off)
+            .unwrap()
+            .digest();
+        let on_digest = crate::goal::GoalContract::from_config("goal", &on)
+            .unwrap()
+            .digest();
+        assert_ne!(off_digest, on_digest, "an enabled feature must be in the digest");
+        // The default (off) keeps the historical digest of a conversation-
+        // enabled run: the feature is invisible until it is declared.
+        let mut default_conv = off.clone();
+        default_conv.conversation.enabled = false;
+        let baseline = crate::goal::GoalContract::from_config("goal", &default_conv)
+            .unwrap()
+            .digest();
+        assert_eq!(off_digest, baseline);
     }
 
     /// F3: an old config has no `[verify]` section; it must load with the

@@ -30,6 +30,41 @@ fn api_key_env_names(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Bound for the operator-initiated model probe. Shorter than a chat request:
+/// it is a diagnostic nobody should wait a minute for.
+const MODEL_PROBE_TIMEOUT_SECS: u64 = 20;
+
+/// Whether the editor's Base URL may be edited. Only a custom provider (no
+/// registry preset chosen) may point somewhere else: a preset's endpoint is
+/// the vendor's canonical address, and a typo there is a silent
+/// misconfiguration that only fails mid-run. Picking a preset therefore locks
+/// the URL until "自定义" is selected again.
+fn preset_url_is_locked(preset: &str) -> bool {
+    !preset.trim().is_empty()
+}
+
+/// Model dropdown candidates: the preset's tool-capable models first (Pangu
+/// requires tool calling, so a toolless model would only fail at config time),
+/// then whatever the endpoint probe returned, deduplicated.
+fn model_choices(preset: &str, fetched: &[String]) -> Vec<String> {
+    let mut choices: Vec<String> = Vec::new();
+    if let Some(preset) = pangu_boundary::registry::preset(preset.trim()) {
+        choices.extend(
+            preset
+                .models
+                .iter()
+                .filter(|model| model.supports_tools)
+                .map(|model| model.name.to_string()),
+        );
+    }
+    for name in fetched {
+        if !choices.iter().any(|existing| existing == name) {
+            choices.push(name.clone());
+        }
+    }
+    choices
+}
+
 /// Fill the editor draft from a built-in registry preset. Only the preset's
 /// own defaults are written (endpoint, key variable, first tool-capable
 /// model); the operator can still edit every field afterwards.
@@ -75,6 +110,63 @@ fn apply_provider_profile(config: &mut pangu_boundary::Config, profile: &Provide
         config.model.api_key_env = Some(first.clone());
     }
 }
+
+impl Client {
+    /// Fetch the endpoint's model list with the first declared key variable.
+    /// The request runs off the UI thread — a slow endpoint must not freeze
+    /// the window — and the outcome lands in `provider_probe_rx`. A declared
+    /// but unset variable is an error, not a silent anonymous probe.
+    fn start_model_probe(&mut self) {
+        let key = match api_key_env_names(&self.provider_draft.api_key_envs).first() {
+            Some(name) => match std::env::var(name) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    self.provider_probe_error = Some(format!("环境变量 `{name}` 未设置"));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let base_url = self.provider_draft.base_url.trim().to_string();
+        if base_url.is_empty() {
+            self.provider_probe_error = Some("先填写 Base URL".to_string());
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.provider_probe_rx = Some(receiver);
+        self.provider_probe_error = None;
+        std::thread::spawn(move || {
+            let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build()
+            {
+                Ok(runtime) => runtime
+                    .block_on(pangu_provider::probe_models(
+                        &base_url,
+                        key.as_deref(),
+                        MODEL_PROBE_TIMEOUT_SECS,
+                    ))
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(outcome);
+        });
+    }
+
+    /// Collect a finished probe. Called every frame so the editor can show
+    /// progress without ever blocking on the network.
+    fn poll_model_probe(&mut self) {
+        let Some(receiver) = &self.provider_probe_rx else {
+            return;
+        };
+        let Ok(outcome) = receiver.try_recv() else {
+            return;
+        };
+        self.provider_probe_rx = None;
+        match outcome {
+            Ok(models) => self.provider_models = models,
+            Err(error) => self.provider_probe_error = Some(error),
+        }
+    }
+}
 struct Client {
     goal: String,
     log: String,
@@ -90,6 +182,13 @@ struct Client {
     /// Registry preset the editor started from ("" = custom). Selection only
     /// fills defaults; the draft stays fully editable afterwards.
     provider_preset: String,
+    /// Models fetched from the current endpoint this session (`GET /models`
+    /// probe; session-only, never persisted).
+    provider_models: Vec<String>,
+    /// Receiver of an in-flight model probe; `None` when idle.
+    provider_probe_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// Last probe failure, shown in the editor until the next attempt.
+    provider_probe_error: Option<String>,
     settings: DesktopSettings,
     draft_config: String,
     changes: Vec<String>,
@@ -308,7 +407,7 @@ impl Default for Client {
         save_settings(&settings);
         let draft_config = settings.active_config.clone();
         let providers = load_providers();
-        Self { goal: String::new(), log: format!("数据目录：{}", data_dir().display()), pending: None, sandboxes, selected: None, settings_open: false, providers_open: false, provider_editor_open: false, providers, selected_provider: None, provider_draft: ProviderProfile { name: String::new(), base_url: "https://api.openai.com/v1".into(), model: String::new(), api_key_envs: "OPENAI_API_KEY".into() }, provider_preset: String::new(), settings, draft_config, changes: Vec::new(), artifacts: Vec::new(), commit_summary: None }
+        Self { goal: String::new(), log: format!("数据目录：{}", data_dir().display()), pending: None, sandboxes, selected: None, settings_open: false, providers_open: false, provider_editor_open: false, providers, selected_provider: None, provider_draft: ProviderProfile { name: String::new(), base_url: "https://api.openai.com/v1".into(), model: String::new(), api_key_envs: "OPENAI_API_KEY".into() }, provider_preset: String::new(), provider_models: Vec::new(), provider_probe_rx: None, provider_probe_error: None, settings, draft_config, changes: Vec::new(), artifacts: Vec::new(), commit_summary: None }
     }
 }
 
@@ -456,6 +555,7 @@ impl eframe::App for Client {
             if !open { self.providers_open = false; }
         }
         if self.provider_editor_open {
+            self.poll_model_probe();
             let mut open = true;
             egui::Window::new("Provider 设置").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 40.0]).open(&mut open).show(ctx, |ui| {
                 let presets = pangu_boundary::registry::presets();
@@ -473,13 +573,37 @@ impl eframe::App for Client {
                     if let Some(preset) = presets.iter().find(|preset| preset.name == self.provider_preset) {
                         fill_draft_from_preset(&mut self.provider_draft, preset);
                     }
+                    // Whatever the previous endpoint answered no longer
+                    // describes this one.
+                    self.provider_models.clear();
+                    self.provider_probe_error = None;
                 }
                 ui.label("名称"); ui.text_edit_singleline(&mut self.provider_draft.name);
-                ui.label("Base URL"); ui.text_edit_singleline(&mut self.provider_draft.base_url);
-                ui.label("模型"); ui.text_edit_singleline(&mut self.provider_draft.model);
+                ui.label("Base URL");
+                ui.add_enabled(!preset_url_is_locked(&self.provider_preset), egui::TextEdit::singleline(&mut self.provider_draft.base_url));
+                if preset_url_is_locked(&self.provider_preset) { ui.label("官方 Provider 的 URL 已锁定；换端点请选「自定义」。"); }
+                let choices = model_choices(&self.provider_preset, &self.provider_models);
+                let mut model_choice = self.provider_draft.model.clone();
+                egui::ComboBox::from_label("模型")
+                    .selected_text(if model_choice.is_empty() { "（填写，或用 apiKey 获取）".to_string() } else { model_choice.clone() })
+                    .show_ui(ui, |ui| {
+                        for name in &choices {
+                            ui.selectable_value(&mut model_choice, name.clone(), name);
+                        }
+                    });
+                if model_choice != self.provider_draft.model { self.provider_draft.model = model_choice; }
                 ui.label("API Key 环境变量（每行一个，轮询）");
                 ui.add(egui::TextEdit::multiline(&mut self.provider_draft.api_key_envs).desired_rows(3).hint_text("每行一个环境变量名，例如 OPENAI_API_KEY"));
                 ui.label(format!("已声明 {} 个环境变量；按请求顺序轮询，未设置的变量会在 run 开始时报错。", api_key_env_names(&self.provider_draft.api_key_envs).len()));
+                let probing = self.provider_probe_rx.is_some();
+                let probe_error = self.provider_probe_error.clone();
+                let fetched = self.provider_models.len();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!probing, egui::Button::new("获取模型列表")).on_hover_text("用首个 API Key 环境变量请求 <Base URL>/models").clicked() { self.start_model_probe(); }
+                    if probing { ui.label("正在获取…"); }
+                    else if let Some(error) = &probe_error { ui.label(format!("获取失败：{error}")); }
+                    else if fetched > 0 { ui.label(format!("已获取 {fetched} 个模型")); }
+                });
                 if ui.button("保存 Provider").clicked() && !self.provider_draft.name.trim().is_empty() {
                     self.providers.push(self.provider_draft.clone());
                     save_providers(&self.providers);
@@ -513,8 +637,8 @@ fn load_cjk_font(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_key_env_names, apply_provider_profile, fill_draft_from_preset, sandbox_label_for,
-        ProviderProfile,
+        api_key_env_names, apply_provider_profile, fill_draft_from_preset, model_choices,
+        preset_url_is_locked, sandbox_label_for, ProviderProfile,
     };
     use std::path::Path;
 
@@ -612,6 +736,36 @@ mod tests {
         };
         apply_provider_profile(&mut config, &profile);
         assert_eq!(config.model.model, before);
+    }
+
+    #[test]
+    fn choosing_a_preset_locks_the_url_until_custom_is_selected() {
+        assert!(preset_url_is_locked("openai"));
+        assert!(preset_url_is_locked(" deepseek "));
+        assert!(!preset_url_is_locked(""));
+        assert!(!preset_url_is_locked("   "));
+    }
+
+    #[test]
+    fn model_choices_lead_with_tool_capable_preset_models_and_dedupe() {
+        // deepseek-reasoner had no tool support in the registry table: Pangu
+        // cannot use it, so it must not be offered as a candidate at all.
+        assert_eq!(model_choices("deepseek", &[]), vec!["deepseek-chat".to_string()]);
+        // Fetched models append, deduplicated against the preset's own list.
+        assert_eq!(
+            model_choices(
+                "deepseek",
+                &["deepseek-chat".to_string(), "local-model".to_string()]
+            ),
+            vec!["deepseek-chat".to_string(), "local-model".to_string()]
+        );
+        // A custom provider has no registry models: only the probe's answers.
+        assert_eq!(
+            model_choices("", &["some-model".to_string()]),
+            vec!["some-model".to_string()]
+        );
+        // An unknown name behaves like custom, mirroring apply_provider_profile.
+        assert!(model_choices("no-such-provider", &[]).is_empty());
     }
 }
 

@@ -653,6 +653,13 @@ impl GoalContract {
                 );
             }
         }
+        // ADR-0014: only a notes-enabled run changes the digest; the default
+        // (off) keeps historical digests stable.
+        if self.conversation.model_notes {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("model_notes".into(), serde_json::json!(true));
+            }
+        }
         if !self.verify_command.is_empty() || !self.extra_readonly_commands.is_empty() {
             if let Some(object) = value.as_object_mut() {
                 object.insert(

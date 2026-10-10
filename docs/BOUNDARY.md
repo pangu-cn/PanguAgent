@@ -241,7 +241,7 @@ rollback 是 operator/library API，入口为 typed `RollbackRequest`；模型�
 发给模型的输入不是完整 history，而是每轮重新组装的窗口（ADR-0005，已接入默认运行路径）：
 
 - 组装 = **强制集 ∪ 请求集**。强制集（system 轮、goal、被拒路径、未完成工具调用的配对闭包、最近 N 轮）不可被模型排除；模型只能请求追加切片，“需要哪个”不是模型决定。当前默认运行的请求集为空，请求集接线与选择器接缝（A6-6）留给 B6。组装是纯内存投影，不依赖 `conversation.enabled`（默认关闭时同样工作）。
-- 摘要由确定性抽取生成（首 N 行、工具名、错误行、计数），**不是模型生成**；切片绑定会话消息前缀 digest 与逐范围 digest，读时重算校验，对不上即报错，不静默重生成、不静默接受。
+- 摘要**默认**由确定性抽取生成（首 N 行、工具名、错误行、计数）；opt-in 的模型上下文笔记（`[conversation] model_notes`，ADR-0014）只能**追加**一层带 UNTRUSTED 标注的可选摘要，绑定它声称覆盖的消息 span（span 存在性与前缀 digest 校验，文本按数据接受），不进判定路径。确定性摘要始终是地板——笔记缺席、非法或关闭时，行为与未启用时逐位相同。切片/摘要的 digest 绑定与重算校验语义不变。
 - 切片拼接处的接缝显式标记（`[pangu context seam: …]`），组装结果是派生投影（`derived: true` / `authoritative: false`）；每次组装发 `ContextAssembled` 事件，带切片来源与降级统计。
 - 组装只影响模型看到的内容，**不改变 L1–L4 的任何判定**；被拒路径在强制集里，`I-Failed-Path-Not-Repeated` 的证据链不因切片而断。
 - 降级链 `full → summary → omit-with-reason` 走完仍放不下强制集时，以 `BudgetExhausted` 硬终止（I-Budget-Terminates）；不存在“永不终止的运行”。组装器自身失败与“上下文确实超预算”是两类错误，分别上报，不互相伪装。
@@ -291,6 +291,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 26. **I-Sub-Agent-Never-Wider**：仅当 `[boundary] allow_delegation` 已开启时生效。子 Agent 的 contract 由父 contract 派生，任何一维预算超过父级即拒绝；子的 sandbox/policy/审批面与父级相同，run 作用域特性全部剥离；子的事件进同一中央 Journal，花费聚合进父级账本；子不能再委派（深度 1，结构性）；委派事件只携带 task digest，不携带原文；关闭开关时行为与 digest 完全不变。
 27. **I-Sandbox-Declared-Means-Enforced**：仅当 `[execution] runtime` 非 `local` 时生效。声明的运行时必须**先探测通过**（在沙箱内真正跑通一条命令）才允许任何命令执行；探测失败即拒绝，**不存在**任何退回宿主机执行的路径——否则审计里记录的运行时与实际执行不符，记录即为假。探测报告的是观察到的行为，不是"隔离攻不破"的断言。`auto` 按 firecracker > gvisor > oci 的内核边界强度择优；显式选择不得静默降级为更弱的运行时。`runtime = "local"`（默认）不进入本不变量，行为与 digest 完全不变。
 28. **I-Browser-Absent-Until-Enabled**：仅当 `[browser] enabled` 时生效。未启用时浏览器工具**不出现在任何工具表中**，模型无法调用一个操作者未开启的能力；`assess` 亦拒绝调用，使拒绝是结构性的而非只靠执行器。启用后每个浏览器动作进入与其它工具逐位相同的 L1–L4 链：`browser_open` 会访问主机，必须声明其 host 并受 egress 允许表约束；**`browser_click`/`browser_type` 是 `NeedsHuman` + `ExternalMutation`/`Irreversible`，并声明已打开的浏览器会话；`browser_screenshot` 必须声明其 artifact 目录作为写入路径。它们都不是只读**——点下去会发生什么由页面决定，将其归类为观察会让改变状态的动作绕过人工闸门。这里的 `Irreversible` 不是保守取值：状态改动落在本程序不控制的服务器上，它无法撤销自己观察不到的变更。该组合还必须满足 `validate_for_risk` 的约束（ExternalMutation 必须 Irreversible 且 risk ≥ Destructive），否则工具会在每次调用时被 L1 拒绝——曾经如此，见 `docs/CAPABILITIES.md` 的说明。只支持 `http`/`https`，`file:` 被拒绝。导航前检查请求主机。所有浏览器动作在返回前都用同一个出口规则检查当前 URL。无论拒绝来自打开、读取、截图、点击还是输入，只要页面落到未允许主机或 `file:`，浏览器会话都会关闭，避免后续动作继续观察该页面。`enabled = false`（默认）时不进入本不变量，行为与 digest 完全不变。
+29. **I-Model-Notes-Untrusted**：仅当 `[conversation] model_notes` 开启时生效。模型笔记（`note_context` 控制调用）不过闸、无副作用，只能**追加**为组装窗口的可选层：带固定 UNTRUSTED 标注、不进入任何判定路径、声称覆盖的 span 必须真实存在（前缀 digest 重算校验），对不上即拒绝加载；非法输出按非法工具调用回灌，不截断、不猜。关闭时行为与 digest 完全不变；开启时 digest 携带该开关。确定性摘要始终是地板——笔记缺席、非法或全部被预算退化时，行为与未启用时逐位相同。
 
 ## 4b. 明确拒绝的反模式
 

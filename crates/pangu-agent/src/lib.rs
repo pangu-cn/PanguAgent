@@ -21,10 +21,10 @@ use pangu_boundary::{
     ValidatedResources,
 };
 use pangu_core::{
-    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact,
-    DeliverableStore, Event, EventKind, EventSink, FailureClass, JournalMeta, MemoryStore, Message,
-    RestoreDisposition, RollbackOperation, RollbackRequest, SkillRegistry, ToolCall, ToolSpec,
-    Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
+    assemble_with_notes, redact_event, redact_text, truncate_middle, ChatResponse,
+    CheckpointArtifact, DeliverableStore, Event, EventKind, EventSink, FailureClass, JournalMeta,
+    MemoryStore, Message, RestoreDisposition, RollbackOperation, RollbackRequest, SkillRegistry,
+    ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
 };
 
 pub mod capability;
@@ -428,6 +428,13 @@ pub struct Agent {
     /// History to continue from. Model input only: it carries no decision and
     /// no approval, and every action in the resumed run is re-evaluated.
     resume_from: Option<Vec<Message>>,
+    /// ADR-0014: the model-authored context notes this run has emitted (and,
+    /// on resume, the ones stored for the previous run). Untrusted data by
+    /// construction: they ride assembly as an optional, annotated layer and
+    /// never touch a gate. Empty whenever `model_notes` is off. Mutex-guarded
+    /// because `run` takes `&self` (the library entry point is re-runnable);
+    /// the guard is never held across an await.
+    model_notes: std::sync::Mutex<Vec<pangu_core::ModelNote>>,
     /// B3: the memory candidate store. Attached only when the contract
     /// enables the queue; used to inject accepted, clearly-labeled memory
     /// into fresh runs.
@@ -591,6 +598,7 @@ impl Agent {
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
             resume_from: None,
+            model_notes: std::sync::Mutex::new(Vec::new()),
             memory: None,
             skills: None,
             deliverables: None,
@@ -696,7 +704,17 @@ impl Agent {
         conversation.validate()?;
         let history = conversation.restore()?;
         conversation::validate_resumable(&history)?;
-        self.resume_from = Some(history);
+        self.resume_from = Some(history.clone());
+        // ADR-0014: a resumed run inherits the previous run's stored notes as
+        // untrusted data. They are re-verified against the restored history —
+        // a note that no longer binds to the messages beneath it is a loud
+        // error here, never a silent drop, and certainly never a regeneration.
+        if self.contract.conversation.enabled && self.contract.conversation.model_notes {
+            if let Some(runtime) = &self.conversation {
+                let loaded = runtime.load_notes(&self.contract.goal, &history)?;
+                self.model_notes = std::sync::Mutex::new(loaded);
+            }
+        }
         Ok(self)
     }
 
@@ -1639,6 +1657,14 @@ impl Agent {
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut evidence = Vec::new();
+        // ADR-0014: the working copy of this run's notes. Seeded from the
+        // resume state; every emission is persisted first and then mirrored
+        // back into the agent so a re-run sees them too.
+        let mut model_notes = self
+            .model_notes
+            .lock()
+            .expect("model notes lock")
+            .clone();
         let mut history = match &self.resume_from {
             // A resumed history already carries its system turn and goal.
             // Re-seeding them would duplicate the instructions at the head and
@@ -1781,6 +1807,59 @@ impl Agent {
                 }),
             ));
         }
+        // ADR-0014: the note_context control tool exists only when the
+        // operator opted into model notes (`conversation.model_notes`,
+        // default off). Like `begin_act` it is agent-owned: it executes
+        // nothing and passes no gate. The note it records is untrusted data
+        // that rides assembly as an optional, annotated layer — writing one
+        // authorizes nothing and changes no boundary.
+        if self.contract.conversation.enabled && self.contract.conversation.model_notes {
+            specs.push(pangu_core::ToolSpec::new(
+                "note_context",
+                "Record a context note: your own bounded summary of this conversation, kept \
+                 for when older history is no longer in your context window. Takes no side \
+                 effect and authorizes nothing — the note is stored as unverified data and \
+                 shown back to you marked UNTRUSTED. You cannot address message indices of \
+                 the projected window, so omit `spans` and the note covers the whole history \
+                 as it stands. Arguments: spans (optional array of 1-4 inclusive ranges \
+                 {start_message, end_message} within the stored history), summary (required \
+                 string, at most 2 KiB, no control characters), open_items (optional array of \
+                 at most 8 short strings worth keeping in view).",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["summary"],
+                    "properties": {
+                        "spans": {
+                            "type": "array",
+                            "maxItems": 4,
+                            "description": "Optional inclusive message ranges this note covers.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["start_message", "end_message"],
+                                "properties": {
+                                    "start_message": {"type": "integer", "minimum": 0},
+                                    "end_message": {"type": "integer", "minimum": 0}
+                                }
+                            }
+                        },
+                        "summary": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 2048,
+                            "description": "Your summary of the covered history."
+                        },
+                        "open_items": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "description": "Short strings worth keeping in view.",
+                            "items": {"type": "string", "maxLength": 256}
+                        }
+                    }
+                }),
+            ));
+        }
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
             let breaches =
@@ -1795,11 +1874,12 @@ impl Agent {
             // history stays in memory (and in `history`); assembly is a pure
             // projection (§3.9). Input-token pressure is resolved here — by
             // degradation — not by ending the run.
-            let (assembled, assembly) = match assemble(
+            let (assembled, assembly) = match assemble_with_notes(
                 &history,
                 RECENT_TURNS,
                 &[],
                 self.contract.budget().max_input_tokens,
+                &model_notes,
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -1840,7 +1920,7 @@ impl Agent {
                 turn,
                 format!(
                     "messages={} tokens~{} forced_over_budget={} prefix_stable={} slices: {} full, {} summary, \
-                     {} omitted, {} seam(s)",
+                     {} omitted, {} seam(s), {} model note(s)",
                     assembled.messages.len(),
                     assembly.estimated_tokens,
                     assembly.forced_over_budget,
@@ -1848,13 +1928,15 @@ impl Agent {
                     modes.0,
                     modes.1,
                     modes.2,
-                    assembled.seams.len()
+                    assembled.seams.len(),
+                    assembly.model_notes
                 ),
             );
             assembled_event.payload = Some(serde_json::json!({
                 "derived": true,
                 "authoritative": false,
-                "prefix_stable": prefix_stable
+                "prefix_stable": prefix_stable,
+                "model_notes": assembly.model_notes
             }));
             self.emit(assembled_event).await?;
             if assembly.forced_over_budget {
@@ -2052,6 +2134,84 @@ impl Agent {
                             "begin_act",
                             "act phase started; mutating actions now proceed through the gates",
                         ));
+                    }
+                } else if call.name == "note_context" {
+                    // ADR-0014 control call: no assess, no gates, no side
+                    // effect on the workspace. The note is validated against
+                    // the live history (span + prefix digest), stored
+                    // append-only as untrusted data, and injected back only
+                    // through the assembler's optional layer. An invalid note
+                    // is an invalid tool call — the error is fed back to the
+                    // model, never silently dropped or truncated.
+                    match pangu_core::note_from_args(turn as usize, &call.args, &history) {
+                        Ok(note) => {
+                            let stored: anyhow::Result<()> =
+                                if let Some(runtime) = &self.conversation {
+                                    runtime
+                                        .append_notes(
+                                            &self.contract.goal,
+                                            std::slice::from_ref(&note),
+                                            &history,
+                                        )
+                                        .map_err(|error| anyhow!(error.to_string()))
+                                } else {
+                                    Err(anyhow!(
+                                        "conversation persistence is off; note_context requires it"
+                                    ))
+                                };
+                            if let Err(error) = stored {
+                                let context = FailureContext::from_call(&call);
+                                self.record_tool_error_with_context(
+                                    &mut history,
+                                    &call,
+                                    turn,
+                                    EventKind::ToolBlocked,
+                                    error,
+                                    checkpoint_state.as_ref(),
+                                    &context,
+                                    FailureClass::InvalidToolCall,
+                                )
+                                .await?;
+                            } else {
+                                model_notes.push(note.clone());
+                                self.model_notes
+                                    .lock()
+                                    .expect("model notes lock")
+                                    .push(note.clone());
+                                self.emit(
+                                    self.event(
+                                        EventKind::Note,
+                                        turn,
+                                        format!(
+                                            "model context note recorded: covers messages \
+                                             {}..={}",
+                                            note.start_message, note.end_message
+                                        ),
+                                    )
+                                    .call_id(&call.id),
+                                )
+                                .await?;
+                                history.push(Message::tool_result(
+                                    &call.id,
+                                    "note_context",
+                                    "context note recorded",
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            let context = FailureContext::from_call(&call);
+                            self.record_tool_error_with_context(
+                                &mut history,
+                                &call,
+                                turn,
+                                EventKind::ToolBlocked,
+                                anyhow!(error.to_string()),
+                                checkpoint_state.as_ref(),
+                                &context,
+                                FailureClass::InvalidToolCall,
+                            )
+                            .await?;
+                        }
                     }
                 } else if call.name == "finish" {
                     match self.finish_status(&call, &evidence) {
