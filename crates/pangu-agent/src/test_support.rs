@@ -11,7 +11,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1290,6 +1290,146 @@ mod tests {
             .snapshot()
             .iter()
             .any(|event: &Event| event.kind == pangu_core::EventKind::RunFinished));
+        clean(root);
+    }
+
+    /// A flag set before the run starts: nothing happens at all — no model
+    /// request, no tool execution — and the run ends `aborted` with the stop
+    /// on the record.
+    #[tokio::test]
+    async fn a_preset_stop_ends_the_run_aborted_before_anything_starts() {
+        let options = SetupOptions {
+            rules: vec![Rule::allow("allow-all", "*", "test action")],
+            responses: vec![
+                response(vec![tool_call()], Usage::default()),
+                response(vec![finish_call()], Usage::default()),
+            ],
+            ..SetupOptions::default()
+        };
+        let (agent, tool, sink, root) = setup(options);
+        let stopped = agent.with_cancel(Arc::new(AtomicBool::new(true)));
+        let outcome = stopped.run().await.expect("run");
+        assert_eq!(outcome.status, GoalStatus::Aborted);
+        assert_eq!(tool.executions.load(Ordering::Relaxed), 0);
+        assert!(
+            !sink
+                .snapshot()
+                .iter()
+                .any(|event: &Event| event.kind == pangu_core::EventKind::ModelRequest),
+            "the turn boundary fires before any provider request"
+        );
+        assert!(sink
+            .snapshot()
+            .iter()
+            .any(|event: &Event| event.kind == pangu_core::EventKind::Note
+                && event.message.contains("cancelled")));
+        clean(root);
+    }
+
+    /// A provider that simulates the operator pressing stop while the model is
+    /// thinking: turn 1's response arrives, its tool calls are then all "not
+    /// yet started", so none run and the run ends `aborted`.
+    struct StoppingProvider {
+        flag: Arc<AtomicBool>,
+        responses: Mutex<VecDeque<ChatResponse>>,
+    }
+
+    #[async_trait]
+    impl Provider for StoppingProvider {
+        fn name(&self) -> &str {
+            "stopping"
+        }
+
+        fn model(&self) -> &str {
+            "stopping-model"
+        }
+
+        fn describe(&self) -> String {
+            "stopping provider".into()
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolSpec>,
+        ) -> Result<ChatResponse> {
+            self.flag.store(true, Ordering::Relaxed);
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| response(vec![finish_call()], Usage::default())))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_turn_keeps_completed_actions_and_runs_no_new_ones() {
+        let root = test_temp_root().join(format!(
+            "pangu-agent-stop-{}-{}-{}",
+            std::process::id(),
+            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.rules = vec![Rule::allow("allow-all", "*", "test action")];
+        config.model.input_usd_per_mtok = Some(0.0);
+        config.model.output_usd_per_mtok = Some(0.0);
+        let contract = GoalContract::from_config("stop goal", &config).unwrap();
+        let sandbox = Arc::new(Sandbox::from_config(&config.boundary).unwrap());
+        let policy = Arc::new(Policy::new(config.rules.clone()).unwrap());
+        let tool = Arc::new(CountingTool {
+            executions: AtomicUsize::new(0),
+            risk: Risk::ReadOnly,
+            fail_execution: false,
+            output: "ok".into(),
+            omit_effect: false,
+            declared_write: root.join("tool-effect.txt"),
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(StoppingProvider {
+            flag: flag.clone(),
+            responses: Mutex::new(VecDeque::from(vec![
+                response(vec![tool_call()], Usage::default()),
+                response(vec![finish_call()], Usage::default()),
+            ])),
+        });
+        let sink = Arc::new(MemSink::default());
+        let agent = Agent::new(
+            contract,
+            policy,
+            sandbox,
+            provider,
+            tool.clone(),
+            Arc::new(ScriptedApproval::new(
+                ApprovalMode::DestructiveAndAbove,
+                Vec::new(),
+            )),
+            sink.clone(),
+        )
+        .unwrap()
+        .with_cancel(flag);
+        let outcome = agent.run().await.expect("run");
+        assert_eq!(outcome.status, GoalStatus::Aborted);
+        assert_eq!(
+            tool.executions.load(Ordering::Relaxed),
+            0,
+            "the tool call in the stop-time response never ran"
+        );
+        assert!(
+            !sink
+                .snapshot()
+                .iter()
+                .any(|event: &Event| event.kind == pangu_core::EventKind::ToolStarted),
+            "no tool was started after the stop"
+        );
         clean(root);
     }
 

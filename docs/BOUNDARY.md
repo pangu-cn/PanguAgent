@@ -295,7 +295,7 @@ Pangu 防的是模型幻觉、注入诱导和粗心，不是完整的恶意代�
 
 ## 4b. 明确拒绝的反模式
 
-以下行为即使外部 Agent 默认提供，也不进入 Pangu：无确认写长期记忆、自动安装技能、进程内扩展读取凭据、`--yolo` 或默认 auto-approve、自动 commit 与 `--no-verify`、runtime 不可用后退回宿主机、非沙箱 `python_executor`、把 benchmark score 当验收、长期密钥进入前端，以及默认 telemetry。现有替代分别是记忆候选队列、签名 skill、capability 与隔离加载、L4、显式 verify、F8 fail-closed、短时 token 和本地事件。
+以下行为即使外部 Agent 默认提供，也不进入 Pangu：无确认写长期记忆、自动安装技能、进程内扩展读取凭据、`--yolo` 或默认 auto-approve、自动 commit 与 `--no-verify`、runtime 不可用后退回宿主机、非沙箱 `python_executor`、把 benchmark score 当验收，以及默认 telemetry。现有替代分别是记忆候选队列、签名 skill、capability 与隔离加载、L4、显式 verify、F8 fail-closed、短时 token 和本地事件。（**长期密钥进入前端**：2026-10-10 起按操作者明确选择部分放宽——桌面端自定义 Provider 的 profile 可明文存储 key，见 ADR-0015；界面必须明示，key 仍不得进入事件、日志、模型上下文或 workspace，配置与 CLI 仍只记录环境变量名。）
 
 ## 5. 非目标
 

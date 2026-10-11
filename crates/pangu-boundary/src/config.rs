@@ -1714,6 +1714,15 @@ impl Config {
     }
 }
 
+/// Validate the operator-declared provider endpoint.
+///
+/// http and https are both accepted: the provider endpoint is operator
+/// configuration (BOUNDARY §3 网络 governs the *tool* gate, not the model
+/// endpoint), and an intranet gateway or local proxy over plain http is a
+/// legitimate deployment. The cost is stated plainly in the desktop editor:
+/// over http the API key travels in cleartext, so it belongs on a trusted
+/// network only. What never changes: no credentials, query or fragment in
+/// the URL, and no zero port.
 fn validate_base_url(raw: &str) -> Result<()> {
     let url = Url::parse(raw)
         .map_err(|error| Error::Config(format!("invalid model.base_url: {error}")))?;
@@ -1739,14 +1748,6 @@ fn validate_base_url(raw: &str) -> Result<()> {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     if host.is_empty() {
         return Err(Error::Config("model.base_url must contain a host".into()));
-    }
-    let loopback = host == "localhost"
-        || host == "::1"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    if url.scheme() == "http" && !loopback {
-        return Err(Error::Config("remote model.base_url must use https".into()));
     }
     Ok(())
 }
@@ -2258,6 +2259,21 @@ mod tests {
         contract
             .validate_against(&matching)
             .expect("same-config contract and sandbox agree");
+    }
+
+    /// The provider endpoint is operator configuration, so both schemes are
+    /// accepted for any host: an intranet gateway or a local router over
+    /// plain http is a legitimate deployment. What never changes: no
+    /// credentials, no query/fragment, no zero port, http/https only.
+    #[test]
+    fn base_url_http_and_https_are_both_accepted() {
+        validate_base_url("https://api.openai.com/v1").expect("https official");
+        validate_base_url("http://gateway.intranet:8310/v1").expect("http gateway");
+        validate_base_url("http://localhost:11434/v1").expect("http loopback");
+        assert!(validate_base_url("http://user:pass@example.com/v1").is_err());
+        assert!(validate_base_url("https://example.com/v1?token=x").is_err());
+        assert!(validate_base_url("ftp://example.com/v1").is_err());
+        assert!(validate_base_url("https://example.com:0/v1").is_err());
     }
 
     /// B4: naming a provider in config fills the endpoint, the key variable,

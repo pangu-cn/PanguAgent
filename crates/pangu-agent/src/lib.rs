@@ -14,6 +14,7 @@ const RECENT_TURNS: usize = 8;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pangu_boundary::{
     ActionRequest, ApprovalHandler, ApprovalMode, ApprovalRequest, ApprovalResponse,
@@ -450,6 +451,11 @@ pub struct Agent {
     /// enables delegation; builds the restricted executor each child runs
     /// with.
     delegation: Option<Arc<dyn SubtoolFactory>>,
+    /// Operator cancellation flag (the GUI's stop button). Checked at turn
+    /// and tool-call boundaries only: the in-flight provider request and the
+    /// running tool always complete, so a stop never leaves a half-executed
+    /// action behind (ADR-0013 §2's "只取消尚未开始的动作").
+    cancel: Option<Arc<AtomicBool>>,
     /// D1/D2: whether a delegated child must hold the workspace write lock.
     /// Defaults on: a child shares the parent's workspace, so concurrent
     /// children would otherwise race. Kept as a field so a deployment that
@@ -585,6 +591,7 @@ impl Agent {
             tools,
             approval,
             delegation: None,
+            cancel: None,
             // Off by default: the child's tool calls take per-path locks, so
             // unrelated work is not blocked. Turning this on excludes the whole
             // workspace, which is only wanted when the caller needs to stop
@@ -700,6 +707,24 @@ impl Agent {
     /// through. Resuming a conversation while the workspace is in a different
     /// state is the operator's call to make, visibly, with
     /// `pangu rollback`.
+    /// Attach an operator cancellation flag (the GUI's stop button). The flag
+    /// is checked at turn and tool-call boundaries; an in-flight provider
+    /// request or running tool always finishes first, so stopping never leaves
+    /// a half-executed action. The run then ends `aborted` with a `Note`
+    /// event on the record.
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    /// Whether the operator asked the run to stop. Bound to the same two
+    /// boundaries the run loop checks.
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     pub fn resume_from(mut self, conversation: &pangu_core::ConversationSnapshot) -> Result<Self> {
         conversation.validate()?;
         let history = conversation.restore()?;
@@ -1862,6 +1887,18 @@ impl Agent {
         }
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
+            // Operator stop: recorded, then the run ends `aborted`. Checked at
+            // the turn boundary so nothing new starts — the in-flight tool or
+            // provider request from the previous turn always completed.
+            if self.cancel_requested() {
+                self.emit(
+                    self.event(EventKind::Note, turn, "run cancelled by the operator")
+                        .tool("stop"),
+                )
+                .await?;
+                terminal = Some(GoalStatus::Aborted);
+                break;
+            }
             let breaches =
                 self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed(), spent);
             if !breaches.is_empty() {
@@ -2043,6 +2080,17 @@ impl Agent {
             }
 
             for call in tool_calls {
+                // Operator stop mid-turn: the calls this response asked for are
+                // all "not yet started", so none of them run.
+                if self.cancel_requested() {
+                    self.emit(
+                        self.event(EventKind::Note, turn, "run cancelled by the operator")
+                            .tool("stop"),
+                    )
+                    .await?;
+                    terminal = Some(GoalStatus::Aborted);
+                    break;
+                }
                 let call_breaches = self.budget_breaches(turn, &usage, started.elapsed(), spent);
                 if !call_breaches.is_empty() {
                     self.emit_budget(turn, &call_breaches).await?;

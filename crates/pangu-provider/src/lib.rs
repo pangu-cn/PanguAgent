@@ -315,6 +315,14 @@ pub fn resolve_api_keys<S: AsRef<str>>(env_names: &[S]) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+/// Validate and normalize the endpoint every request goes to.
+///
+/// http and https are both accepted for any host. The provider endpoint is
+/// operator configuration, and a plain-http gateway (intranet proxy, local
+/// router) is a legitimate deployment; the desktop editor discloses the
+/// cost at the point of decision — over http the API key travels in
+/// cleartext. What never changes: no credentials, query or fragment in the
+/// URL, and no zero port.
 fn normalize_base_url(raw: String) -> Result<String> {
     if raw.len() > 2_048 {
         bail!("provider base URL is too long");
@@ -336,14 +344,6 @@ fn normalize_base_url(raw: String) -> Result<String> {
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     if host.is_empty() {
         bail!("provider base URL must contain a host");
-    }
-    let loopback = host == "localhost"
-        || host == "::1"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    if parsed.scheme() == "http" && !loopback {
-        bail!("remote provider base URL must use HTTPS");
     }
     let mut normalized = parsed.to_string();
     while normalized.ends_with('/') {
@@ -557,10 +557,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_url_rejects_credentials_and_remote_http() {
-        assert!(normalize_base_url("https://user:pass@example.com/v1".into()).is_err());
-        assert!(normalize_base_url("http://example.com/v1".into()).is_err());
+    fn base_url_accepts_http_and_still_rejects_credentials() {
+        // http is accepted for any host: the endpoint is operator
+        // configuration, and an intranet gateway or local router over plain
+        // http is a legitimate deployment (the desktop editor discloses the
+        // cleartext cost at the point of decision).
+        assert_eq!(
+            normalize_base_url("http://gateway.intranet:8310/v1".into()).expect("http remote"),
+            "http://gateway.intranet:8310/v1"
+        );
         assert!(normalize_base_url("http://localhost:11434/v1".into()).is_ok());
+        // A trailing slash is normalized away; the request path stays stable.
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/".into()).expect("trailing slash"),
+            "https://api.openai.com/v1"
+        );
+        // What never changes: no credentials, no query/fragment, no zero port,
+        // http/https only.
+        assert!(normalize_base_url("https://user:pass@example.com/v1".into()).is_err());
+        assert!(normalize_base_url("https://example.com/v1?token=x".into()).is_err());
+        assert!(normalize_base_url("ftp://example.com/v1".into()).is_err());
+        assert!(normalize_base_url("https://example.com:0/v1".into()).is_err());
     }
 
     #[test]
