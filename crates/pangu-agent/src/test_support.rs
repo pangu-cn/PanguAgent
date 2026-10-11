@@ -11,7 +11,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1293,6 +1293,146 @@ mod tests {
         clean(root);
     }
 
+    /// A flag set before the run starts: nothing happens at all — no model
+    /// request, no tool execution — and the run ends `aborted` with the stop
+    /// on the record.
+    #[tokio::test]
+    async fn a_preset_stop_ends_the_run_aborted_before_anything_starts() {
+        let options = SetupOptions {
+            rules: vec![Rule::allow("allow-all", "*", "test action")],
+            responses: vec![
+                response(vec![tool_call()], Usage::default()),
+                response(vec![finish_call()], Usage::default()),
+            ],
+            ..SetupOptions::default()
+        };
+        let (agent, tool, sink, root) = setup(options);
+        let stopped = agent.with_cancel(Arc::new(AtomicBool::new(true)));
+        let outcome = stopped.run().await.expect("run");
+        assert_eq!(outcome.status, GoalStatus::Aborted);
+        assert_eq!(tool.executions.load(Ordering::Relaxed), 0);
+        assert!(
+            !sink
+                .snapshot()
+                .iter()
+                .any(|event: &Event| event.kind == pangu_core::EventKind::ModelRequest),
+            "the turn boundary fires before any provider request"
+        );
+        assert!(sink
+            .snapshot()
+            .iter()
+            .any(|event: &Event| event.kind == pangu_core::EventKind::Note
+                && event.message.contains("cancelled")));
+        clean(root);
+    }
+
+    /// A provider that simulates the operator pressing stop while the model is
+    /// thinking: turn 1's response arrives, its tool calls are then all "not
+    /// yet started", so none run and the run ends `aborted`.
+    struct StoppingProvider {
+        flag: Arc<AtomicBool>,
+        responses: Mutex<VecDeque<ChatResponse>>,
+    }
+
+    #[async_trait]
+    impl Provider for StoppingProvider {
+        fn name(&self) -> &str {
+            "stopping"
+        }
+
+        fn model(&self) -> &str {
+            "stopping-model"
+        }
+
+        fn describe(&self) -> String {
+            "stopping provider".into()
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolSpec>,
+        ) -> Result<ChatResponse> {
+            self.flag.store(true, Ordering::Relaxed);
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| response(vec![finish_call()], Usage::default())))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_turn_keeps_completed_actions_and_runs_no_new_ones() {
+        let root = test_temp_root().join(format!(
+            "pangu-agent-stop-{}-{}-{}",
+            std::process::id(),
+            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.rules = vec![Rule::allow("allow-all", "*", "test action")];
+        config.model.input_usd_per_mtok = Some(0.0);
+        config.model.output_usd_per_mtok = Some(0.0);
+        let contract = GoalContract::from_config("stop goal", &config).unwrap();
+        let sandbox = Arc::new(Sandbox::from_config(&config.boundary).unwrap());
+        let policy = Arc::new(Policy::new(config.rules.clone()).unwrap());
+        let tool = Arc::new(CountingTool {
+            executions: AtomicUsize::new(0),
+            risk: Risk::ReadOnly,
+            fail_execution: false,
+            output: "ok".into(),
+            omit_effect: false,
+            declared_write: root.join("tool-effect.txt"),
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(StoppingProvider {
+            flag: flag.clone(),
+            responses: Mutex::new(VecDeque::from(vec![
+                response(vec![tool_call()], Usage::default()),
+                response(vec![finish_call()], Usage::default()),
+            ])),
+        });
+        let sink = Arc::new(MemSink::default());
+        let agent = Agent::new(
+            contract,
+            policy,
+            sandbox,
+            provider,
+            tool.clone(),
+            Arc::new(ScriptedApproval::new(
+                ApprovalMode::DestructiveAndAbove,
+                Vec::new(),
+            )),
+            sink.clone(),
+        )
+        .unwrap()
+        .with_cancel(flag);
+        let outcome = agent.run().await.expect("run");
+        assert_eq!(outcome.status, GoalStatus::Aborted);
+        assert_eq!(
+            tool.executions.load(Ordering::Relaxed),
+            0,
+            "the tool call in the stop-time response never ran"
+        );
+        assert!(
+            !sink
+                .snapshot()
+                .iter()
+                .any(|event: &Event| event.kind == pangu_core::EventKind::ToolStarted),
+            "no tool was started after the stop"
+        );
+        clean(root);
+    }
+
     #[tokio::test]
     async fn tool_error_is_returned_to_the_model() {
         let options = SetupOptions {
@@ -1312,6 +1452,223 @@ mod tests {
             .snapshot()
             .iter()
             .any(|event: &Event| event.kind == pangu_core::EventKind::ToolFinished));
+        clean(root);
+    }
+
+    // ---- ADR-0014: model-authored context notes --------------------------
+
+    /// Keeps every window the model was shown, so a test can read what the
+    /// note injection actually looked like from the model's side.
+    struct CapturingProvider {
+        responses: Mutex<VecDeque<ChatResponse>>,
+        seen: Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CapturingProvider {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        fn model(&self) -> &str {
+            "capturing-model"
+        }
+
+        fn describe(&self) -> String {
+            "capturing provider".into()
+        }
+
+        async fn chat(
+            &self,
+            messages: Vec<Message>,
+            _tools: Vec<ToolSpec>,
+        ) -> Result<ChatResponse> {
+            self.seen.lock().expect("seen lock").push(messages);
+            Ok(self
+                .responses
+                .lock()
+                .expect("response lock")
+                .pop_front()
+                .unwrap_or_else(|| response(vec![finish_call()], Usage::default())))
+        }
+    }
+
+    /// A run with conversation persistence on and (optionally) model notes.
+    /// Returns the provider too, because the property under test is what the
+    /// model was shown.
+    fn notes_setup(
+        model_notes: bool,
+        responses: Vec<ChatResponse>,
+    ) -> (Agent, Arc<CapturingProvider>, Arc<MemSink>, PathBuf) {
+        let root = test_temp_root().join(format!(
+            "pangu-agent-notes-{}-{}-{}",
+            std::process::id(),
+            TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = Config::embedded().unwrap();
+        config.boundary.workspace = root.clone();
+        config.boundary.readable_roots = vec![root.clone()];
+        config.boundary.writable_roots = vec![root.clone()];
+        config.model.input_usd_per_mtok = Some(0.0);
+        config.model.output_usd_per_mtok = Some(0.0);
+        config.conversation.enabled = true;
+        config.conversation.artifact_root = root.join(".pangu/conversations");
+        config.conversation.save_every_turn = true;
+        config.conversation.model_notes = model_notes;
+        let rules = config.rules.clone();
+        let contract = GoalContract::from_config("notes goal", &config).unwrap();
+        let sandbox = Arc::new(Sandbox::from_config(&config.boundary).unwrap());
+        let policy = Arc::new(Policy::new(rules).unwrap());
+        let tool = Arc::new(CountingTool {
+            executions: AtomicUsize::new(0),
+            risk: Risk::ReadOnly,
+            fail_execution: false,
+            output: "ok".into(),
+            omit_effect: false,
+            declared_write: root.join("tool-effect.txt"),
+        });
+        let provider = Arc::new(CapturingProvider {
+            responses: Mutex::new(VecDeque::from(responses)),
+            seen: Mutex::new(Vec::new()),
+        });
+        let sink = Arc::new(MemSink::default());
+        let agent = Agent::new(
+            contract,
+            policy,
+            sandbox,
+            provider.clone(),
+            tool,
+            Arc::new(ScriptedApproval::new(
+                ApprovalMode::DestructiveAndAbove,
+                Vec::new(),
+            )),
+            sink.clone(),
+        )
+        .unwrap();
+        (agent, provider, sink, root)
+    }
+
+    fn note_call(args: serde_json::Value) -> ToolCall {
+        ToolCall::new("note_context", args)
+    }
+
+    fn window_texts(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|message| match message {
+                Message::System { content }
+                | Message::User { content }
+                | Message::Assistant { content, .. }
+                | Message::Tool { content, .. } => content.clone(),
+            })
+            .collect()
+    }
+
+    fn notes_store(root: &std::path::Path) -> pangu_core::ArtifactStore {
+        pangu_core::ArtifactStore::open(root.join(".pangu/conversations")).unwrap()
+    }
+
+    /// The store key the runtime derives from the run label — never the raw
+    /// goal text, for secrets hygiene.
+    fn notes_key() -> String {
+        pangu_core::short_hash(&pangu_core::redact_text("notes goal"))
+    }
+
+    #[tokio::test]
+    async fn a_model_note_is_stored_and_injected_as_untrusted_data() {
+        let (agent, provider, sink, root) = notes_setup(
+            true,
+            vec![
+                response(
+                    vec![note_call(serde_json::json!({"summary": "read the goal, no writes yet"}))],
+                    Usage::default(),
+                ),
+                response(vec![finish_call()], Usage::default()),
+            ],
+        );
+        agent.run().await.expect("run");
+        // The note was recorded as a Note event and persisted.
+        assert!(sink
+            .snapshot()
+            .iter()
+            .any(|event: &Event| event.kind == pangu_core::EventKind::Note));
+        let store = notes_store(&root);
+        assert!(
+            store.has_notes(&notes_key()).unwrap(),
+            "the note must be stored"
+        );
+        // The second model call saw it, annotated as untrusted data.
+        let seen = provider.seen.lock().expect("lock").clone();
+        assert_eq!(seen.len(), 2, "two scripted turns");
+        let injected = window_texts(&seen[1])
+            .into_iter()
+            .find(|text| text.contains("pangu model note"))
+            .expect("the note must reach the next window");
+        assert!(injected.contains("UNTRUSTED"), "got: {injected}");
+        assert!(injected.contains("carries no authorization"), "got: {injected}");
+        assert!(injected.contains("read the goal, no writes yet"));
+        clean(root);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_note_is_refused_like_an_invalid_tool_call() {
+        let (agent, _provider, sink, root) = notes_setup(
+            true,
+            vec![
+                response(
+                    vec![note_call(serde_json::json!({
+                        "spans": [{"start_message": 0, "end_message": 99}],
+                        "summary": "claims messages that do not exist",
+                    }))],
+                    Usage::default(),
+                ),
+                response(vec![finish_call()], Usage::default()),
+            ],
+        );
+        agent.run().await.expect("run continues past a refused note");
+        let blocked = sink
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == pangu_core::EventKind::ToolBlocked)
+            .expect("the invalid note must be recorded as blocked");
+        assert!(
+            blocked.message.contains("exceeds"),
+            "the refusal must say why, got: {}",
+            blocked.message
+        );
+        assert!(
+            !notes_store(&root).has_notes(&notes_key()).unwrap(),
+            "a refused note must not be stored"
+        );
+        clean(root);
+    }
+
+    #[tokio::test]
+    async fn note_context_is_refused_when_the_operator_did_not_opt_in() {
+        // Not advertised means not available: the call falls through to the
+        // ordinary unknown-tool path, and nothing is stored.
+        let (agent, _provider, sink, root) = notes_setup(
+            false,
+            vec![
+                response(
+                    vec![note_call(serde_json::json!({"summary": "sneaky note"}))],
+                    Usage::default(),
+                ),
+                response(vec![finish_call()], Usage::default()),
+            ],
+        );
+        let outcome = agent.run().await.expect("run");
+        assert_eq!(outcome.status, GoalStatus::Failed);
+        assert!(sink
+            .snapshot()
+            .iter()
+            .any(|event: &Event| event.kind == pangu_core::EventKind::ToolBlocked));
+        assert!(!notes_store(&root).has_notes(&notes_key()).unwrap());
         clean(root);
     }
 }

@@ -14,6 +14,7 @@ const RECENT_TURNS: usize = 8;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pangu_boundary::{
     ActionRequest, ApprovalHandler, ApprovalMode, ApprovalRequest, ApprovalResponse,
@@ -21,10 +22,10 @@ use pangu_boundary::{
     ValidatedResources,
 };
 use pangu_core::{
-    assemble, redact_event, redact_text, truncate_middle, ChatResponse, CheckpointArtifact,
-    DeliverableStore, Event, EventKind, EventSink, FailureClass, JournalMeta, MemoryStore, Message,
-    RestoreDisposition, RollbackOperation, RollbackRequest, SkillRegistry, ToolCall, ToolSpec,
-    Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
+    assemble_with_notes, redact_event, redact_text, truncate_middle, ChatResponse,
+    CheckpointArtifact, DeliverableStore, Event, EventKind, EventSink, FailureClass, JournalMeta,
+    MemoryStore, Message, RestoreDisposition, RollbackOperation, RollbackRequest, SkillRegistry,
+    ToolCall, ToolSpec, Usage, Value, JOURNAL_FORMAT_V1, JOURNAL_FORMAT_V2,
 };
 
 pub mod capability;
@@ -379,6 +380,38 @@ impl VerifiedAction {
     }
 }
 
+fn parse_text_actions(content: &str) -> Result<Vec<pangu_core::ToolCall>> {
+    let mut calls = Vec::new();
+    for (index, block) in content.split("```action").skip(1).enumerate() {
+        let body = block.split("```").next().unwrap_or("").trim();
+        if body.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(body)?;
+        let name = value
+            .get("name")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        let args = value
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if name.trim().is_empty() || !args.is_object() {
+            return Err(anyhow!(
+                "text action block must contain a name and object arguments"
+            ));
+        }
+        let call = pangu_core::ToolCall {
+            id: format!("text-action-{index}"),
+            name: name.to_string(),
+            args,
+        };
+        call.validate().map_err(|error| anyhow!(error))?;
+        calls.push(call);
+    }
+    Ok(calls)
+}
+
 pub struct Agent {
     contract: GoalContract,
     policy: Arc<Policy>,
@@ -388,6 +421,7 @@ pub struct Agent {
     /// fallback.
     fallbacks: Vec<Arc<dyn Provider>>,
     tools: Arc<dyn ToolExecutor>,
+    initial_tool_digest: String,
     approval: Arc<dyn ApprovalHandler>,
     event_sink: Arc<dyn EventSink>,
     checkpoint: Option<Arc<checkpoint::CheckpointRuntime>>,
@@ -395,6 +429,13 @@ pub struct Agent {
     /// History to continue from. Model input only: it carries no decision and
     /// no approval, and every action in the resumed run is re-evaluated.
     resume_from: Option<Vec<Message>>,
+    /// ADR-0014: the model-authored context notes this run has emitted (and,
+    /// on resume, the ones stored for the previous run). Untrusted data by
+    /// construction: they ride assembly as an optional, annotated layer and
+    /// never touch a gate. Empty whenever `model_notes` is off. Mutex-guarded
+    /// because `run` takes `&self` (the library entry point is re-runnable);
+    /// the guard is never held across an await.
+    model_notes: std::sync::Mutex<Vec<pangu_core::ModelNote>>,
     /// B3: the memory candidate store. Attached only when the contract
     /// enables the queue; used to inject accepted, clearly-labeled memory
     /// into fresh runs.
@@ -410,6 +451,11 @@ pub struct Agent {
     /// enables delegation; builds the restricted executor each child runs
     /// with.
     delegation: Option<Arc<dyn SubtoolFactory>>,
+    /// Operator cancellation flag (the GUI's stop button). Checked at turn
+    /// and tool-call boundaries only: the in-flight provider request and the
+    /// running tool always complete, so a stop never leaves a half-executed
+    /// action behind (ADR-0013 §2's "只取消尚未开始的动作").
+    cancel: Option<Arc<AtomicBool>>,
     /// D1/D2: whether a delegated child must hold the workspace write lock.
     /// Defaults on: a child shares the parent's workspace, so concurrent
     /// children would otherwise race. Kept as a field so a deployment that
@@ -534,9 +580,18 @@ impl Agent {
             sandbox,
             provider,
             fallbacks: fallback_iter.collect(),
+            initial_tool_digest: pangu_core::hex_sha256(
+                &tools
+                    .specs()
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             tools,
             approval,
             delegation: None,
+            cancel: None,
             // Off by default: the child's tool calls take per-path locks, so
             // unrelated work is not blocked. Turning this on excludes the whole
             // workspace, which is only wanted when the caller needs to stop
@@ -550,6 +605,7 @@ impl Agent {
             checkpoint: checkpoint.map(Arc::new),
             conversation: conversation.map(Arc::new),
             resume_from: None,
+            model_notes: std::sync::Mutex::new(Vec::new()),
             memory: None,
             skills: None,
             deliverables: None,
@@ -651,11 +707,39 @@ impl Agent {
     /// through. Resuming a conversation while the workspace is in a different
     /// state is the operator's call to make, visibly, with
     /// `pangu rollback`.
+    /// Attach an operator cancellation flag (the GUI's stop button). The flag
+    /// is checked at turn and tool-call boundaries; an in-flight provider
+    /// request or running tool always finishes first, so stopping never leaves
+    /// a half-executed action. The run then ends `aborted` with a `Note`
+    /// event on the record.
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    /// Whether the operator asked the run to stop. Bound to the same two
+    /// boundaries the run loop checks.
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     pub fn resume_from(mut self, conversation: &pangu_core::ConversationSnapshot) -> Result<Self> {
         conversation.validate()?;
         let history = conversation.restore()?;
         conversation::validate_resumable(&history)?;
-        self.resume_from = Some(history);
+        self.resume_from = Some(history.clone());
+        // ADR-0014: a resumed run inherits the previous run's stored notes as
+        // untrusted data. They are re-verified against the restored history —
+        // a note that no longer binds to the messages beneath it is a loud
+        // error here, never a silent drop, and certainly never a regeneration.
+        if self.contract.conversation.enabled && self.contract.conversation.model_notes {
+            if let Some(runtime) = &self.conversation {
+                let loaded = runtime.load_notes(&self.contract.goal, &history)?;
+                self.model_notes = std::sync::Mutex::new(loaded);
+            }
+        }
         Ok(self)
     }
 
@@ -1598,6 +1682,14 @@ impl Agent {
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut evidence = Vec::new();
+        // ADR-0014: the working copy of this run's notes. Seeded from the
+        // resume state; every emission is persisted first and then mirrored
+        // back into the agent so a re-run sees them too.
+        let mut model_notes = self
+            .model_notes
+            .lock()
+            .expect("model notes lock")
+            .clone();
         let mut history = match &self.resume_from {
             // A resumed history already carries its system turn and goal.
             // Re-seeding them would duplicate the instructions at the head and
@@ -1740,8 +1832,73 @@ impl Agent {
                 }),
             ));
         }
+        // ADR-0014: the note_context control tool exists only when the
+        // operator opted into model notes (`conversation.model_notes`,
+        // default off). Like `begin_act` it is agent-owned: it executes
+        // nothing and passes no gate. The note it records is untrusted data
+        // that rides assembly as an optional, annotated layer — writing one
+        // authorizes nothing and changes no boundary.
+        if self.contract.conversation.enabled && self.contract.conversation.model_notes {
+            specs.push(pangu_core::ToolSpec::new(
+                "note_context",
+                "Record a context note: your own bounded summary of this conversation, kept \
+                 for when older history is no longer in your context window. Takes no side \
+                 effect and authorizes nothing — the note is stored as unverified data and \
+                 shown back to you marked UNTRUSTED. You cannot address message indices of \
+                 the projected window, so omit `spans` and the note covers the whole history \
+                 as it stands. Arguments: spans (optional array of 1-4 inclusive ranges \
+                 {start_message, end_message} within the stored history), summary (required \
+                 string, at most 2 KiB, no control characters), open_items (optional array of \
+                 at most 8 short strings worth keeping in view).",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["summary"],
+                    "properties": {
+                        "spans": {
+                            "type": "array",
+                            "maxItems": 4,
+                            "description": "Optional inclusive message ranges this note covers.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["start_message", "end_message"],
+                                "properties": {
+                                    "start_message": {"type": "integer", "minimum": 0},
+                                    "end_message": {"type": "integer", "minimum": 0}
+                                }
+                            }
+                        },
+                        "summary": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 2048,
+                            "description": "Your summary of the covered history."
+                        },
+                        "open_items": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "description": "Short strings worth keeping in view.",
+                            "items": {"type": "string", "maxLength": 256}
+                        }
+                    }
+                }),
+            ));
+        }
         for turn in 1..=self.contract.budget().max_turns {
             last_turn = turn;
+            // Operator stop: recorded, then the run ends `aborted`. Checked at
+            // the turn boundary so nothing new starts — the in-flight tool or
+            // provider request from the previous turn always completed.
+            if self.cancel_requested() {
+                self.emit(
+                    self.event(EventKind::Note, turn, "run cancelled by the operator")
+                        .tool("stop"),
+                )
+                .await?;
+                terminal = Some(GoalStatus::Aborted);
+                break;
+            }
             let breaches =
                 self.budget_breaches(turn.saturating_sub(1), &usage, started.elapsed(), spent);
             if !breaches.is_empty() {
@@ -1754,11 +1911,12 @@ impl Agent {
             // history stays in memory (and in `history`); assembly is a pure
             // projection (§3.9). Input-token pressure is resolved here — by
             // degradation — not by ending the run.
-            let (assembled, assembly) = match assemble(
+            let (assembled, assembly) = match assemble_with_notes(
                 &history,
                 RECENT_TURNS,
                 &[],
                 self.contract.budget().max_input_tokens,
+                &model_notes,
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -1781,22 +1939,43 @@ impl Agent {
                     pangu_core::DegradeMode::Omitted => (full, summary, omitted + 1),
                 },
             );
-            self.emit(self.event(
+            let current_tool_digest = pangu_core::hex_sha256(
+                &self
+                    .tools
+                    .specs()
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            let prefix_stable = turn == 1
+                && !assembly.forced_over_budget
+                && assembled.seams.is_empty()
+                && current_tool_digest == self.initial_tool_digest;
+            let mut assembled_event = self.event(
                 EventKind::ContextAssembled,
                 turn,
                 format!(
-                    "messages={} tokens~{} forced_over_budget={} slices: {} full, {} summary, \
-                     {} omitted, {} seam(s)",
+                    "messages={} tokens~{} forced_over_budget={} prefix_stable={} slices: {} full, {} summary, \
+                     {} omitted, {} seam(s), {} model note(s)",
                     assembled.messages.len(),
                     assembly.estimated_tokens,
                     assembly.forced_over_budget,
+                    prefix_stable,
                     modes.0,
                     modes.1,
                     modes.2,
-                    assembled.seams.len()
+                    assembled.seams.len(),
+                    assembly.model_notes
                 ),
-            ))
-            .await?;
+            );
+            assembled_event.payload = Some(serde_json::json!({
+                "derived": true,
+                "authoritative": false,
+                "prefix_stable": prefix_stable,
+                "model_notes": assembly.model_notes
+            }));
+            self.emit(assembled_event).await?;
             if assembly.forced_over_budget {
                 // The honest tail of the chain: even every forced slice at its
                 // summary form does not fit. Terminate — but for a *budget*
@@ -1880,6 +2059,10 @@ impl Agent {
                                 "provider returned too many tool calls in one response"
                             ));
                         }
+                        let mut calls = calls;
+                        if calls.is_empty() && self.contract.model_raw_tool_calls {
+                            calls = parse_text_actions(&content)?;
+                        }
                         tool_calls.extend(calls);
                         history.push(Message::assistant_calls(content, history_calls));
                     }
@@ -1897,6 +2080,17 @@ impl Agent {
             }
 
             for call in tool_calls {
+                // Operator stop mid-turn: the calls this response asked for are
+                // all "not yet started", so none of them run.
+                if self.cancel_requested() {
+                    self.emit(
+                        self.event(EventKind::Note, turn, "run cancelled by the operator")
+                            .tool("stop"),
+                    )
+                    .await?;
+                    terminal = Some(GoalStatus::Aborted);
+                    break;
+                }
                 let call_breaches = self.budget_breaches(turn, &usage, started.elapsed(), spent);
                 if !call_breaches.is_empty() {
                     self.emit_budget(turn, &call_breaches).await?;
@@ -1988,6 +2182,84 @@ impl Agent {
                             "begin_act",
                             "act phase started; mutating actions now proceed through the gates",
                         ));
+                    }
+                } else if call.name == "note_context" {
+                    // ADR-0014 control call: no assess, no gates, no side
+                    // effect on the workspace. The note is validated against
+                    // the live history (span + prefix digest), stored
+                    // append-only as untrusted data, and injected back only
+                    // through the assembler's optional layer. An invalid note
+                    // is an invalid tool call — the error is fed back to the
+                    // model, never silently dropped or truncated.
+                    match pangu_core::note_from_args(turn as usize, &call.args, &history) {
+                        Ok(note) => {
+                            let stored: anyhow::Result<()> =
+                                if let Some(runtime) = &self.conversation {
+                                    runtime
+                                        .append_notes(
+                                            &self.contract.goal,
+                                            std::slice::from_ref(&note),
+                                            &history,
+                                        )
+                                        .map_err(|error| anyhow!(error.to_string()))
+                                } else {
+                                    Err(anyhow!(
+                                        "conversation persistence is off; note_context requires it"
+                                    ))
+                                };
+                            if let Err(error) = stored {
+                                let context = FailureContext::from_call(&call);
+                                self.record_tool_error_with_context(
+                                    &mut history,
+                                    &call,
+                                    turn,
+                                    EventKind::ToolBlocked,
+                                    error,
+                                    checkpoint_state.as_ref(),
+                                    &context,
+                                    FailureClass::InvalidToolCall,
+                                )
+                                .await?;
+                            } else {
+                                model_notes.push(note.clone());
+                                self.model_notes
+                                    .lock()
+                                    .expect("model notes lock")
+                                    .push(note.clone());
+                                self.emit(
+                                    self.event(
+                                        EventKind::Note,
+                                        turn,
+                                        format!(
+                                            "model context note recorded: covers messages \
+                                             {}..={}",
+                                            note.start_message, note.end_message
+                                        ),
+                                    )
+                                    .call_id(&call.id),
+                                )
+                                .await?;
+                                history.push(Message::tool_result(
+                                    &call.id,
+                                    "note_context",
+                                    "context note recorded",
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            let context = FailureContext::from_call(&call);
+                            self.record_tool_error_with_context(
+                                &mut history,
+                                &call,
+                                turn,
+                                EventKind::ToolBlocked,
+                                anyhow!(error.to_string()),
+                                checkpoint_state.as_ref(),
+                                &context,
+                                FailureClass::InvalidToolCall,
+                            )
+                            .await?;
+                        }
                     }
                 } else if call.name == "finish" {
                     match self.finish_status(&call, &evidence) {
@@ -2823,10 +3095,8 @@ impl Agent {
                         evidence.push(item);
                     }
                 }
-                let content = truncate_middle(
-                    &redact_text(&output.content),
-                    self.sandbox.max_tool_output_bytes,
-                );
+                let content = redact_text(&output.content);
+                let preview = truncate_middle(&content, 240);
                 let output_bytes = output.content.len();
                 let output_digest = pangu_core::hex_sha256(&output.content);
                 let finished_event = self
@@ -2845,6 +3115,10 @@ impl Agent {
                         .payload(serde_json::json!({
                             "ok": true,
                             "evidence": bounded_evidence,
+                            "output_complete": true,
+                            "collapsed": true,
+                            "preview": preview,
+                            "output": content,
                             "output_bytes": output_bytes,
                             "output_sha256": output_digest,
                         })),

@@ -79,6 +79,13 @@ impl ConversationRuntime {
     ///
     /// The digest is verified on the way out, so a snapshot edited since it was
     /// written is refused rather than fed to a model as if it were intact.
+    pub fn clone_snapshot(&self, snapshot_id: &str, run_id: &str) -> Result<ConversationSnapshot> {
+        let source = self.load(snapshot_id)?;
+        let cloned = source.cloned_for(self.next_snapshot_id(run_id), run_id)?;
+        self.store.save_conversation(&cloned)?;
+        Ok(cloned)
+    }
+
     pub fn load(&self, snapshot_id: &str) -> Result<ConversationSnapshot> {
         self.store.load_conversation(snapshot_id)
     }
@@ -173,6 +180,46 @@ impl ConversationRuntime {
         let summaries = self.store.load_summaries(&key)?;
         pangu_core::verify_summaries(&summaries, history)?;
         Ok(summaries)
+    }
+
+    /// ADR-0014: append model-authored notes for this run.
+    ///
+    /// Append-only, like snapshots: a stored note is never rewritten. The
+    /// notes are verified against the live history *before* they reach the
+    /// file — a note describing bytes it does not cover must not be stored,
+    /// because the span binding is the only thing about a note that can be
+    /// checked.
+    pub fn append_notes(
+        &self,
+        run_id: &str,
+        notes: &[pangu_core::ModelNote],
+        history: &[Message],
+    ) -> Result<()> {
+        if notes.is_empty() {
+            return Ok(());
+        }
+        let stored = pangu_core::ConversationNotes {
+            schema_version: pangu_core::NOTE_SCHEMA_VERSION,
+            notes: notes.to_vec(),
+        };
+        pangu_core::verify_notes(&stored, history)?;
+        self.store.append_notes(&Self::summaries_key(run_id), notes)
+    }
+
+    /// Load this run's notes and verify them against a live history.
+    ///
+    /// A missing file is an empty set, not an error: a run that never emitted
+    /// a note is the normal case. A note that no longer binds to the history
+    /// beneath it is a loud error — never a silent drop, and never a
+    /// regeneration.
+    pub fn load_notes(
+        &self,
+        run_id: &str,
+        history: &[Message],
+    ) -> Result<Vec<pangu_core::ModelNote>> {
+        let stored = self.store.load_notes(&Self::summaries_key(run_id))?;
+        pangu_core::verify_notes(&stored, history)?;
+        Ok(stored.notes)
     }
 
     /// The stored snapshots that belong to one session node, oldest first.
@@ -371,6 +418,47 @@ mod tests {
             .restore()
             .expect("restore");
         let _: Vec<Message> = restored;
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// ADR-0014: notes round-trip through the store, and a history that
+    /// diverged beneath a note is refused rather than silently accepted.
+    #[test]
+    fn model_notes_round_trip_and_verify_on_load() {
+        let root = temp_root("notes");
+        let runtime = runtime(&root);
+        let note = |turn: usize, summary: &str| {
+            pangu_core::note_from_args(
+                turn,
+                &serde_json::json!({"summary": summary}),
+                &history(),
+            )
+            .expect("note")
+        };
+        let first = note(1, "first note");
+        let second = note(2, "second note");
+        runtime
+            .append_notes("run-1", std::slice::from_ref(&first), &history())
+            .expect("first append");
+        runtime
+            .append_notes("run-1", std::slice::from_ref(&second), &history())
+            .expect("second append");
+        let loaded = runtime.load_notes("run-1", &history()).expect("load");
+        assert_eq!(loaded, vec![first, second], "append keeps declaration order");
+        // Appending messages never invalidates an existing note.
+        let mut longer = history();
+        longer.push(Message::user("and later"));
+        assert_eq!(
+            runtime.load_notes("run-1", &longer).expect("load after append"),
+            loaded
+        );
+        // Editing the covered prefix does.
+        let mut diverged = longer.clone();
+        diverged[1] = Message::user("changed");
+        let error = runtime
+            .load_notes("run-1", &diverged)
+            .expect_err("diverged history must fail");
+        assert!(error.to_string().contains("prefix_digest"), "got: {error}");
         std::fs::remove_dir_all(root).ok();
     }
 }

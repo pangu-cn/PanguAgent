@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod canvas_server;
+mod client_server;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -69,6 +70,10 @@ enum Commands {
         goal: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Start a new run from a recorded checkpoint. The checkpoint stays
+        /// read-only; pending actions are not replayed.
+        #[arg(long = "from-checkpoint")]
+        from_checkpoint: Option<String>,
     },
     Rollback {
         #[arg(long = "checkpoint-id", visible_alias = "target-checkpoint")]
@@ -120,6 +125,9 @@ enum Commands {
         #[command(subcommand)]
         action: SessionCommands,
     },
+    /// Read one JSON command from stdin and write one derived JSON response.
+    /// This channel cannot execute tools.
+    Rpc,
     /// Inspect a stable event stream. Read-only, and never an authorization.
     Events {
         #[command(subcommand)]
@@ -129,6 +137,12 @@ enum Commands {
     /// loopback. It has no route that runs, approves or writes anything, so a
     /// page rendered from model output can never sit next to a control that
     /// authorizes it.
+    /// Local executable client. It accepts one goal and renders risk confirmation
+    /// as a modal dialog.
+    Client {
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+    },
     Canvas {
         /// Journal to view. Defaults to the workspace journal.
         #[arg(long)]
@@ -375,6 +389,17 @@ enum ArtifactCommands {
 enum ConversationCommands {
     /// List stored conversations, oldest first.
     List,
+    /// Copy one stored conversation into a new snapshot. This copies dialogue only,
+    /// never the workspace, approvals, or checkpoint state.
+    Clone {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "cloned-conversation")]
+        run_id: String,
+    },
+    /// Search redacted conversation text. The query result is derived and
+    /// never includes the raw stored snapshot.
+    Search { query: String },
     /// Show one conversation's metadata without its full text.
     Show {
         /// Snapshot id. Defaults to the most recent.
@@ -410,6 +435,20 @@ enum SessionCommands {
     Tree {
         #[arg(long)]
         json: bool,
+    },
+    /// Copy the recorded dialogue into a new snapshot. This command does not
+    /// copy the workspace, approvals, or checkpoint state.
+    Clone {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "cloned-conversation")]
+        run_id: String,
+    },
+    Fork {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "forked-conversation")]
+        run_id: String,
     },
     /// Reconstruct the conversation recorded at one node, without restoring the
     /// workspace. For that, use `pangu rollback`.
@@ -484,9 +523,11 @@ async fn main() -> Result<()> {
                 json,
             },
         ),
-        Some(Commands::Run { goal, dry_run }) => {
-            run_command(&args, goal, dry_run || args.dry_run).await
-        }
+        Some(Commands::Run {
+            goal,
+            dry_run,
+            from_checkpoint,
+        }) => run_command(&args, goal, dry_run || args.dry_run, from_checkpoint).await,
         Some(Commands::Rollback {
             checkpoint_id,
             source_node,
@@ -506,6 +547,8 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Conversation { action }) => match action {
             ConversationCommands::List => conversation_list(&args),
+            ConversationCommands::Clone { id, run_id } => conversation_clone(&args, &id, &run_id),
+            ConversationCommands::Search { query } => conversation_search(&args, &query),
             ConversationCommands::Show { id, json } => conversation_show(&args, id, json),
             ConversationCommands::Export {
                 id,
@@ -515,17 +558,27 @@ async fn main() -> Result<()> {
             } => conversation_export(&args, id, out, strict, json),
         },
         Some(Commands::Session { action }) => match action {
+            SessionCommands::Fork { id, run_id } => session_fork(&args, &id, &run_id),
+            SessionCommands::Clone { id, run_id } => {
+                println!("session clone copies dialogue only; it does not copy the workspace");
+                conversation_clone(&args, &id, &run_id)
+            }
             SessionCommands::Tree { json } => session_tree(&args, json),
             SessionCommands::Replay { node, full, json } => {
                 session_replay(&args, &node, full, json)
             }
         },
+        Some(Commands::Client { port }) => {
+            client_server::serve(port).await?;
+            Ok(())
+        }
         Some(Commands::Canvas {
             journal,
             port,
             print_url,
             no_token,
         }) => canvas_serve(&args, journal, port, print_url, no_token).await,
+        Some(Commands::Rpc) => rpc_once(),
         Some(Commands::Events { action }) => match action {
             EventsCommands::Read {
                 path,
@@ -590,7 +643,7 @@ async fn main() -> Result<()> {
                     input.trim().to_string()
                 }
             };
-            run_command(&args, goal, args.dry_run).await
+            run_command(&args, goal, args.dry_run, None).await
         }
     }
 }
@@ -1092,6 +1145,15 @@ fn conversation_list(args: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn conversation_clone(args: &Cli, id: &str, run_id: &str) -> Result<()> {
+    let Some(runtime) = conversation_store(args)? else {
+        bail!("conversation persistence is disabled");
+    };
+    let cloned = runtime.clone_snapshot(id, run_id)?;
+    println!("{}", cloned.snapshot_id);
+    Ok(())
+}
+
 fn conversation_show(args: &Cli, id: Option<String>, json: bool) -> Result<()> {
     let Some(store) = conversation_store(args)? else {
         return Err(anyhow::anyhow!(
@@ -1127,6 +1189,21 @@ authoritative: false",
                 "compacted from {} (dropped {}, kept {})",
                 record.compacted_from_digest, record.dropped_messages, record.kept_messages
             );
+        }
+    }
+    Ok(())
+}
+
+fn conversation_search(args: &Cli, query: &str) -> Result<()> {
+    let Some(store) = conversation_store(args)? else {
+        bail!("conversation persistence is disabled");
+    };
+    let query = pangu_core::redact_text(query);
+    for id in store.list().map_err(|error| anyhow!(error))? {
+        let snapshot = store.load(&id).map_err(|error| anyhow!(error))?;
+        let text = pangu_core::redact_text(&format!("{:?}", snapshot.messages));
+        if text.contains(&query) {
+            println!("{id}\tderived=true\tauthoritative=false");
         }
     }
     Ok(())
@@ -1929,7 +2006,12 @@ fn config_command(file: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
+async fn run_command(
+    args: &Cli,
+    goal: String,
+    dry_run: bool,
+    from_checkpoint: Option<String>,
+) -> Result<()> {
     if goal.trim().is_empty() {
         bail!("goal must not be empty");
     }
@@ -1952,6 +2034,11 @@ async fn run_command(args: &Cli, goal: String, dry_run: bool) -> Result<()> {
         ..Default::default()
     };
     config = config.apply(&overrides)?;
+    if let Some(checkpoint_id) = &from_checkpoint {
+        println!(
+            "from checkpoint {checkpoint_id}: old journal and checkpoint remain read-only; pending actions are not replayed"
+        );
+    }
     if dry_run {
         println!(
             "dry run: no provider request or tool execution\n\n{}",
@@ -2597,6 +2684,62 @@ fn session_contract(args: &Cli) -> Result<GoalContract> {
         );
     }
     Ok(GoalContract::from_config("session maintenance", &config)?)
+}
+
+fn session_fork(args: &Cli, id: &str, run_id: &str) -> Result<()> {
+    println!("session fork copies dialogue only; it does not copy the workspace");
+    let Some(runtime) = conversation_store(args)? else {
+        bail!("conversation persistence is disabled");
+    };
+    let source = runtime.load(id).map_err(|error| anyhow!(error))?;
+    let cloned = runtime
+        .clone_snapshot(id, run_id)
+        .map_err(|error| anyhow!(error))?;
+    let event = pangu_core::Event::new_v2(
+        pangu_core::EventKind::SessionForked,
+        0,
+        format!(
+            "parent={} child={} workspace_copied=false",
+            source.snapshot_id, cloned.snapshot_id
+        ),
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "pangu-session-fork/1",
+            "derived": true,
+            "authoritative": false,
+            "parent_digest": source.history_digest,
+            "child": cloned.snapshot_id,
+            "workspace_copied": false,
+            "event": event.kind.as_str()
+        })
+    );
+    Ok(())
+}
+
+fn rpc_once() -> Result<()> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let value: serde_json::Value = serde_json::from_str(&input)?;
+    let command = value
+        .get("command")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    if command != "capabilities" {
+        bail!("rpc command is not available");
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "pangu-rpc/1",
+            "derived": true,
+            "authoritative": false,
+            "capabilities": ["session.tree", "conversation.search"],
+            "execution": false
+        })
+    );
+    Ok(())
 }
 
 fn session_tree(args: &Cli, json: bool) -> Result<()> {

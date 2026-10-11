@@ -2,10 +2,11 @@ use std::time::Duration;
 
 use pangu_agent::Provider;
 use pangu_core::{ChatResponse, Message};
-use pangu_provider::OpenAiCompatibleProvider;
+use pangu_provider::{OpenAiCompatibleProvider, MAX_API_KEYS};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 struct MockServer {
@@ -94,6 +95,52 @@ fn provider(base_url: String) -> OpenAiCompatibleProvider {
         5,
     )
     .expect("provider")
+}
+
+/// Serve `times` sequential requests, reporting each request's Authorization
+/// header over the returned channel. The single-shot mock above cannot prove
+/// rotation, which is a property *across* requests.
+async fn spawn_rotating_server(times: usize, body: String) -> (String, mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind mock provider server");
+    let address = listener.local_addr().expect("mock provider address");
+    let (authorizations_tx, authorizations_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        for _ in 0..times {
+            let (mut socket, _) = listener.accept().await.expect("accept provider request");
+            let request = read_request(&mut socket).await;
+            let _ = authorizations_tx.send(authorization_of(&request));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (format!("http://{address}/v1"), authorizations_rx)
+}
+
+fn authorization_of(request: &str) -> String {
+    request
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn success_body() -> String {
+    serde_json::json!({
+        "choices": [{"message": {"content": "ok"}}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+    })
+    .to_string()
 }
 
 async fn chat(provider: &OpenAiCompatibleProvider) -> anyhow::Result<ChatResponse> {
@@ -195,6 +242,85 @@ async fn oversized_response_is_rejected_before_json_parsing() {
     let message = error.to_string();
     assert!(message.contains("provider response exceeds 2097152 bytes"));
     let _ = server.request.await;
+}
+
+// ---- API key rotation ------------------------------------------------------
+
+#[tokio::test]
+async fn multiple_keys_rotate_across_requests_in_order() {
+    let (base_url, mut authorizations) = spawn_rotating_server(3, success_body()).await;
+    let provider = OpenAiCompatibleProvider::with_keys(
+        "test-model",
+        base_url,
+        vec!["key-one".into(), "key-two".into()],
+        None,
+        Some(64),
+        5,
+    )
+    .expect("provider");
+
+    chat(&provider).await.expect("first response");
+    chat(&provider).await.expect("second response");
+    chat(&provider).await.expect("third response");
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(
+            tokio::time::timeout(Duration::from_secs(5), authorizations.recv())
+                .await
+                .expect("authorization report")
+                .expect("channel open"),
+        );
+    }
+    assert_eq!(
+        seen,
+        vec![
+            "Bearer key-one".to_string(),
+            "Bearer key-two".to_string(),
+            "Bearer key-one".to_string(),
+        ],
+        "the Nth request must use key N mod key_count"
+    );
+}
+
+#[tokio::test]
+async fn keyless_provider_sends_no_authorization_header() {
+    let (base_url, mut authorizations) = spawn_rotating_server(1, success_body()).await;
+    // Local endpoints (e.g. ollama) need no key: an empty key list is the
+    // unauthenticated case, not an error.
+    let provider = OpenAiCompatibleProvider::with_keys(
+        "test-model",
+        base_url,
+        Vec::new(),
+        None,
+        Some(64),
+        5,
+    )
+    .expect("provider");
+
+    chat(&provider).await.expect("response without a key");
+
+    let seen = tokio::time::timeout(Duration::from_secs(5), authorizations.recv())
+        .await
+        .expect("authorization report")
+        .expect("channel open");
+    assert!(seen.is_empty(), "no key means no header: {seen:?}");
+}
+
+#[tokio::test]
+async fn keyring_bounds_are_enforced_at_construction() {
+    // MAX_API_KEYS is the documented ceiling; one more must fail closed rather
+    // than silently truncate the operator's declaration.
+    let too_many: Vec<String> = (0..=MAX_API_KEYS).map(|index| format!("key-{index}")).collect();
+    assert!(OpenAiCompatibleProvider::with_keys(
+        "test-model",
+        "https://example.invalid/v1",
+        too_many,
+        None,
+        Some(64),
+        5,
+    )
+    .is_err());
 }
 
 // ---- B4: capability probe ------------------------------------------------

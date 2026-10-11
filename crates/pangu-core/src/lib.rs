@@ -9,7 +9,9 @@ pub mod assemble;
 pub mod audit;
 pub mod canvas;
 pub mod checkpoint;
+pub mod control;
 pub mod conversation;
+pub mod dag;
 pub mod deliverable;
 pub mod diff;
 pub mod error;
@@ -26,6 +28,8 @@ pub mod memory;
 pub mod memory_layers;
 pub mod messages;
 pub mod modules;
+pub mod negative;
+pub mod notes;
 pub mod replay;
 pub mod repomap;
 pub mod session;
@@ -52,13 +56,14 @@ pub mod util;
 pub mod testing;
 
 pub use artifact::{
-    ArtifactStore, EffectRecord, RestoreDisposition, RestoreResult, RollbackOperation,
-    RollbackOperationStatus, SnapshotLimits, SnapshotRequest, ARTIFACT_STORE_SCHEMA_VERSION,
-    FAILED_PATH_LEDGER_FILE, ROLLBACK_OPERATION_SCHEMA_VERSION,
+    ArtifactStore, EffectRecord, MemArtifactStore, RestoreDisposition, RestoreResult,
+    RollbackOperation, RollbackOperationStatus, SnapshotLimits, SnapshotRequest,
+    ARTIFACT_STORE_SCHEMA_VERSION, FAILED_PATH_LEDGER_FILE, ROLLBACK_OPERATION_SCHEMA_VERSION,
 };
 pub use assemble::{
-    assemble, assemble_with, close_pairing, AssembledContext, AssemblyReport, CandidateSlice,
-    DegradeMode, Omission, Seam, SecondStageSelector, SelectionReason, SliceSelection,
+    assemble, assemble_with, assemble_with_notes, close_pairing, AssembledContext, AssemblyReport,
+    CandidateSlice, DegradeMode, Omission, Seam, SecondStageSelector, SelectionReason,
+    SliceSelection,
 };
 pub use checkpoint::{
     ArtifactState, CheckpointArtifact, CheckpointFileEntry, CheckpointFileType, EventRef,
@@ -102,6 +107,11 @@ pub use lockfile::{
 };
 pub use memory::{
     MemoryCandidate, MemoryLimits, MemoryStatus, MemoryStore, MemoryTransition, MEMORY_SCHEMA,
+};
+pub use notes::{
+    note_from_args, verify as verify_notes, ConversationNotes, ModelNote, NoteArgs, NoteSpan,
+    MAX_MODEL_NOTES, MAX_NOTE_OPEN_ITEMS, MAX_NOTE_OPEN_ITEM_BYTES, MAX_NOTE_SPANS,
+    MAX_NOTE_SUMMARY_BYTES, NOTE_SCHEMA_VERSION,
 };
 pub use messages::{ChatResponse, ContentPart, Message, MessageRole};
 pub use modules::{

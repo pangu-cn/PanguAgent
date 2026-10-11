@@ -58,6 +58,15 @@ pub enum EventKind {
     RollbackFailed,
     FailedPathRecorded,
     ContextAssembled,
+    /// A1: a conversation was copied into a new snapshot. Provisional: the
+    /// event records dialogue lineage only and never copies a workspace.
+    SessionForked,
+    /// C3: a scheduled intent was accepted. Provisional and non-executing.
+    AutomationAccepted,
+    /// C3: a duplicate idempotency key was rejected.
+    AutomationDuplicate,
+    /// D2: a manager rejected a child result. Provisional and non-executing.
+    TaskRejected,
 }
 
 impl EventKind {
@@ -98,6 +107,10 @@ impl EventKind {
             Self::RollbackFailed => "rollback_failed",
             Self::FailedPathRecorded => "failed_path_recorded",
             Self::ContextAssembled => "context_assembled",
+            Self::SessionForked => "session_forked",
+            Self::AutomationAccepted => "automation_accepted",
+            Self::AutomationDuplicate => "automation_duplicate",
+            Self::TaskRejected => "task_rejected",
         }
     }
 

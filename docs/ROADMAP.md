@@ -384,7 +384,7 @@ Pangu 当前最值得走的路线不是变成“功能最多的桌面助手”�
   - **配对不变量（勘察新增，ADR-0005 §3.8）**：OpenAI wire format 要求 `tool_calls` 与 `Tool` 结果同进同出，切片裁剪必须扩展选取范围保配对，否则组装结果是协议非法而不只是不连贯。
   - **纯内存工作（ADR-0005 §3.9）**：`conversation.enabled` 默认关闭，组装器不得依赖持久化；摘要/切片落盘只是跨运行复用的优化。
   - **两级寻址，不能只用行号**：`message_index` 解决“哪一条消息”（不可变文件 + 数组顺序，稳定）；`start_line/end_line` 解决“这条消息内部”——单条工具输出可达 256 KiB，一条消息一行仍切不开。内容行是**读时按换行切分**得到的，确定性，不需要再改存储格式。
-  - **摘要是确定性抽取，不是模型生成**，且升格为 Pangu 自己的主要功能（规格自定：有单测、可复现、每条带 `derived_from` 指向它描述的 `message_index`、不接触模型）：首 N 行 / 工具名 / 错误行 / 计数。不选模型生成是为了避开“污染的摘要一路传播”这一整类问题。
+  - **摘要是确定性抽取，不是模型生成**，且升格为 Pangu 自己的主要功能（规格自定：有单测、可复现、每条带 `derived_from` 指向它描述的 `message_index`、不接触模型）：首 N 行 / 工具名 / 错误行 / 计数。不选模型生成是为了避开“污染的摘要一路传播”这一整类问题。**唯一例外（2026-10-10，ADR-0014，默认关）**：`[conversation] model_notes` 开启后模型可经 `note_context` 控制调用**追加**一层自撰摘要——span 存在性与前缀 digest 校验、UNTRUSTED 标注注入、不进判定路径、预算压力下最先退化；确定性摘要仍是地板，删掉它整条链逐位不变。
   - **laya 只能做短决策，所以它不承重**。由此排除三件事：**不能**用 laya 生成摘要（上下文装不进一次短决策）、**不能**用它做粗筛（要遍历全量摘要）、**不能**用它决定强制集/写回/终止。laya 只剩最末端一步：粗筛（本地确定性）→ **laya 短决策**（短名单里哪几片相关）→ 组装（本地确定性）。
   - **关键性质：删掉 laya，整条链依然完整可用**，只是相关性从模型判断退化为启发式——粗筛产出的短名单就是合法输入，组装器不需要知道它从哪来。这比 B6 原有的“不得成为核心启动依赖”更强。**A6-6 因此是纯增强项，删掉不损失任何能力。**
   - **衔接必须留可见接缝**：拼接产生的“从未发生过的连贯对话”是 §3.2 的新变种——不是模型裁掉自己的边界，而是我们喂给它伪造的连贯历史（若 turn 7 的工具调用拼在 turn 3 的用户消息后，模型可能以为自己已执行过）。每个接缝显式标记，组装结果标 `derived: true` / `authoritative: false`。不标则 `invariant_i_failed_path_not_repeated` 的证据链会断。
@@ -684,6 +684,57 @@ W-43~W-47 是 F7 的风险摘要；完整激活后具体控制以 [`ADR-0001`](a
 | W-47 | Artifact/Git backend 引入隐藏副作用或供应链风险 | checkpoint 存储、Git commit/index、插件/凭据、跨设备 Artifact | 默认 Pangu Artifact、Git 独立审批、路径/来源校验、quota、签名/版本和可回滚卸载 |
 
 ---
+
+## 5b. P0 快赢决策
+
+[ADR-0011](adr/0011-p0-quick-wins.md) 记录八项 P0 的边界。它是 Proposed，不是完成声明。会话复制已有对话级实现；前缀字段、session fork 事件、内存 Artifact、只读工具宏、原生工具调用透传和代码健康告警仍待按该 ADR 实现。
+
+## 5c. 工具准入四级
+
+| 级别 | 来源 | 生效条件 |
+| --- | --- | --- |
+| 1 | 内置 core | 新工具必须有 ADR，并进入 manifest 与 contract digest |
+| 2 | 配置声明 | 只能引用已登记工具，不能直接执行 |
+| 3 | skill 包 | 沿用 skill registry；不能自行安装 |
+| 4 | E1 插件 | 未来能力；当前没有加载器，不能生效 |
+
+任何级别都不能跳过 Policy、Sandbox、Approval 和 VerifiedAction。
+
+## 5i. 多 Agent 收编
+
+DAG 节点必须有独立预算和 idempotency key。manager 只能返回 `TaskDelegated` 或 `TaskRejected`，`can_execute_tools()` 固定为 false。`NamedAction` 只保存工具名单，不执行；每个工具调用仍逐项过 L1–L4。自动搜索出的 workflow 必须重新过准入，不能自动获得执行权。
+
+## 5h. 控制面与执行面
+
+控制面只接受 `ControlIntent` 和短时 `SessionToken`。它不能调用工具。重复 idempotency key 与过期意图 fail-closed。token 最长 900 秒，且只匹配一个 scope。长期密钥不得进入 UI。`AutomationAccepted` 与 `AutomationDuplicate` 是 provisional 事件，不表示动作已执行。
+
+## 5g. LangGraph 式回放边界
+
+`pangu run --from-checkpoint ID` 开启一个新 run，并声明旧 checkpoint 与 Journal 只读。它不恢复 workspace，也不重放 `ToolStarted` 后尚未完成的动作。exact-once 恢复仍属于 F7 激活门，当前没有 operator 证据，不能声称已完成。
+
+Journal 文件名作为 thread id，checkpoint id 由显式命令提供。没有全局租户状态；跨 workspace 隔离仍由各自的 GoalContract 保证。
+
+## 5f. 文本工具调用与评测边界
+
+`model.raw_tool_calls=true` 时，模型可以在普通文本中使用一个 `action` 代码块表达工具调用。代码块必须是 JSON，并包含 `name` 与 object 参数。解析结果只是候选调用，必须继续通过 schema、Policy、Sandbox 和 Approval。默认关闭，因此默认 digest 不变。
+
+DeepPlanning 与 SWE-bench-verified 只作为外部回归题库候选。Pangu 不内置题库，不把外部分数写入产品宣传；现有 `pangu eval run` 仍只记录本仓库声明的 issue。
+
+## 5e. 扩展曝光五级
+
+| 级别 | 含义 | 权限 |
+| --- | --- | --- |
+| direct | 可直接出现在工具列表 | 仍需 L1–L4 |
+| model-only | 仅模型可见 | 仍需 L1–L4 |
+| codemode | 仅代码模式可见 | 仍需 L1–L4 |
+| deferred | 默认不广告，显式请求后可见 | 仍需 L1–L4 |
+| hidden | 不广告 | 没有执行路径 |
+
+exposure 只控制广告，不降低风险，也不等于授权。
+
+## 5d. 定时任务与 Gateway 边界
+
+未来 cron 的每个任务必须是独立 `GoalContract`，拥有独立 workspace、预算、审批、过期时间和取消路径。Gateway 只接收意图并创建合同，不能执行工具。profile 绑定测试必须证明一个 profile 的合同不能读取另一个 profile 的 workspace。Hermes 的多 profile 泄漏不能通过引入全局状态在 Pangu 中复现。
 
 ## 6. 每个新特性的准入模板
 

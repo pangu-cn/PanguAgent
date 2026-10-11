@@ -111,6 +111,11 @@ pub enum StreamKind {
     DeliverableRecorded,
     /// D1: a bounded subtask was delegated to a restricted sub-agent.
     TaskDelegated,
+    /// A1: provisional dialogue fork. It is not a workspace rollback.
+    SessionForked,
+    AutomationAccepted,
+    AutomationDuplicate,
+    TaskRejected,
 }
 
 impl StreamKind {
@@ -170,6 +175,10 @@ impl StreamKind {
             Self::MemoryProposed,
             Self::DeliverableRecorded,
             Self::TaskDelegated,
+            Self::SessionForked,
+            Self::AutomationAccepted,
+            Self::AutomationDuplicate,
+            Self::TaskRejected,
         ]
     }
 
@@ -209,6 +218,10 @@ impl StreamKind {
             EventKind::MemoryProposed => Self::MemoryProposed,
             EventKind::DeliverableRecorded => Self::DeliverableRecorded,
             EventKind::TaskDelegated => Self::TaskDelegated,
+            EventKind::SessionForked => Self::SessionForked,
+            EventKind::AutomationAccepted => Self::AutomationAccepted,
+            EventKind::AutomationDuplicate => Self::AutomationDuplicate,
+            EventKind::TaskRejected => Self::TaskRejected,
         })
     }
 }
@@ -793,6 +806,10 @@ mod tests {
                 StreamKind::MemoryProposed => EventKind::MemoryProposed,
                 StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
                 StreamKind::TaskDelegated => EventKind::TaskDelegated,
+                StreamKind::SessionForked => EventKind::SessionForked,
+                StreamKind::AutomationAccepted => EventKind::AutomationAccepted,
+                StreamKind::AutomationDuplicate => EventKind::AutomationDuplicate,
+                StreamKind::TaskRejected => EventKind::TaskRejected,
             };
             assert_eq!(StreamKind::from_event(internal).unwrap(), *kind);
         }
@@ -843,6 +860,10 @@ mod tests {
                     StreamKind::ProviderSwitched => EventKind::ProviderSwitched,
                     StreamKind::MemoryProposed => EventKind::MemoryProposed,
                     StreamKind::DeliverableRecorded => EventKind::DeliverableRecorded,
+                    StreamKind::SessionForked => EventKind::SessionForked,
+                    StreamKind::AutomationAccepted => EventKind::AutomationAccepted,
+                    StreamKind::AutomationDuplicate => EventKind::AutomationDuplicate,
+                    StreamKind::TaskRejected => EventKind::TaskRejected,
                 },
                 0,
                 "hello",

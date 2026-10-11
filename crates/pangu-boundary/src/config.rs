@@ -301,6 +301,11 @@ pub struct ConversationSection {
     /// Save after every turn, not just at terminal states. Costs a write per
     /// turn and buys recovery from a crash mid-run.
     pub save_every_turn: bool,
+    /// ADR-0014: allow the model to append context notes through the
+    /// `note_context` control call. Off by default: a stored note is
+    /// untrusted data (span-bound, UNTRUSTED-annotated on injection), and a
+    /// disabled run keeps its historical digest. Requires `enabled`.
+    pub model_notes: bool,
 }
 
 impl Default for ConversationSection {
@@ -309,6 +314,7 @@ impl Default for ConversationSection {
             enabled: false,
             artifact_root: PathBuf::from(".pangu/conversations"),
             save_every_turn: true,
+            model_notes: false,
         }
     }
 }
@@ -543,6 +549,10 @@ pub struct ModelSection {
     pub input_usd_per_mtok: Option<f64>,
     pub output_usd_per_mtok: Option<f64>,
     pub request_timeout_secs: Option<u64>,
+    /// Opt-in only. Provider-native tool calls still pass schema checks and
+    /// the full Policy -> Sandbox -> Approval chain.
+    #[serde(default)]
+    pub raw_tool_calls: bool,
 }
 
 /// B5: one declared fallback candidate. Field semantics mirror the primary
@@ -771,6 +781,12 @@ impl Default for GoalSection {
 impl Config {
     pub fn embedded() -> Result<Self> {
         Self::from_toml(EMBEDDED)
+    }
+
+    pub fn from_json(source: &str) -> Result<Self> {
+        let config: Self = serde_json::from_str(source).map_err(|error| Error::Config(format!("invalid config: {error}")))?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn from_toml(source: &str) -> Result<Self> {
@@ -1237,6 +1253,14 @@ impl Config {
         }
         // C5: validate the execution declaration.
         self.execution.validate()?;
+        // ADR-0014: model notes live in the conversation store, so declaring
+        // them without persistence would promise a feature that never runs.
+        // Fail at config time rather than silently ignoring the flag.
+        if self.conversation.model_notes && !self.conversation.enabled {
+            return Err(Error::Config(
+                "conversation.model_notes requires conversation.enabled".into(),
+            ));
+        }
         // F3: extra programs join the read-only argv allow-list, so each
         // entry must be a bare program name. Declaring one does not weaken
         // path, flag, or host checks.
@@ -1690,6 +1714,15 @@ impl Config {
     }
 }
 
+/// Validate the operator-declared provider endpoint.
+///
+/// http and https are both accepted: the provider endpoint is operator
+/// configuration (BOUNDARY §3 网络 governs the *tool* gate, not the model
+/// endpoint), and an intranet gateway or local proxy over plain http is a
+/// legitimate deployment. The cost is stated plainly in the desktop editor:
+/// over http the API key travels in cleartext, so it belongs on a trusted
+/// network only. What never changes: no credentials, query or fragment in
+/// the URL, and no zero port.
 fn validate_base_url(raw: &str) -> Result<()> {
     let url = Url::parse(raw)
         .map_err(|error| Error::Config(format!("invalid model.base_url: {error}")))?;
@@ -1715,14 +1748,6 @@ fn validate_base_url(raw: &str) -> Result<()> {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     if host.is_empty() {
         return Err(Error::Config("model.base_url must contain a host".into()));
-    }
-    let loopback = host == "localhost"
-        || host == "::1"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    if url.scheme() == "http" && !loopback {
-        return Err(Error::Config("remote model.base_url must use https".into()));
     }
     Ok(())
 }
@@ -2042,6 +2067,55 @@ mod tests {
         );
         assert!(loaded.conversation.save_every_turn);
         assert!(loaded.conversation.artifact_root.is_relative());
+        assert!(
+            !loaded.conversation.model_notes,
+            "model notes are opt-in (ADR-0014); an absent section cannot enable them"
+        );
+    }
+
+    /// ADR-0014: notes live in the conversation store, so enabling them
+    /// without persistence is a config error, not a silently ignored flag.
+    #[test]
+    fn model_notes_require_conversation_persistence() {
+        let mut config = Config::embedded().unwrap();
+        config.conversation.enabled = false;
+        config.conversation.model_notes = true;
+        let error = config.validate().expect_err("notes without a store");
+        assert!(
+            error
+                .to_string()
+                .contains("conversation.model_notes requires conversation.enabled"),
+            "got: {error}"
+        );
+        config.conversation.enabled = true;
+        config.validate().expect("notes with a store are fine");
+    }
+
+    /// The conditional-digest rule: a notes-enabled run's contract digest
+    /// differs from the same run without notes, and a disabled run keeps the
+    /// digest it always had.
+    #[test]
+    fn model_notes_change_the_digest_only_when_enabled() {
+        let mut off = Config::embedded().unwrap();
+        off.conversation.enabled = true;
+        off.conversation.model_notes = false;
+        let mut on = off.clone();
+        on.conversation.model_notes = true;
+        let off_digest = crate::goal::GoalContract::from_config("goal", &off)
+            .unwrap()
+            .digest();
+        let on_digest = crate::goal::GoalContract::from_config("goal", &on)
+            .unwrap()
+            .digest();
+        assert_ne!(off_digest, on_digest, "an enabled feature must be in the digest");
+        // The default (off) keeps the historical digest of a conversation-
+        // enabled run: the feature is invisible until it is declared.
+        let mut default_conv = off.clone();
+        default_conv.conversation.enabled = false;
+        let baseline = crate::goal::GoalContract::from_config("goal", &default_conv)
+            .unwrap()
+            .digest();
+        assert_eq!(off_digest, baseline);
     }
 
     /// F3: an old config has no `[verify]` section; it must load with the
@@ -2185,6 +2259,21 @@ mod tests {
         contract
             .validate_against(&matching)
             .expect("same-config contract and sandbox agree");
+    }
+
+    /// The provider endpoint is operator configuration, so both schemes are
+    /// accepted for any host: an intranet gateway or a local router over
+    /// plain http is a legitimate deployment. What never changes: no
+    /// credentials, no query/fragment, no zero port, http/https only.
+    #[test]
+    fn base_url_http_and_https_are_both_accepted() {
+        validate_base_url("https://api.openai.com/v1").expect("https official");
+        validate_base_url("http://gateway.intranet:8310/v1").expect("http gateway");
+        validate_base_url("http://localhost:11434/v1").expect("http loopback");
+        assert!(validate_base_url("http://user:pass@example.com/v1").is_err());
+        assert!(validate_base_url("https://example.com/v1?token=x").is_err());
+        assert!(validate_base_url("ftp://example.com/v1").is_err());
+        assert!(validate_base_url("https://example.com:0/v1").is_err());
     }
 
     /// B4: naming a provider in config fills the endpoint, the key variable,

@@ -295,7 +295,11 @@ impl SessionTree {
             .as_deref()
             .map(|value| format!("  checkpoint={value}"))
             .unwrap_or_default();
-        out.push_str(&format!("{}{id}{checkpoint}\n", " ".repeat(depth * 2)));
+        let marker = if depth == 0 { "• " } else { "└ " };
+        out.push_str(&format!(
+            "{}{marker}{id}{checkpoint}\n",
+            " ".repeat(depth * 2)
+        ));
         if !path.insert(node.session_node_id.clone()) {
             out.push_str(&format!(
                 "{}  (already shown above; parent links cycle here)\n",
